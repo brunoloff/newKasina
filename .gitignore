@@ -2,6 +2,8 @@
 /.cargo-local/
 /.rustup-local/
 /.git-local/
+/render-benchmark.json
+/render-benchmark-*.json
 *.log
 *.profraw
 *.sqlite-shm

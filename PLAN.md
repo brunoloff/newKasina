@@ -31,7 +31,15 @@ Do not mark a milestone complete until its exit criteria pass.
   and F11 handling were exercised without validation errors. The sandbox exposes no
   `/dev/dri`, so native GPU 60/120 Hz measurements, real-window-manager fullscreen, and
   mixed-DPI validation remain exit blockers. Software llvmpipe timing is recorded only
-  as a functional smoke result and is not treated as performance evidence.
+  as a functional smoke result and is not treated as performance evidence. The app now
+  has a self-terminating release benchmark that records source revision, adapter/backend,
+  viewport/DPI, declared refresh, frame-interval/UI-CPU/callback percentiles, upload size,
+  and a conservative hardware-only target result. Continuous animation is explicitly
+  disabled for hidden/minimized viewports and inactive views are event-driven. Surface
+  outdated/lost/occluded events have explicit recovery actions and visible counters; full
+  device loss is captured as an actionable diagnostic. A targeted CPU preparation
+  benchmark processed 20 million frames at 3.049 ns/frame on this host; work and upload
+  size remain constant as instance count grows.
 - Milestone 3 hardware-independent work: Polar HR/RR parsing covers 8/16-bit heart rate,
   energy, contact, multiple RR intervals, and malformed frames; both Polar and Go Direct
   have cancellable reconnecting `btleplug` drivers; Go Direct command framing,

@@ -16,6 +16,7 @@ use kasina_protocol::v1::{
 };
 use kasina_protocol::{AUTH_HEADER, client_hello};
 use kasina_render::{BiofeedbackRenderer, FrameStats};
+use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
@@ -25,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 const HISTORY_CAPACITY_PER_STREAM: usize = 6_000;
 const UI_EVENT_CAPACITY: usize = 256;
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Debug, Parser)]
 #[command(about = "newKasina biofeedback desktop client")]
@@ -35,6 +37,59 @@ struct Args {
     /// Override the standard service authentication-token path.
     #[arg(long)]
     token_path: Option<PathBuf>,
+    /// Run the visualizer for this many measured seconds, write JSON, and exit.
+    #[arg(long, value_parser = benchmark_duration_seconds)]
+    render_benchmark_seconds: Option<f64>,
+    /// Warm-up time excluded from render benchmark statistics.
+    #[arg(long, default_value_t = 2.0, value_parser = benchmark_warmup_seconds)]
+    benchmark_warmup_seconds: f64,
+    /// JSON destination for a render benchmark (default: render-benchmark.json).
+    #[arg(long)]
+    benchmark_output: Option<PathBuf>,
+    /// Particle instances drawn by the stress visualizer.
+    #[arg(long, default_value_t = 8_000, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
+    stress_instances: u32,
+    /// Externally confirmed display refresh rate for evaluating the frame-pacing budget.
+    #[arg(long, value_parser = refresh_rate_hz)]
+    display_refresh_hz: Option<f64>,
+}
+
+fn finite_number(value: &str) -> std::result::Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid number: {error}"))?;
+    if parsed.is_finite() {
+        Ok(parsed)
+    } else {
+        Err("value must be finite".to_owned())
+    }
+}
+
+fn benchmark_duration_seconds(value: &str) -> std::result::Result<f64, String> {
+    let parsed = finite_number(value)?;
+    if parsed > 0.0 && parsed <= 300.0 {
+        Ok(parsed)
+    } else {
+        Err("benchmark duration must be greater than zero and at most 300 seconds".to_owned())
+    }
+}
+
+fn benchmark_warmup_seconds(value: &str) -> std::result::Result<f64, String> {
+    let parsed = finite_number(value)?;
+    if (0.0..=60.0).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("benchmark warm-up must be between zero and 60 seconds".to_owned())
+    }
+}
+
+fn refresh_rate_hz(value: &str) -> std::result::Result<f64, String> {
+    let parsed = finite_number(value)?;
+    if (1.0..=1_000.0).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("display refresh must be between 1 and 1000 Hz".to_owned())
+    }
 }
 
 fn main() -> Result<()> {
@@ -44,17 +99,64 @@ fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    let surface_health = Arc::new(SurfaceHealth::default());
+    let wgpu_options = eframe::WgpuConfiguration {
+        on_surface_status: surface_status_handler(Arc::clone(&surface_health)),
+        ..Default::default()
+    };
     eframe::run_native(
         "newKasina",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1_180.0, 780.0])
                 .with_min_inner_size([760.0, 500.0]),
+            wgpu_options,
             ..Default::default()
         },
-        Box::new(move |creation_context| Ok(Box::new(KasinaApp::new(creation_context, args)?))),
+        Box::new(move |creation_context| {
+            Ok(Box::new(KasinaApp::new(
+                creation_context,
+                args,
+                surface_health,
+            )?))
+        }),
     )
     .map_err(|error| anyhow!(error.to_string()))
+}
+
+#[derive(Debug, Default)]
+struct SurfaceHealth {
+    outdated: AtomicU64,
+    lost: AtomicU64,
+    occluded: AtomicU64,
+    other: AtomicU64,
+}
+
+fn surface_status_handler(
+    health: Arc<SurfaceHealth>,
+) -> Arc<
+    dyn Fn(&eframe::wgpu::CurrentSurfaceTexture) -> eframe::egui_wgpu::SurfaceErrorAction
+        + Send
+        + Sync,
+> {
+    Arc::new(move |status| match status {
+        eframe::wgpu::CurrentSurfaceTexture::Outdated => {
+            health.outdated.fetch_add(1, Ordering::Relaxed);
+            eframe::egui_wgpu::SurfaceErrorAction::Reconfigure
+        }
+        eframe::wgpu::CurrentSurfaceTexture::Lost => {
+            health.lost.fetch_add(1, Ordering::Relaxed);
+            eframe::egui_wgpu::SurfaceErrorAction::RecreateSurface
+        }
+        eframe::wgpu::CurrentSurfaceTexture::Occluded => {
+            health.occluded.fetch_add(1, Ordering::Relaxed);
+            eframe::egui_wgpu::SurfaceErrorAction::SkipFrame
+        }
+        _ => {
+            health.other.fetch_add(1, Ordering::Relaxed);
+            eframe::egui_wgpu::SurfaceErrorAction::SkipFrame
+        }
+    })
 }
 
 fn default_token_path() -> Result<PathBuf> {
@@ -77,6 +179,115 @@ enum View {
     Raw,
     Visualizer,
     Diagnostics,
+}
+
+fn animation_repaint_interval(view: View, viewport_visible: Option<bool>) -> Option<Duration> {
+    (view == View::Visualizer && viewport_visible != Some(false)).then_some(ANIMATION_INTERVAL)
+}
+
+#[derive(Debug)]
+struct RenderBenchmark {
+    warmup: Duration,
+    duration: Duration,
+    measurement_start: Instant,
+    measurement_end: Instant,
+    output: PathBuf,
+    frame_intervals: FrameStats,
+    ui_cpu_times: FrameStats,
+    writer: Option<JoinHandle<std::result::Result<(), String>>>,
+    submitted: bool,
+}
+
+impl RenderBenchmark {
+    fn new(now: Instant, warmup_seconds: f64, duration_seconds: f64, output: PathBuf) -> Self {
+        let warmup = Duration::from_secs_f64(warmup_seconds);
+        let duration = Duration::from_secs_f64(duration_seconds);
+        let measurement_start = now + warmup;
+        let sample_capacity =
+            (duration_seconds.mul_add(240.0, 1_024.0).ceil() as usize).min(100_000);
+        Self {
+            warmup,
+            duration,
+            measurement_start,
+            measurement_end: measurement_start + duration,
+            output,
+            frame_intervals: FrameStats::new(sample_capacity),
+            ui_cpu_times: FrameStats::new(sample_capacity),
+            writer: None,
+            submitted: false,
+        }
+    }
+
+    fn recording(&self, now: Instant) -> bool {
+        now >= self.measurement_start && now < self.measurement_end
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RenderBenchmarkReport {
+    schema_version: u32,
+    package_version: &'static str,
+    source_revision: &'static str,
+    operating_system: &'static str,
+    architecture: &'static str,
+    adapter: String,
+    backend: String,
+    device_type: String,
+    driver: String,
+    driver_info: String,
+    hardware_accelerated: bool,
+    logical_viewport_points: Option<[f32; 2]>,
+    physical_viewport_pixels: Option<[u32; 2]>,
+    native_pixels_per_point: Option<f32>,
+    fullscreen: Option<bool>,
+    stress_instances: u32,
+    declared_display_refresh_hz: Option<f64>,
+    target_frame_interval_ms: Option<f64>,
+    sample_count_sufficient: Option<bool>,
+    target_met: Option<bool>,
+    warmup_seconds: f64,
+    measured_seconds: f64,
+    measured_frames: usize,
+    frame_interval_average_ms: f64,
+    frame_interval_p95_ms: f64,
+    frame_interval_p99_ms: f64,
+    ui_cpu_average_ms: f64,
+    ui_cpu_p95_ms: f64,
+    ui_cpu_p99_ms: f64,
+    wgpu_prepare_average_ms: f64,
+    wgpu_prepare_p95_ms: f64,
+    wgpu_prepare_p99_ms: f64,
+    latest_upload_bytes: u64,
+    surface_outdated_events: u64,
+    surface_lost_events: u64,
+    surface_occluded_events: u64,
+    surface_other_events: u64,
+    device_lost: Option<String>,
+    note: &'static str,
+}
+
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn frame_target_result(
+    hardware_accelerated: bool,
+    refresh_hz: Option<f64>,
+    measured_duration: Duration,
+    measured_frames: usize,
+    p99_ms: f64,
+) -> (Option<f64>, Option<bool>, Option<bool>) {
+    let Some(refresh_hz) = refresh_hz else {
+        return (None, None, None);
+    };
+    let target_ms = 1_000.0 / refresh_hz;
+    let enough_samples =
+        measured_frames as f64 >= measured_duration.as_secs_f64() * refresh_hz * 0.5;
+    (
+        Some(target_ms),
+        Some(enough_samples),
+        Some(hardware_accelerated && enough_samples && p99_ms < target_ms),
+    )
 }
 
 #[derive(Debug)]
@@ -154,27 +365,75 @@ struct KasinaApp {
     model: ClientModel,
     renderer: Option<BiofeedbackRenderer>,
     renderer_name: String,
+    renderer_backend: String,
+    renderer_device_type: String,
+    renderer_driver: String,
+    renderer_driver_info: String,
+    renderer_hardware_accelerated: bool,
+    surface_health: Arc<SurfaceHealth>,
+    device_lost: Arc<parking_lot::Mutex<Option<String>>>,
     stress_instances: u32,
+    display_refresh_hz: Option<f64>,
     fullscreen: bool,
     started: Instant,
     last_frame: Instant,
-    frame_stats: FrameStats,
+    frame_interval_stats: FrameStats,
+    ui_cpu_stats: FrameStats,
+    benchmark: Option<RenderBenchmark>,
+    benchmark_status: Option<String>,
 }
 
 impl KasinaApp {
-    fn new(creation_context: &eframe::CreationContext<'_>, args: Args) -> Result<Self> {
-        let token_path = args.token_path.unwrap_or(default_token_path()?);
+    fn new(
+        creation_context: &eframe::CreationContext<'_>,
+        args: Args,
+        surface_health: Arc<SurfaceHealth>,
+    ) -> Result<Self> {
+        let token_path = args.token_path.clone().unwrap_or(default_token_path()?);
         let renderer = creation_context
             .wgpu_render_state
             .as_ref()
             .map(BiofeedbackRenderer::new);
-        let renderer_name = creation_context.wgpu_render_state.as_ref().map_or_else(
+        let adapter_info = creation_context
+            .wgpu_render_state
+            .as_ref()
+            .map(|state| state.adapter.get_info());
+        let renderer_name = adapter_info
+            .as_ref()
+            .map_or_else(|| "unavailable".to_owned(), |info| info.name.clone());
+        let renderer_backend = adapter_info.as_ref().map_or_else(
             || "unavailable".to_owned(),
-            |state| {
-                let info = state.adapter.get_info();
-                format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type)
-            },
+            |info| format!("{:?}", info.backend),
         );
+        let renderer_device_type = adapter_info.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |info| format!("{:?}", info.device_type),
+        );
+        let renderer_driver = adapter_info
+            .as_ref()
+            .map_or_else(|| "unavailable".to_owned(), |info| info.driver.clone());
+        let renderer_driver_info = adapter_info
+            .as_ref()
+            .map_or_else(|| "unavailable".to_owned(), |info| info.driver_info.clone());
+        let renderer_hardware_accelerated = adapter_info.as_ref().is_some_and(|info| {
+            matches!(
+                info.device_type,
+                eframe::wgpu::DeviceType::IntegratedGpu | eframe::wgpu::DeviceType::DiscreteGpu
+            )
+        });
+        let device_lost = Arc::new(parking_lot::Mutex::new(None));
+        if let Some(render_state) = &creation_context.wgpu_render_state {
+            let device_lost_state = Arc::clone(&device_lost);
+            let repaint = creation_context.egui_ctx.clone();
+            render_state
+                .device
+                .set_device_lost_callback(move |reason, message| {
+                    let detail = format!("{reason:?}: {message}");
+                    tracing::error!(%detail, "wgpu device lost");
+                    *device_lost_state.lock() = Some(detail);
+                    repaint.request_repaint();
+                });
+        }
         let (sender, events) = std::sync::mpsc::sync_channel(UI_EVENT_CAPACITY);
         let cancellation = CancellationToken::new();
         let ui_dropped_batches = Arc::new(AtomicU64::new(0));
@@ -187,9 +446,23 @@ impl KasinaApp {
             creation_context.egui_ctx.clone(),
         ));
         let now = Instant::now();
+        let benchmark = args.render_benchmark_seconds.map(|duration| {
+            RenderBenchmark::new(
+                now,
+                args.benchmark_warmup_seconds,
+                duration,
+                args.benchmark_output
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("render-benchmark.json")),
+            )
+        });
         Ok(Self {
             endpoint: args.endpoint,
-            view: View::Dashboard,
+            view: if benchmark.is_some() {
+                View::Visualizer
+            } else {
+                View::Dashboard
+            },
             events,
             cancellation,
             network_thread,
@@ -197,11 +470,22 @@ impl KasinaApp {
             model: ClientModel::default(),
             renderer,
             renderer_name,
-            stress_instances: 8_000,
+            renderer_backend,
+            renderer_device_type,
+            renderer_driver,
+            renderer_driver_info,
+            renderer_hardware_accelerated,
+            surface_health,
+            device_lost,
+            stress_instances: args.stress_instances,
+            display_refresh_hz: args.display_refresh_hz,
             fullscreen: false,
             started: now,
             last_frame: now,
-            frame_stats: FrameStats::default(),
+            frame_interval_stats: FrameStats::default(),
+            ui_cpu_stats: FrameStats::default(),
+            benchmark,
+            benchmark_status: None,
         })
     }
 
@@ -361,7 +645,29 @@ impl KasinaApp {
                 egui::Color32::LIGHT_GRAY,
             );
         }
-        ui.ctx().request_repaint_after(Duration::from_millis(8));
+        if let Some(status) = &self.benchmark_status {
+            ui.label(status);
+        } else if let Some(benchmark) = &self.benchmark {
+            let now = Instant::now();
+            let status = if now < benchmark.measurement_start {
+                format!(
+                    "Benchmark warm-up: {:.1} s remaining",
+                    benchmark
+                        .measurement_start
+                        .duration_since(now)
+                        .as_secs_f64()
+                )
+            } else {
+                format!(
+                    "Benchmark recording: {:.1} s remaining",
+                    benchmark
+                        .measurement_end
+                        .saturating_duration_since(now)
+                        .as_secs_f64()
+                )
+            };
+            ui.label(status);
+        }
     }
 
     fn diagnostics(&self, ui: &mut egui::Ui) {
@@ -376,22 +682,43 @@ impl KasinaApp {
             .num_columns(2)
             .show(ui, |ui| {
                 diagnostic_row(ui, "Connection", &self.model.connection);
-                diagnostic_row(ui, "GPU", &self.renderer_name);
                 diagnostic_row(
                     ui,
-                    "Frame average",
+                    "GPU",
                     &format!(
-                        "{:.3} ms",
-                        self.frame_stats.average().as_secs_f64() * 1_000.0
+                        "{} ({}, {})",
+                        self.renderer_name, self.renderer_backend, self.renderer_device_type
                     ),
                 );
                 diagnostic_row(
                     ui,
-                    "Frame p95 / p99",
+                    "Frame interval average",
+                    &format!(
+                        "{:.3} ms",
+                        milliseconds(self.frame_interval_stats.average())
+                    ),
+                );
+                diagnostic_row(
+                    ui,
+                    "Frame interval p95 / p99",
                     &format!(
                         "{:.3} / {:.3} ms",
-                        self.frame_stats.percentile(0.95).as_secs_f64() * 1_000.0,
-                        self.frame_stats.percentile(0.99).as_secs_f64() * 1_000.0
+                        milliseconds(self.frame_interval_stats.percentile(0.95)),
+                        milliseconds(self.frame_interval_stats.percentile(0.99))
+                    ),
+                );
+                diagnostic_row(
+                    ui,
+                    "UI CPU average",
+                    &format!("{:.3} ms", milliseconds(self.ui_cpu_stats.average())),
+                );
+                diagnostic_row(
+                    ui,
+                    "UI CPU p95 / p99",
+                    &format!(
+                        "{:.3} / {:.3} ms",
+                        milliseconds(self.ui_cpu_stats.percentile(0.95)),
+                        milliseconds(self.ui_cpu_stats.percentile(0.99))
                     ),
                 );
                 diagnostic_row(
@@ -403,6 +730,29 @@ impl KasinaApp {
                     ui,
                     "Latest GPU upload",
                     &format!("{} bytes", prepare.uploaded_bytes()),
+                );
+                diagnostic_row(
+                    ui,
+                    "Surface outdated / lost",
+                    &format!(
+                        "{} / {}",
+                        self.surface_health.outdated.load(Ordering::Relaxed),
+                        self.surface_health.lost.load(Ordering::Relaxed)
+                    ),
+                );
+                diagnostic_row(
+                    ui,
+                    "Surface occluded / other",
+                    &format!(
+                        "{} / {}",
+                        self.surface_health.occluded.load(Ordering::Relaxed),
+                        self.surface_health.other.load(Ordering::Relaxed)
+                    ),
+                );
+                diagnostic_row(
+                    ui,
+                    "Device loss",
+                    self.device_lost.lock().as_deref().unwrap_or("none"),
                 );
                 diagnostic_row(
                     ui,
@@ -443,6 +793,134 @@ impl KasinaApp {
                 }
             });
     }
+
+    fn record_benchmark_frame(
+        &mut self,
+        context: &egui::Context,
+        now: Instant,
+        frame_interval: Duration,
+        ui_cpu_time: Duration,
+    ) {
+        let Some(benchmark) = &mut self.benchmark else {
+            return;
+        };
+        if benchmark.recording(now) {
+            benchmark.frame_intervals.record(frame_interval, 0);
+            benchmark.ui_cpu_times.record(ui_cpu_time, 0);
+        }
+        if now < benchmark.measurement_end || benchmark.submitted {
+            return;
+        }
+
+        benchmark.submitted = true;
+        let viewport = context.input(|input| input.viewport().clone());
+        let pixels_per_point = context.pixels_per_point();
+        let logical_viewport_points = viewport
+            .inner_rect
+            .map(|rect| [rect.width(), rect.height()]);
+        let physical_viewport_pixels = logical_viewport_points.map(|size| {
+            [
+                (size[0] * pixels_per_point).round().max(0.0) as u32,
+                (size[1] * pixels_per_point).round().max(0.0) as u32,
+            ]
+        });
+        let prepare = self
+            .renderer
+            .as_ref()
+            .map(BiofeedbackRenderer::prepare_stats)
+            .unwrap_or_default();
+        let p99_ms = milliseconds(benchmark.frame_intervals.percentile(0.99));
+        let (target_frame_interval_ms, sample_count_sufficient, target_met) = frame_target_result(
+            self.renderer_hardware_accelerated,
+            self.display_refresh_hz,
+            benchmark.duration,
+            benchmark.frame_intervals.len(),
+            p99_ms,
+        );
+        let report = RenderBenchmarkReport {
+            schema_version: 1,
+            package_version: env!("CARGO_PKG_VERSION"),
+            source_revision: option_env!("KASINA_BUILD_REVISION").unwrap_or("unknown"),
+            operating_system: std::env::consts::OS,
+            architecture: std::env::consts::ARCH,
+            adapter: self.renderer_name.clone(),
+            backend: self.renderer_backend.clone(),
+            device_type: self.renderer_device_type.clone(),
+            driver: self.renderer_driver.clone(),
+            driver_info: self.renderer_driver_info.clone(),
+            hardware_accelerated: self.renderer_hardware_accelerated,
+            logical_viewport_points,
+            physical_viewport_pixels,
+            native_pixels_per_point: viewport.native_pixels_per_point,
+            fullscreen: viewport.fullscreen,
+            stress_instances: self.stress_instances,
+            declared_display_refresh_hz: self.display_refresh_hz,
+            target_frame_interval_ms,
+            sample_count_sufficient,
+            target_met,
+            warmup_seconds: benchmark.warmup.as_secs_f64(),
+            measured_seconds: benchmark.duration.as_secs_f64(),
+            measured_frames: benchmark.frame_intervals.len(),
+            frame_interval_average_ms: milliseconds(benchmark.frame_intervals.average()),
+            frame_interval_p95_ms: milliseconds(benchmark.frame_intervals.percentile(0.95)),
+            frame_interval_p99_ms: p99_ms,
+            ui_cpu_average_ms: milliseconds(benchmark.ui_cpu_times.average()),
+            ui_cpu_p95_ms: milliseconds(benchmark.ui_cpu_times.percentile(0.95)),
+            ui_cpu_p99_ms: milliseconds(benchmark.ui_cpu_times.percentile(0.99)),
+            wgpu_prepare_average_ms: milliseconds(prepare.average()),
+            wgpu_prepare_p95_ms: milliseconds(prepare.percentile(0.95)),
+            wgpu_prepare_p99_ms: milliseconds(prepare.percentile(0.99)),
+            latest_upload_bytes: prepare.uploaded_bytes(),
+            surface_outdated_events: self.surface_health.outdated.load(Ordering::Relaxed),
+            surface_lost_events: self.surface_health.lost.load(Ordering::Relaxed),
+            surface_occluded_events: self.surface_health.occluded.load(Ordering::Relaxed),
+            surface_other_events: self.surface_health.other.load(Ordering::Relaxed),
+            device_lost: self.device_lost.lock().clone(),
+            note: "Treat this as a native-GPU performance result only when renderer identifies the physical adapter and the run used a normal desktop session.",
+        };
+        let output = benchmark.output.clone();
+        self.benchmark_status = Some(format!("Writing benchmark to {}", output.display()));
+        benchmark.writer = Some(
+            std::thread::Builder::new()
+                .name("kasina-benchmark-writer".to_owned())
+                .spawn(move || {
+                    let encoded = serde_json::to_vec_pretty(&report)
+                        .map_err(|error| format!("serialize benchmark report: {error}"))?;
+                    fs::write(&output, encoded).map_err(|error| {
+                        format!("write benchmark report at {}: {error}", output.display())
+                    })
+                })
+                .expect("the operating system should allow the benchmark writer thread"),
+        );
+        context.request_repaint_after(Duration::from_millis(10));
+    }
+
+    fn poll_benchmark_writer(&mut self, context: &egui::Context) {
+        let Some(benchmark) = &mut self.benchmark else {
+            return;
+        };
+        let Some(writer) = benchmark.writer.as_ref() else {
+            return;
+        };
+        if !writer.is_finished() {
+            context.request_repaint_after(Duration::from_millis(10));
+            return;
+        }
+        let outcome = benchmark
+            .writer
+            .take()
+            .expect("checked benchmark writer")
+            .join()
+            .map_err(|_| "benchmark writer panicked".to_owned())
+            .and_then(std::convert::identity);
+        match outcome {
+            Ok(()) => {
+                tracing::info!(path = %benchmark.output.display(), "render benchmark written")
+            }
+            Err(error) => tracing::error!(%error, "render benchmark failed"),
+        }
+        context.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
 }
 
 impl eframe::App for KasinaApp {
@@ -452,12 +930,18 @@ impl eframe::App for KasinaApp {
             self.fullscreen = !self.fullscreen;
             context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
+        let viewport_visible = context.input(|input| input.viewport().visible());
+        if let Some(interval) = animation_repaint_interval(self.view, viewport_visible) {
+            context.request_repaint_after(interval);
+        }
+        self.poll_benchmark_writer(context);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ui_started = Instant::now();
         let now = Instant::now();
-        self.frame_stats
-            .record(now.duration_since(self.last_frame), 0);
+        let frame_interval = now.duration_since(self.last_frame);
+        self.frame_interval_stats.record(frame_interval, 0);
         self.last_frame = now;
         self.top_bar(ui);
         self.navigation(ui);
@@ -467,6 +951,9 @@ impl eframe::App for KasinaApp {
             View::Visualizer => self.visualizer(ui),
             View::Diagnostics => self.diagnostics(ui),
         });
+        let ui_cpu_time = ui_started.elapsed();
+        self.ui_cpu_stats.record(ui_cpu_time, 0);
+        self.record_benchmark_frame(ui.ctx(), now, frame_interval, ui_cpu_time);
     }
 }
 
@@ -847,5 +1334,94 @@ mod tests {
         assert_eq!(batch.samples.len(), 1);
         assert_eq!(batch.samples[0].sequence, 6);
         assert_eq!(cursors[&(StreamKind::HeartRate as i32)], 6);
+    }
+
+    #[test]
+    fn continuous_animation_requires_a_visible_visualizer() {
+        assert_eq!(
+            animation_repaint_interval(View::Visualizer, Some(true)),
+            Some(ANIMATION_INTERVAL)
+        );
+        assert_eq!(
+            animation_repaint_interval(View::Visualizer, None),
+            Some(ANIMATION_INTERVAL)
+        );
+        assert_eq!(
+            animation_repaint_interval(View::Visualizer, Some(false)),
+            None
+        );
+        assert_eq!(
+            animation_repaint_interval(View::Dashboard, Some(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn surface_statuses_choose_recovery_actions_and_are_counted() {
+        let health = Arc::new(SurfaceHealth::default());
+        let handler = surface_status_handler(Arc::clone(&health));
+        assert!(matches!(
+            handler(&eframe::wgpu::CurrentSurfaceTexture::Outdated),
+            eframe::egui_wgpu::SurfaceErrorAction::Reconfigure
+        ));
+        assert!(matches!(
+            handler(&eframe::wgpu::CurrentSurfaceTexture::Lost),
+            eframe::egui_wgpu::SurfaceErrorAction::RecreateSurface
+        ));
+        assert!(matches!(
+            handler(&eframe::wgpu::CurrentSurfaceTexture::Occluded),
+            eframe::egui_wgpu::SurfaceErrorAction::SkipFrame
+        ));
+        assert!(matches!(
+            handler(&eframe::wgpu::CurrentSurfaceTexture::Timeout),
+            eframe::egui_wgpu::SurfaceErrorAction::SkipFrame
+        ));
+        assert_eq!(health.outdated.load(Ordering::Relaxed), 1);
+        assert_eq!(health.lost.load(Ordering::Relaxed), 1);
+        assert_eq!(health.occluded.load(Ordering::Relaxed), 1);
+        assert_eq!(health.other.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn benchmark_cli_rejects_non_finite_and_non_positive_durations() {
+        for invalid in ["0", "-1", "301", "NaN", "inf"] {
+            assert!(
+                Args::try_parse_from(["kasina-app", "--render-benchmark-seconds", invalid])
+                    .is_err(),
+                "duration {invalid} should be rejected"
+            );
+        }
+        let args = Args::try_parse_from([
+            "kasina-app",
+            "--render-benchmark-seconds",
+            "10",
+            "--stress-instances",
+            "100000",
+        ])
+        .unwrap();
+        assert_eq!(args.render_benchmark_seconds, Some(10.0));
+        assert_eq!(args.stress_instances, 100_000);
+        assert!(Args::try_parse_from(["kasina-app", "--display-refresh-hz", "1001"]).is_err());
+    }
+
+    #[test]
+    fn frame_target_requires_hardware_and_enough_samples() {
+        let duration = Duration::from_secs(10);
+        assert_eq!(
+            frame_target_result(false, Some(60.0), duration, 600, 10.0),
+            (Some(1_000.0 / 60.0), Some(true), Some(false))
+        );
+        assert_eq!(
+            frame_target_result(true, Some(60.0), duration, 20, 10.0),
+            (Some(1_000.0 / 60.0), Some(false), Some(false))
+        );
+        assert_eq!(
+            frame_target_result(true, Some(120.0), duration, 1_200, 8.0),
+            (Some(1_000.0 / 120.0), Some(true), Some(true))
+        );
+        assert_eq!(
+            frame_target_result(true, None, duration, 1_200, 8.0),
+            (None, None, None)
+        );
     }
 }

@@ -14,5 +14,9 @@ parking_lot.workspace = true
 [dev-dependencies]
 naga.workspace = true
 
+[[bench]]
+name = "prepare_visual_frame"
+harness = false
+
 [lints]
 workspace = true

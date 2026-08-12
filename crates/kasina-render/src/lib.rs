@@ -89,7 +89,7 @@ impl Default for FrameStats {
     }
 }
 
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 struct VisualUniforms {
     time_seconds: f32,
@@ -98,6 +98,49 @@ struct VisualUniforms {
     _padding: u32,
     viewport_points: [f32; 2],
     _padding_2: [f32; 2],
+}
+
+/// CPU-side input prepared for one biofeedback draw.
+///
+/// Construction performs all normalization needed before the callback reaches wgpu. The
+/// resulting uniform upload is fixed at 32 bytes regardless of the instance count.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedVisualFrame {
+    uniforms: VisualUniforms,
+}
+
+impl PreparedVisualFrame {
+    /// Normalize one frame of visual state into the exact GPU uniform layout.
+    #[must_use]
+    pub fn new(
+        time_seconds: f32,
+        respiration: f32,
+        instance_count: u32,
+        viewport_points: [f32; 2],
+    ) -> Self {
+        Self {
+            uniforms: VisualUniforms {
+                time_seconds,
+                respiration: respiration.clamp(0.0, 1.0),
+                instance_count: instance_count.max(1),
+                _padding: 0,
+                viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
+                _padding_2: [0.0; 2],
+            },
+        }
+    }
+
+    /// Exact bytes queued to the retained uniform buffer.
+    #[must_use]
+    pub fn upload_bytes(&self) -> &[u8] {
+        bytemuck::bytes_of(&self.uniforms)
+    }
+
+    /// Number of instances emitted by the draw call.
+    #[must_use]
+    pub const fn instance_count(&self) -> u32 {
+        self.uniforms.instance_count
+    }
 }
 
 struct BiofeedbackResources {
@@ -220,18 +263,16 @@ impl BiofeedbackRenderer {
         stress_instances: u32,
     ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
-        let uniforms = VisualUniforms {
+        let prepared = PreparedVisualFrame::new(
             time_seconds,
-            respiration: respiration.clamp(0.0, 1.0),
-            instance_count: stress_instances.max(1),
-            _padding: 0,
-            viewport_points: [rect.width(), rect.height()],
-            _padding_2: [0.0; 2],
-        };
+            respiration,
+            stress_instances,
+            [rect.width(), rect.height()],
+        );
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             BiofeedbackCallback {
-                uniforms,
+                uniforms: prepared.uniforms,
                 prepare_stats: Arc::clone(&self.prepare_stats),
             },
         ));
@@ -316,5 +357,19 @@ mod tests {
     #[test]
     fn biofeedback_shader_parses_without_a_gpu() {
         naga::front::wgsl::parse_str(include_str!("biofeedback.wgsl")).unwrap();
+    }
+
+    #[test]
+    fn prepared_frame_clamps_inputs_and_has_a_fixed_upload() {
+        let low = PreparedVisualFrame::new(2.0, -4.0, 0, [0.0, -10.0]);
+        let high = PreparedVisualFrame::new(2.0, 4.0, 100_000, [1_920.0, 1_080.0]);
+
+        assert_eq!(low.uniforms.respiration, 0.0);
+        assert_eq!(low.uniforms.instance_count, 1);
+        assert_eq!(low.uniforms.viewport_points, [1.0, 1.0]);
+        assert_eq!(high.uniforms.respiration, 1.0);
+        assert_eq!(high.uniforms.instance_count, 100_000);
+        assert_eq!(low.upload_bytes().len(), 32);
+        assert_eq!(high.upload_bytes().len(), low.upload_bytes().len());
     }
 }

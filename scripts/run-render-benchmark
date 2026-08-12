@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+duration_seconds=${1:-30}
+output_path=${2:-render-benchmark.json}
+instance_count=${3:-8000}
+display_refresh_hz=${4:-}
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(dirname -- "$script_dir")
+cd "$project_dir"
+temporary_output="${output_path}.tmp.$$"
+trap 'rm -f "$temporary_output"' EXIT HUP INT TERM
+
+if revision=$(git rev-parse --verify HEAD 2>/dev/null); then
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        revision="${revision}-dirty"
+    fi
+elif revision=$(git --git-dir=.git-local --work-tree=. rev-parse --verify HEAD 2>/dev/null); then
+    if [ -n "$(git --git-dir=.git-local --work-tree=. status --porcelain 2>/dev/null)" ]; then
+        revision="${revision}-dirty"
+    fi
+else
+    revision=unknown
+fi
+
+if [ -n "$display_refresh_hz" ]; then
+    KASINA_BUILD_REVISION="$revision" "$script_dir/cargo-local" run \
+        --release \
+        -p kasina-app \
+        -- \
+        --render-benchmark-seconds "$duration_seconds" \
+        --benchmark-output "$temporary_output" \
+        --stress-instances "$instance_count" \
+        --display-refresh-hz "$display_refresh_hz"
+else
+    KASINA_BUILD_REVISION="$revision" "$script_dir/cargo-local" run \
+        --release \
+        -p kasina-app \
+        -- \
+        --render-benchmark-seconds "$duration_seconds" \
+        --benchmark-output "$temporary_output" \
+        --stress-instances "$instance_count"
+fi
+
+if [ ! -s "$temporary_output" ]; then
+    printf 'newKasina benchmark did not produce a report at %s\n' "$temporary_output" >&2
+    exit 1
+fi
+mv -f "$temporary_output" "$output_path"
+trap - EXIT HUP INT TERM
+printf 'newKasina benchmark report: %s\n' "$output_path"

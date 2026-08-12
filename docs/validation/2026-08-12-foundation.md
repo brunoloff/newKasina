@@ -20,14 +20,28 @@ Results:
 
 - formatting: pass;
 - Clippy with warnings denied: pass;
-- 23 unit/integration tests plus doc tests: pass;
+- 28 unit/integration tests plus doc tests: pass;
 - optimized workspace build: pass.
 
 The test coverage includes bounded retention and cursor gaps, replay ordering, low-pass
 and RMSSD reference calculations, Polar packets, Go Direct commands/reassembly/values,
 WGSL parsing, protocol authentication/version skew, service broadcast lag, UI queue
 backpressure, live/history overlap removal, multi-device supervision, and service
-continuity across client restart.
+continuity across client restart. Rendering coverage also proves fixed-size normalized
+uniform preparation, surface-error recovery routing/counters, and that continuous repaint
+is requested only for a visible visualizer, leaving inactive and minimized views
+event-driven. A wgpu device-loss callback retains an actionable diagnostic independently
+of the service process.
+
+The targeted release benchmark for CPU-side renderer preparation ran with:
+
+```sh
+scripts/cargo-local bench -p kasina-render --bench prepare_visual_frame
+```
+
+It prepared 20,000,000 varying frames in 60.983 ms (3.049 ns/frame) on this host. The
+prepared upload remains 32 bytes for both one and 100,000 instances; particle geometry is
+generated in the vertex shader rather than rebuilt on the CPU.
 
 ## Release process smoke test
 
@@ -64,12 +78,31 @@ Observed:
 - callback preparation averaged roughly 0.01 ms and uploaded 32 bytes per animated frame
   under llvmpipe; overall software frame timings are not comparable to the target GPU.
 
+The automated benchmark path was also exercised against llvmpipe for one measured second
+after a two-second warm-up. It wrote valid JSON, recorded the source tree as dirty, named
+the OpenGL CPU adapter and Mesa driver, captured logical/physical viewport and scale,
+recorded 89 frames, found the sample count sufficient, and still set `hardware_accelerated`
+and `target_met` to `false`. Its frame-interval p99 was 14.469 ms, UI-CPU p99 was 0.355 ms,
+and callback p99 was 0.017 ms. All surface-event counters remained zero and device loss
+remained null. The harness then atomically installed its JSON output and exited without
+intervention. This proves report generation and conservative result classification, not
+the 60 Hz performance target.
+
 ## Native checks still required
 
-From the normal desktop session, run the service and app in release mode, open the GPU
-visualizer, and record Diagnostics at 60 Hz and 120 Hz where supported. Exercise F11,
-window resizing, minimizing, and a mixed-DPI monitor move. Record adapter, backend,
-resolution, refresh rate, instance count, average/p95/p99 frame time, and upload bytes.
+From the normal desktop session, run the automated release benchmark at each externally
+confirmed active display refresh rate:
+
+```sh
+scripts/run-render-benchmark 30 render-benchmark-60hz.json 8000 60
+scripts/run-render-benchmark 30 render-benchmark-120hz.json 8000 120
+```
+
+Confirm that `hardware_accelerated` and `target_met` are both true. Also run the service
+and app interactively, exercise controls while the visualizer runs, press F11, resize,
+minimize/restore, move between mixed-DPI monitors, and confirm that the Diagnostics view
+remains free of wgpu validation/surface errors. Device-loss recovery requires a platform-
+appropriate forced reset or suspend/resume test; record the procedure with the report.
 
 Physical Milestone 3 checks additionally require the Polar H10 and respiration belt:
 side-by-side values against pyKasina, power-cycle recovery, and the eight-hour soak.
