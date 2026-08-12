@@ -1,0 +1,5 @@
+# Synthetic fixture; it contains no human biometric data.
+{"delay_ms":0,"stream":"RespirationForce","source_id":"fixture:belt","device_time_ns":null,"value":50.0,"quality_flags":1}
+{"delay_ms":100,"stream":"RespirationForce","source_id":"fixture:belt","device_time_ns":null,"value":53.0,"quality_flags":1}
+{"delay_ms":0,"stream":"HeartRate","source_id":"fixture:polar","device_time_ns":null,"value":64.0,"quality_flags":1}
+{"delay_ms":0,"stream":"RrInterval","source_id":"fixture:polar","device_time_ns":null,"value":937500.0,"quality_flags":1}

@@ -1,0 +1,32 @@
+[package]
+name = "kasina-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+clap.workspace = true
+directories.workspace = true
+fs2.workspace = true
+futures.workspace = true
+kasina-devices = { path = "../kasina-devices" }
+kasina-domain = { path = "../kasina-domain" }
+kasina-protocol = { path = "../kasina-protocol" }
+parking_lot.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.26.0"
+
+[lints]
+workspace = true
+

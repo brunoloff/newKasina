@@ -1,0 +1,787 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context as _, Result, anyhow, bail};
+use clap::Parser;
+use kasina_protocol::v1::kasina_client::KasinaClient;
+use kasina_protocol::v1::{
+    Sample, SampleBatch, SamplesSinceRequest, ServiceInfo, StatusSnapshot, StreamCursor,
+    StreamKind, SubscribeRequest,
+};
+use kasina_protocol::{AUTH_HEADER, client_hello};
+use kasina_render::{BiofeedbackRenderer, FrameStats};
+use tokio_util::sync::CancellationToken;
+use tonic::Request;
+use tonic::metadata::MetadataValue;
+use tonic::transport::Endpoint;
+use tracing::{debug, warn};
+use tracing_subscriber::EnvFilter;
+
+const HISTORY_CAPACITY_PER_STREAM: usize = 6_000;
+const UI_EVENT_CAPACITY: usize = 256;
+
+#[derive(Debug, Parser)]
+#[command(about = "newKasina biofeedback desktop client")]
+struct Args {
+    /// Loopback acquisition service endpoint.
+    #[arg(long, default_value = "http://127.0.0.1:18861")]
+    endpoint: String,
+    /// Override the standard service authentication-token path.
+    #[arg(long)]
+    token_path: Option<PathBuf>,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+    let args = Args::parse();
+    eframe::run_native(
+        "newKasina",
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1_180.0, 780.0])
+                .with_min_inner_size([760.0, 500.0]),
+            ..Default::default()
+        },
+        Box::new(move |creation_context| Ok(Box::new(KasinaApp::new(creation_context, args)?))),
+    )
+    .map_err(|error| anyhow!(error.to_string()))
+}
+
+fn default_token_path() -> Result<PathBuf> {
+    let project = directories::ProjectDirs::from("org", "newkasina", "newKasina")
+        .context("operating system did not provide a user configuration directory")?;
+    Ok(project.config_dir().join("service-token"))
+}
+
+#[derive(Debug)]
+enum ClientEvent {
+    Connection(String),
+    ServiceInfo(ServiceInfo),
+    Status(StatusSnapshot),
+    Samples(SampleBatch),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Dashboard,
+    Raw,
+    Visualizer,
+    Diagnostics,
+}
+
+#[derive(Debug)]
+struct ClientModel {
+    connection: String,
+    service_info: Option<ServiceInfo>,
+    status: Option<StatusSnapshot>,
+    samples: BTreeMap<i32, VecDeque<Sample>>,
+    last_sequences: BTreeMap<i32, u64>,
+    explicit_gap_samples: u64,
+    inferred_gap_samples: u64,
+    duplicate_samples: u64,
+}
+
+impl Default for ClientModel {
+    fn default() -> Self {
+        Self {
+            connection: "waiting for acquisition service".to_owned(),
+            service_info: None,
+            status: None,
+            samples: BTreeMap::new(),
+            last_sequences: BTreeMap::new(),
+            explicit_gap_samples: 0,
+            inferred_gap_samples: 0,
+            duplicate_samples: 0,
+        }
+    }
+}
+
+impl ClientModel {
+    fn apply_batch(&mut self, batch: SampleBatch) {
+        self.explicit_gap_samples = self.explicit_gap_samples.saturating_add(
+            batch
+                .gaps
+                .iter()
+                .map(|gap| gap.dropped_samples)
+                .sum::<u64>(),
+        );
+        for sample in batch.samples {
+            let previous = self
+                .last_sequences
+                .get(&sample.stream)
+                .copied()
+                .unwrap_or(0);
+            if sample.sequence <= previous {
+                self.duplicate_samples = self.duplicate_samples.saturating_add(1);
+                continue;
+            }
+            if previous != 0 && sample.sequence > previous.saturating_add(1) {
+                self.inferred_gap_samples = self
+                    .inferred_gap_samples
+                    .saturating_add(sample.sequence - previous - 1);
+            }
+            self.last_sequences.insert(sample.stream, sample.sequence);
+            let history = self.samples.entry(sample.stream).or_default();
+            if history.len() == HISTORY_CAPACITY_PER_STREAM {
+                history.pop_front();
+            }
+            history.push_back(sample);
+        }
+    }
+
+    fn latest(&self, stream: StreamKind) -> Option<&Sample> {
+        self.samples.get(&(stream as i32))?.back()
+    }
+}
+
+struct KasinaApp {
+    endpoint: String,
+    view: View,
+    events: Receiver<ClientEvent>,
+    cancellation: CancellationToken,
+    network_thread: Option<JoinHandle<()>>,
+    ui_dropped_batches: Arc<AtomicU64>,
+    model: ClientModel,
+    renderer: Option<BiofeedbackRenderer>,
+    renderer_name: String,
+    stress_instances: u32,
+    started: Instant,
+    last_frame: Instant,
+    frame_stats: FrameStats,
+}
+
+impl KasinaApp {
+    fn new(creation_context: &eframe::CreationContext<'_>, args: Args) -> Result<Self> {
+        let token_path = args.token_path.unwrap_or(default_token_path()?);
+        let renderer = creation_context
+            .wgpu_render_state
+            .as_ref()
+            .map(BiofeedbackRenderer::new);
+        let renderer_name = creation_context.wgpu_render_state.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |state| {
+                let info = state.adapter.get_info();
+                format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type)
+            },
+        );
+        let (sender, events) = std::sync::mpsc::sync_channel(UI_EVENT_CAPACITY);
+        let cancellation = CancellationToken::new();
+        let ui_dropped_batches = Arc::new(AtomicU64::new(0));
+        let network_thread = Some(spawn_network_thread(
+            args.endpoint.clone(),
+            token_path,
+            sender,
+            cancellation.clone(),
+            Arc::clone(&ui_dropped_batches),
+            creation_context.egui_ctx.clone(),
+        ));
+        let now = Instant::now();
+        Ok(Self {
+            endpoint: args.endpoint,
+            view: View::Dashboard,
+            events,
+            cancellation,
+            network_thread,
+            ui_dropped_batches,
+            model: ClientModel::default(),
+            renderer,
+            renderer_name,
+            stress_instances: 8_000,
+            started: now,
+            last_frame: now,
+            frame_stats: FrameStats::default(),
+        })
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                ClientEvent::Connection(connection) => self.model.connection = connection,
+                ClientEvent::ServiceInfo(info) => self.model.service_info = Some(info),
+                ClientEvent::Status(status) => self.model.status = Some(status),
+                ClientEvent::Samples(batch) => self.model.apply_batch(batch),
+            }
+        }
+    }
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("top_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("newKasina");
+                ui.separator();
+                ui.label(&self.model.connection);
+                ui.separator();
+                metric_label(ui, "HR", self.model.latest(StreamKind::HeartRate), 1.0);
+                metric_label(ui, "RR", self.model.latest(StreamKind::RrInterval), 0.001);
+                metric_label(
+                    ui,
+                    "Breath",
+                    self.model.latest(StreamKind::RespirationForce),
+                    1.0,
+                );
+            });
+        });
+    }
+
+    fn navigation(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("navigation")
+            .resizable(false)
+            .default_size(135.0)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                for (view, label) in [
+                    (View::Dashboard, "Dashboard"),
+                    (View::Raw, "Raw signals"),
+                    (View::Visualizer, "GPU visualizer"),
+                    (View::Diagnostics, "Diagnostics"),
+                ] {
+                    if ui.selectable_label(self.view == view, label).clicked() {
+                        self.view = view;
+                    }
+                }
+            });
+    }
+
+    fn dashboard(&self, ui: &mut egui::Ui) {
+        ui.heading("Live biofeedback");
+        ui.label("Sensor acquisition stays in kasina-service when this window closes.");
+        ui.add_space(12.0);
+        egui::Grid::new("summary_grid")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Service endpoint");
+                ui.label(&self.endpoint);
+                ui.end_row();
+                ui.strong("Service instance");
+                ui.label(
+                    self.model
+                        .service_info
+                        .as_ref()
+                        .map_or("—", |info| info.instance_id.as_str()),
+                );
+                ui.end_row();
+                ui.strong("Retained UI samples");
+                ui.label(
+                    self.model
+                        .samples
+                        .values()
+                        .map(VecDeque::len)
+                        .sum::<usize>()
+                        .to_string(),
+                );
+                ui.end_row();
+            });
+        ui.add_space(16.0);
+        draw_signal(
+            ui,
+            "Respiration force",
+            self.model
+                .samples
+                .get(&(StreamKind::RespirationForce as i32)),
+            egui::Color32::from_rgb(80, 190, 220),
+            220.0,
+        );
+    }
+
+    fn raw_signals(&self, ui: &mut egui::Ui) {
+        ui.heading("Raw service streams");
+        draw_signal(
+            ui,
+            "Respiration force",
+            self.model
+                .samples
+                .get(&(StreamKind::RespirationForce as i32)),
+            egui::Color32::from_rgb(80, 190, 220),
+            210.0,
+        );
+        draw_signal(
+            ui,
+            "Heart rate",
+            self.model.samples.get(&(StreamKind::HeartRate as i32)),
+            egui::Color32::from_rgb(230, 92, 116),
+            160.0,
+        );
+        draw_signal(
+            ui,
+            "RR interval",
+            self.model.samples.get(&(StreamKind::RrInterval as i32)),
+            egui::Color32::from_rgb(210, 160, 90),
+            160.0,
+        );
+    }
+
+    fn visualizer(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Retained wgpu visualizer");
+            ui.add(
+                egui::Slider::new(&mut self.stress_instances, 100..=100_000)
+                    .logarithmic(true)
+                    .text("instances"),
+            );
+        });
+        let respiration = self
+            .model
+            .latest(StreamKind::RespirationForce)
+            .map_or(0.5, |sample| {
+                ((sample.value - 25.0) / 50.0).clamp(0.0, 1.0) as f32
+            });
+        let size = egui::vec2(
+            ui.available_width(),
+            (ui.available_height() - 36.0).max(180.0),
+        );
+        if let Some(renderer) = &self.renderer {
+            renderer.paint(
+                ui,
+                size,
+                self.started.elapsed().as_secs_f32(),
+                respiration,
+                self.stress_instances,
+            );
+        } else {
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 8.0, egui::Color32::from_rgb(18, 24, 34));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "wgpu renderer unavailable",
+                egui::FontId::proportional(18.0),
+                egui::Color32::LIGHT_GRAY,
+            );
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(8));
+    }
+
+    fn diagnostics(&self, ui: &mut egui::Ui) {
+        ui.heading("Diagnostics");
+        let prepare = self
+            .renderer
+            .as_ref()
+            .map(BiofeedbackRenderer::prepare_stats)
+            .unwrap_or_default();
+        egui::Grid::new("diagnostics_grid")
+            .striped(true)
+            .num_columns(2)
+            .show(ui, |ui| {
+                diagnostic_row(ui, "Connection", &self.model.connection);
+                diagnostic_row(ui, "GPU", &self.renderer_name);
+                diagnostic_row(
+                    ui,
+                    "Frame average",
+                    &format!(
+                        "{:.3} ms",
+                        self.frame_stats.average().as_secs_f64() * 1_000.0
+                    ),
+                );
+                diagnostic_row(
+                    ui,
+                    "Frame p95 / p99",
+                    &format!(
+                        "{:.3} / {:.3} ms",
+                        self.frame_stats.percentile(0.95).as_secs_f64() * 1_000.0,
+                        self.frame_stats.percentile(0.99).as_secs_f64() * 1_000.0
+                    ),
+                );
+                diagnostic_row(
+                    ui,
+                    "wgpu prepare average",
+                    &format!("{:.3} ms", prepare.average().as_secs_f64() * 1_000.0),
+                );
+                diagnostic_row(
+                    ui,
+                    "Latest GPU upload",
+                    &format!("{} bytes", prepare.uploaded_bytes()),
+                );
+                diagnostic_row(
+                    ui,
+                    "Explicit service gaps",
+                    &self.model.explicit_gap_samples.to_string(),
+                );
+                diagnostic_row(
+                    ui,
+                    "Inferred UI sequence gaps",
+                    &self.model.inferred_gap_samples.to_string(),
+                );
+                diagnostic_row(
+                    ui,
+                    "Duplicate samples rejected",
+                    &self.model.duplicate_samples.to_string(),
+                );
+                diagnostic_row(
+                    ui,
+                    "UI event batches dropped",
+                    &self.ui_dropped_batches.load(Ordering::Relaxed).to_string(),
+                );
+                if let Some(status) = &self.model.status {
+                    diagnostic_row(
+                        ui,
+                        "Service transport lag",
+                        &status.transport_lagged_samples.to_string(),
+                    );
+                    diagnostic_row(
+                        ui,
+                        "Connected clients",
+                        &status.connected_clients.to_string(),
+                    );
+                    diagnostic_row(
+                        ui,
+                        "Service uptime",
+                        &format!("{:.1} s", status.uptime_millis as f64 / 1_000.0),
+                    );
+                }
+            });
+    }
+}
+
+impl eframe::App for KasinaApp {
+    fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_events();
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let now = Instant::now();
+        self.frame_stats
+            .record(now.duration_since(self.last_frame), 0);
+        self.last_frame = now;
+        self.top_bar(ui);
+        self.navigation(ui);
+        egui::CentralPanel::default().show(ui, |ui| match self.view {
+            View::Dashboard => self.dashboard(ui),
+            View::Raw => self.raw_signals(ui),
+            View::Visualizer => self.visualizer(ui),
+            View::Diagnostics => self.diagnostics(ui),
+        });
+    }
+}
+
+impl Drop for KasinaApp {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        let _detached = self.network_thread.take();
+    }
+}
+
+fn metric_label(ui: &mut egui::Ui, label: &str, sample: Option<&Sample>, scale: f64) {
+    if let Some(sample) = sample {
+        ui.label(format!("{label}: {:.1}", sample.value * scale));
+    } else {
+        ui.label(format!("{label}: —"));
+    }
+}
+
+fn diagnostic_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.strong(label);
+    ui.label(value);
+    ui.end_row();
+}
+
+fn draw_signal(
+    ui: &mut egui::Ui,
+    label: &str,
+    samples: Option<&VecDeque<Sample>>,
+    color: egui::Color32,
+    height: f32,
+) {
+    ui.label(label);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(rect, 5.0, egui::Color32::from_rgb(18, 22, 29));
+    let Some(samples) = samples else {
+        return;
+    };
+    if samples.len() < 2 {
+        return;
+    }
+    let visible = samples.iter().rev().take(600).collect::<Vec<_>>();
+    let (minimum, maximum) = visible.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(minimum, maximum), sample| (minimum.min(sample.value), maximum.max(sample.value)),
+    );
+    let span = (maximum - minimum).max(f64::EPSILON);
+    let divisor = (visible.len() - 1) as f32;
+    let mut previous = None;
+    for (index, sample) in visible.iter().rev().enumerate() {
+        let x = rect.left() + rect.width() * index as f32 / divisor;
+        let normalized = ((sample.value - minimum) / span) as f32;
+        let point = egui::pos2(x, rect.bottom() - normalized * rect.height());
+        if let Some(previous) = previous {
+            ui.painter()
+                .line_segment([previous, point], egui::Stroke::new(1.5, color));
+        }
+        previous = Some(point);
+    }
+}
+
+fn spawn_network_thread(
+    endpoint: String,
+    token_path: PathBuf,
+    sender: SyncSender<ClientEvent>,
+    cancellation: CancellationToken,
+    dropped_batches: Arc<AtomicU64>,
+    repaint: egui::Context,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("kasina-ipc".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = sender.try_send(ClientEvent::Connection(format!(
+                        "cannot start networking: {error}"
+                    )));
+                    repaint.request_repaint();
+                    return;
+                }
+            };
+            runtime.block_on(network_supervisor(
+                endpoint,
+                token_path,
+                sender,
+                cancellation,
+                dropped_batches,
+                repaint,
+            ));
+        })
+        .expect("the operating system should allow the IPC thread")
+}
+
+async fn network_supervisor(
+    endpoint: String,
+    token_path: PathBuf,
+    sender: SyncSender<ClientEvent>,
+    cancellation: CancellationToken,
+    dropped_batches: Arc<AtomicU64>,
+    repaint: egui::Context,
+) {
+    let mut cursors = BTreeMap::new();
+    let mut retry = Duration::from_millis(250);
+    while !cancellation.is_cancelled() {
+        send_event(
+            &sender,
+            ClientEvent::Connection("connecting to acquisition service".to_owned()),
+            &repaint,
+        );
+        let result = connected_session(
+            &endpoint,
+            &token_path,
+            &sender,
+            &cancellation,
+            &dropped_batches,
+            &repaint,
+            &mut cursors,
+        )
+        .await;
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let detail = match result {
+            Ok(()) => "service stream ended".to_owned(),
+            Err(error) => {
+                debug!(%error, "service client reconnecting");
+                format!("service unavailable: {error}; retrying")
+            }
+        };
+        send_event(&sender, ClientEvent::Connection(detail), &repaint);
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            () = tokio::time::sleep(retry) => {}
+        }
+        retry = (retry * 2).min(Duration::from_secs(5));
+    }
+}
+
+async fn connected_session(
+    endpoint: &str,
+    token_path: &PathBuf,
+    sender: &SyncSender<ClientEvent>,
+    cancellation: &CancellationToken,
+    dropped_batches: &AtomicU64,
+    repaint: &egui::Context,
+    cursors: &mut BTreeMap<i32, u64>,
+) -> Result<()> {
+    let token = fs::read_to_string(token_path)
+        .with_context(|| format!("read service token at {}", token_path.display()))?;
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("service token file is empty");
+    }
+    let channel = Endpoint::from_shared(endpoint.to_owned())?
+        .connect_timeout(Duration::from_secs(2))
+        .connect()
+        .await
+        .context("connect loopback RPC")?;
+    let mut client = KasinaClient::new(channel);
+    let info = client
+        .get_service_info(authenticated_request(
+            client_hello("kasina-app", env!("CARGO_PKG_VERSION")),
+            token,
+        )?)
+        .await?
+        .into_inner();
+    send_event(sender, ClientEvent::ServiceInfo(info), repaint);
+
+    let streams = all_streams();
+    let history = client
+        .get_samples_since(authenticated_request(
+            SamplesSinceRequest {
+                client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
+                cursors: streams
+                    .iter()
+                    .map(|stream| StreamCursor {
+                        stream: *stream,
+                        after_sequence: cursors.get(stream).copied().unwrap_or(0),
+                    })
+                    .collect(),
+            },
+            token,
+        )?)
+        .await?
+        .into_inner();
+    publish_batch(history, sender, dropped_batches, repaint, cursors)?;
+
+    let mut sample_stream = client
+        .subscribe_samples(authenticated_request(
+            SubscribeRequest {
+                client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
+                streams: streams.clone(),
+            },
+            token,
+        )?)
+        .await?
+        .into_inner();
+    let mut status_client = client.clone();
+    let mut status_tick = tokio::time::interval(Duration::from_millis(500));
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    send_event(
+        sender,
+        ClientEvent::Connection("connected; receiving live samples".to_owned()),
+        repaint,
+    );
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => return Ok(()),
+            message = sample_stream.message() => {
+                let Some(batch) = message? else {
+                    bail!("sample stream closed");
+                };
+                publish_batch(batch, sender, dropped_batches, repaint, cursors)?;
+            }
+            _ = status_tick.tick() => {
+                match status_client.get_status(authenticated_request(
+                    client_hello("kasina-app", env!("CARGO_PKG_VERSION")),
+                    token,
+                )?).await {
+                    Ok(status) => send_event(sender, ClientEvent::Status(status.into_inner()), repaint),
+                    Err(error) => warn!(%error, "status refresh failed"),
+                }
+            }
+        }
+    }
+}
+
+fn publish_batch(
+    batch: SampleBatch,
+    sender: &SyncSender<ClientEvent>,
+    dropped_batches: &AtomicU64,
+    repaint: &egui::Context,
+    cursors: &mut BTreeMap<i32, u64>,
+) -> Result<()> {
+    let next_cursors: Vec<_> = batch
+        .samples
+        .iter()
+        .map(|sample| (sample.stream, sample.sequence))
+        .collect();
+    match sender.try_send(ClientEvent::Samples(batch)) {
+        Ok(()) => {
+            for (stream, sequence) in next_cursors {
+                let cursor = cursors.entry(stream).or_insert(0);
+                *cursor = (*cursor).max(sequence);
+            }
+            repaint.request_repaint();
+            Ok(())
+        }
+        Err(TrySendError::Full(_)) => {
+            dropped_batches.fetch_add(1, Ordering::Relaxed);
+            bail!("UI event queue reached backpressure limit")
+        }
+        Err(TrySendError::Disconnected(_)) => bail!("UI event receiver closed"),
+    }
+}
+
+fn send_event(sender: &SyncSender<ClientEvent>, event: ClientEvent, repaint: &egui::Context) {
+    if sender.try_send(event).is_ok() {
+        repaint.request_repaint();
+    }
+}
+
+fn authenticated_request<T>(message: T, token: &str) -> Result<Request<T>> {
+    let value = MetadataValue::try_from(token).context("token is not valid RPC metadata")?;
+    let mut request = Request::new(message);
+    request.metadata_mut().insert(AUTH_HEADER, value);
+    Ok(request)
+}
+
+fn all_streams() -> Vec<i32> {
+    [
+        StreamKind::HeartRate,
+        StreamKind::RrInterval,
+        StreamKind::RespirationForce,
+        StreamKind::AccelerationX,
+        StreamKind::AccelerationY,
+        StreamKind::AccelerationZ,
+    ]
+    .map(|stream| stream as i32)
+    .to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(stream: StreamKind, sequence: u64) -> Sample {
+        Sample {
+            stream: stream as i32,
+            source_id: "test".to_owned(),
+            sequence,
+            monotonic_time_ns: sequence,
+            wall_time_unix_ns: sequence,
+            device_time_ns: None,
+            value: sequence as f64,
+            unit: "test".to_owned(),
+            quality_flags: 0,
+        }
+    }
+
+    #[test]
+    fn model_rejects_duplicates_and_counts_sequence_gaps() {
+        let mut model = ClientModel::default();
+        model.apply_batch(SampleBatch {
+            samples: vec![
+                sample(StreamKind::HeartRate, 1),
+                sample(StreamKind::HeartRate, 1),
+                sample(StreamKind::HeartRate, 3),
+            ],
+            gaps: Vec::new(),
+            service_batch_sequence: 1,
+        });
+        assert_eq!(model.duplicate_samples, 1);
+        assert_eq!(model.inferred_gap_samples, 1);
+        assert_eq!(model.last_sequences[&(StreamKind::HeartRate as i32)], 3);
+    }
+}

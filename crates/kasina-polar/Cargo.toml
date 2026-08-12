@@ -1,0 +1,22 @@
+[package]
+name = "kasina-polar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+btleplug.workspace = true
+futures.workspace = true
+kasina-devices = { path = "../kasina-devices" }
+kasina-domain = { path = "../kasina-domain" }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+/target/
+/.cargo-local/
+/.rustup-local/
+/.git-local/
+*.log
+*.profraw
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store

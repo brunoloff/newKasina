@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package kasina.v1;
+
+service Kasina {
+  rpc GetServiceInfo(ClientHello) returns (ServiceInfo);
+  rpc ListDevices(ClientHello) returns (DeviceList);
+  rpc SetDeviceConnection(DeviceCommand) returns (DeviceStatus);
+  rpc SetPreferredDevice(PreferredDeviceCommand) returns (DeviceStatus);
+  rpc GetStatus(ClientHello) returns (StatusSnapshot);
+  rpc SubscribeStatus(ClientHello) returns (stream StatusSnapshot);
+  rpc GetSamplesSince(SamplesSinceRequest) returns (SampleBatch);
+  rpc SubscribeSamples(SubscribeRequest) returns (stream SampleBatch);
+}
+
+message ClientHello {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string client_name = 3;
+  string client_version = 4;
+}
+
+message ServiceInfo {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string service_version = 3;
+  string instance_id = 4;
+  uint64 uptime_millis = 5;
+}
+
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  STREAM_KIND_HEART_RATE = 1;
+  STREAM_KIND_RR_INTERVAL = 2;
+  STREAM_KIND_RESPIRATION_FORCE = 3;
+  STREAM_KIND_ACCELERATION_X = 4;
+  STREAM_KIND_ACCELERATION_Y = 5;
+  STREAM_KIND_ACCELERATION_Z = 6;
+}
+
+message Sample {
+  StreamKind stream = 1;
+  string source_id = 2;
+  uint64 sequence = 3;
+  uint64 monotonic_time_ns = 4;
+  uint64 wall_time_unix_ns = 5;
+  optional uint64 device_time_ns = 6;
+  double value = 7;
+  string unit = 8;
+  uint32 quality_flags = 9;
+}
+
+message StreamCursor {
+  StreamKind stream = 1;
+  uint64 after_sequence = 2;
+}
+
+message StreamGap {
+  StreamKind stream = 1;
+  uint64 requested_after_sequence = 2;
+  uint64 oldest_available_sequence = 3;
+  uint64 dropped_samples = 4;
+}
+
+message SamplesSinceRequest {
+  ClientHello client = 1;
+  repeated StreamCursor cursors = 2;
+}
+
+message SubscribeRequest {
+  ClientHello client = 1;
+  repeated StreamKind streams = 2;
+}
+
+message SampleBatch {
+  repeated Sample samples = 1;
+  repeated StreamGap gaps = 2;
+  uint64 service_batch_sequence = 3;
+}
+
+enum DeviceKind {
+  DEVICE_KIND_UNSPECIFIED = 0;
+  DEVICE_KIND_POLAR = 1;
+  DEVICE_KIND_GO_DIRECT = 2;
+  DEVICE_KIND_SIMULATED = 3;
+}
+
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  CONNECTION_STATE_DISCONNECTED = 1;
+  CONNECTION_STATE_DISCOVERING = 2;
+  CONNECTION_STATE_CONNECTING = 3;
+  CONNECTION_STATE_CONNECTED = 4;
+  CONNECTION_STATE_RECONNECTING = 5;
+  CONNECTION_STATE_ERROR = 6;
+}
+
+message DeviceInfo {
+  string id = 1;
+  string name = 2;
+  DeviceKind kind = 3;
+  bool preferred = 4;
+}
+
+message DeviceStatus {
+  DeviceInfo device = 1;
+  ConnectionState state = 2;
+  string detail = 3;
+  uint64 reconnect_attempts = 4;
+  uint64 last_sample_age_millis = 5;
+}
+
+message DeviceList {
+  repeated DeviceStatus devices = 1;
+}
+
+message DeviceCommand {
+  ClientHello client = 1;
+  string device_id = 2;
+  bool connect = 3;
+}
+
+message PreferredDeviceCommand {
+  ClientHello client = 1;
+  DeviceKind kind = 2;
+  string device_id = 3;
+}
+
+message StreamDiagnostics {
+  StreamKind stream = 1;
+  uint64 newest_sequence = 2;
+  uint64 retained_samples = 3;
+  uint64 retained_duration_millis = 4;
+  uint64 dropped_samples = 5;
+  uint64 last_sample_age_millis = 6;
+}
+
+message StatusSnapshot {
+  uint64 uptime_millis = 1;
+  repeated DeviceStatus devices = 2;
+  repeated StreamDiagnostics streams = 3;
+  uint64 connected_clients = 4;
+  uint64 transport_lagged_samples = 5;
+}
+
