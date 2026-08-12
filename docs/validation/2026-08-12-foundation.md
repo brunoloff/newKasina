@@ -50,19 +50,21 @@ The Polar and Go Direct supervisors were exercised together in the release servi
 no sensors available to the sandbox:
 
 ```sh
-scripts/run-hardware-soak 3s /tmp/newkasina-hardware-dry-final.jsonl 1 \
-  --port 18874 \
-  --token-path /tmp/newkasina-hardware-dry-final-token \
-  --lock-path /tmp/newkasina-hardware-dry-final.lock
+scripts/run-hardware-soak 12s hardware-soak-blocker-audit.jsonl 2 \
+  --port 18876 \
+  --token-path /tmp/newkasina-blocker-token \
+  --lock-path /tmp/newkasina-blocker.lock
 ```
 
-The runner exited successfully after SIGINT. It wrote four schema-versioned JSONL records
-with one stable service instance ID and both device supervisors, including a final record
-where both were `CONNECTION_STATE_DISCONNECTED` with detail `stopped`. The diagnostics and
-token files were both mode `0600`. Because the sandbox has no usable Bluetooth devices,
-this confirms process cancellation, structured state, final-snapshot retention, and the
-soak harness only; it does not validate discovery, measurements, or recovery. Saved
-platform IDs can be supplied with `--polar-id` and `--go-direct-id` during the real soak.
+The runner exited successfully after SIGINT. It wrote seven schema-versioned JSONL records
+with one stable service instance ID and both device supervisors. Each supervisor completed
+two full scans, reported that no matching peripheral was found, entered reconnect backoff,
+and finished `CONNECTION_STATE_DISCONNECTED` with detail `stopped` and reconnect count two.
+The diagnostics and token files were both mode `0600`. Because neither physical sensor was
+available, this confirms process cancellation, discovery failure supervision, structured
+state, final-snapshot retention, and the soak harness only; it does not validate successful
+discovery, measurements, or power-cycle recovery. Saved platform IDs can be supplied with
+`--polar-id` and `--go-direct-id` during the real soak.
 
 ## Release process smoke test
 

@@ -49,9 +49,10 @@ Do not mark a milestone complete until its exit criteria pass.
   metadata, period validation, and every documented value layout are tested against
   Vernier's reference implementations. The service supervises both drivers concurrently,
   exposes structured connection state, and can retain private append-only health JSONL.
-  A three-second hardware-mode dry run produced four snapshots including a clean final
-  disconnected state. The 36-test workspace and release build pass. Physical comparison,
-  power-cycle recovery, and the real eight-hour soak remain required.
+  A twelve-second hardware-mode dry run completed two full discovery/retry cycles per
+  unavailable sensor and produced seven snapshots including a clean final disconnected
+  state. The 36-test workspace and release build pass. Physical comparison, power-cycle
+  recovery, and the real eight-hour soak remain required.
 
 ## 1. Objective
 
