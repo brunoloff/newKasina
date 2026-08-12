@@ -41,11 +41,17 @@ Do not mark a milestone complete until its exit criteria pass.
   benchmark processed 20 million frames at 3.049 ns/frame on this host; work and upload
   size remain constant as instance count grows.
 - Milestone 3 hardware-independent work: Polar HR/RR parsing covers 8/16-bit heart rate,
-  energy, contact, multiple RR intervals, and malformed frames; both Polar and Go Direct
-  have cancellable reconnecting `btleplug` drivers; Go Direct command framing,
-  fragmentation, and four value layouts are tested and documented from Vernier's
-  reference implementations; the service can supervise both drivers concurrently with
-  `--source hardware`. Physical-device comparison, power-cycle, and soak criteria remain.
+  energy, contact, multiple RR intervals, and malformed frames. Both native `btleplug`
+  drivers discover across every adapter, prefer optional saved platform IDs, bound BLE
+  operations and notification silence, clean up on cancellation, and retry with capped
+  jittered exponential backoff that resets only after successful session setup. Go Direct
+  command/response framing, fragmentation/back-to-back packets, identity/status/channel
+  metadata, period validation, and every documented value layout are tested against
+  Vernier's reference implementations. The service supervises both drivers concurrently,
+  exposes structured connection state, and can retain private append-only health JSONL.
+  A three-second hardware-mode dry run produced four snapshots including a clean final
+  disconnected state. The 36-test workspace and release build pass. Physical comparison,
+  power-cycle recovery, and the real eight-hour soak remain required.
 
 ## 1. Objective
 

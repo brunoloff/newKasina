@@ -55,6 +55,27 @@ cargo run --release -p kasina-service -- --source hardware
 ```
 
 `--source polar` and `--source go-direct` run one hardware driver for focused testing.
+After the first discovery, `--polar-id ID` and `--go-direct-id ID` prefer saved platform
+peripheral identifiers while retaining advertised-name/service fallback discovery.
+
+For an eight-hour dual-device Linux soak with append-only diagnostics every ten seconds:
+
+```sh
+scripts/run-hardware-soak 8h
+```
+
+The first three arguments are duration, output path, and diagnostic interval. Any later
+arguments are forwarded to the service, for example:
+
+```sh
+scripts/run-hardware-soak 8h hardware-soak.jsonl 10 \
+  --polar-id POLAR_ID --go-direct-id GO_DIRECT_ID
+```
+
+The generated `hardware-soak-*.jsonl` is private (mode `0600`) and ignored by Git. Each
+line retains the service instance, device state/detail/reconnect count, per-stream newest
+sequence/retention/loss/age, client count, and transport lag. A shorter dry run such as
+`scripts/run-hardware-soak 2m` is useful before attaching the sensors overnight.
 
 ## GPU smoke testing
 

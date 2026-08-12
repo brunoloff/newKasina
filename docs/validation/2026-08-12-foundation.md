@@ -20,18 +20,19 @@ Results:
 
 - formatting: pass;
 - Clippy with warnings denied: pass;
-- 28 unit/integration tests plus doc tests: pass;
+- 36 unit/integration tests plus doc tests: pass;
 - optimized workspace build: pass.
 
-The test coverage includes bounded retention and cursor gaps, replay ordering, low-pass
-and RMSSD reference calculations, Polar packets, Go Direct commands/reassembly/values,
-WGSL parsing, protocol authentication/version skew, service broadcast lag, UI queue
-backpressure, live/history overlap removal, multi-device supervision, and service
-continuity across client restart. Rendering coverage also proves fixed-size normalized
-uniform preparation, surface-error recovery routing/counters, and that continuous repaint
-is requested only for a visible visualizer, leaving inactive and minimized views
-event-driven. A wgpu device-loss callback retains an actionable diagnostic independently
-of the service process.
+The test coverage includes bounded retention and cursor gaps, replay ordering, cancellable
+driver operations, jittered reconnect bounds, low-pass and RMSSD reference calculations,
+Polar packets, Go Direct command/metadata/value parsing and packet reassembly, WGSL parsing,
+protocol authentication/version skew, service broadcast lag, UI queue backpressure,
+live/history overlap removal, structured multi-device supervision, append-only diagnostics,
+failed-driver terminal state, and service continuity across client restart. Rendering
+coverage also proves fixed-size normalized uniform preparation, surface-error recovery
+routing/counters, and that continuous repaint is requested only for a visible visualizer,
+leaving inactive and minimized views event-driven. A wgpu device-loss callback retains an
+actionable diagnostic independently of the service process.
 
 The targeted release benchmark for CPU-side renderer preparation ran with:
 
@@ -42,6 +43,26 @@ scripts/cargo-local bench -p kasina-render --bench prepare_visual_frame
 It prepared 20,000,000 varying frames in 60.983 ms (3.049 ns/frame) on this host. The
 prepared upload remains 32 bytes for both one and 100,000 instances; particle geometry is
 generated in the vertex shader rather than rebuilt on the CPU.
+
+## Hardware-independent acquisition validation
+
+The Polar and Go Direct supervisors were exercised together in the release service with
+no sensors available to the sandbox:
+
+```sh
+scripts/run-hardware-soak 3s /tmp/newkasina-hardware-dry-final.jsonl 1 \
+  --port 18874 \
+  --token-path /tmp/newkasina-hardware-dry-final-token \
+  --lock-path /tmp/newkasina-hardware-dry-final.lock
+```
+
+The runner exited successfully after SIGINT. It wrote four schema-versioned JSONL records
+with one stable service instance ID and both device supervisors, including a final record
+where both were `CONNECTION_STATE_DISCONNECTED` with detail `stopped`. The diagnostics and
+token files were both mode `0600`. Because the sandbox has no usable Bluetooth devices,
+this confirms process cancellation, structured state, final-snapshot retention, and the
+soak harness only; it does not validate discovery, measurements, or recovery. Saved
+platform IDs can be supplied with `--polar-id` and `--go-direct-id` during the real soak.
 
 ## Release process smoke test
 

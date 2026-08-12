@@ -14,12 +14,19 @@ use btleplug::api::{
 };
 use btleplug::platform::{Manager, Peripheral};
 use futures::{Stream, StreamExt};
-use kasina_devices::{DeviceDescriptor, DeviceKind, DriverEvent, SensorDriver};
-use kasina_domain::StreamKind;
+use kasina_devices::{
+    DeviceDescriptor, DeviceKind, DriverConnectionState, DriverEvent, ReconnectBackoff,
+    SensorDriver, cancellable_timeout, send_driver_event,
+};
+use kasina_domain::{StreamKind, quality};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+const BLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const NOTIFICATION_TIMEOUT_MINIMUM: Duration = Duration::from_secs(5);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Official Go Direct BLE service UUID.
 pub const SERVICE_UUID: uuid::Uuid =
@@ -40,6 +47,12 @@ const INIT: &[u8] = &[
 const SET_MEASUREMENT_PERIOD: &[u8] = &[0x1b, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 const START_MEASUREMENTS: &[u8] = &[0x18, 0xff, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 const STOP_MEASUREMENTS: &[u8] = &[0x19, 0xff, 0, 0xff, 0xff, 0xff, 0xff];
+const GET_STATUS: &[u8] = &[0x10];
+const GET_SENSOR_INFO: &[u8] = &[0x50, 0];
+const GET_AVAILABLE_SENSORS: &[u8] = &[0x51];
+const GET_DEVICE_INFO: &[u8] = &[0x55];
+const GET_DEFAULT_SENSORS: &[u8] = &[0x56];
+const DISCONNECT: &[u8] = &[0x54];
 
 /// Stateful command encoder; Go Direct echoes the descending rolling counter.
 #[derive(Debug, Clone)]
@@ -57,43 +70,75 @@ impl Default for CommandEncoder {
 
 impl CommandEncoder {
     /// Wrap one Go Direct subcommand in its length/counter/checksum header.
-    #[must_use]
-    pub fn encode(&mut self, subcommand: &[u8]) -> Vec<u8> {
+    pub fn encode(&mut self, subcommand: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+        let length = 4_usize
+            .checked_add(subcommand.len())
+            .ok_or(ProtocolError::CommandTooLong(subcommand.len()))?;
+        let length =
+            u8::try_from(length).map_err(|_| ProtocolError::CommandTooLong(subcommand.len()))?;
         self.rolling_counter = self.rolling_counter.wrapping_sub(1);
         let mut packet = Vec::with_capacity(4 + subcommand.len());
         packet.extend_from_slice(&[PACKET_HEADER, 0, self.rolling_counter, 0]);
         packet.extend_from_slice(subcommand);
-        packet[1] = u8::try_from(packet.len()).expect("Go Direct commands fit in one-byte length");
+        packet[1] = length;
         packet[3] = packet_checksum(&packet);
-        packet
+        Ok(packet)
     }
 
     /// Initialize a newly connected Go Direct session.
-    #[must_use]
-    pub fn initialize(&mut self) -> Vec<u8> {
+    pub fn initialize(&mut self) -> Result<Vec<u8>, ProtocolError> {
         self.encode(INIT)
     }
 
     /// Set the measurement period in milliseconds (the wire uses microseconds).
-    #[must_use]
-    pub fn set_measurement_period(&mut self, period_ms: u32) -> Vec<u8> {
+    pub fn set_measurement_period(&mut self, period_ms: u32) -> Result<Vec<u8>, ProtocolError> {
         let mut command = SET_MEASUREMENT_PERIOD.to_vec();
         command[3..7].copy_from_slice(&period_ms.saturating_mul(1_000).to_le_bytes());
         self.encode(&command)
     }
 
     /// Start a selected channel mask.
-    #[must_use]
-    pub fn start_measurements(&mut self, channel_mask: u32) -> Vec<u8> {
+    pub fn start_measurements(&mut self, channel_mask: u32) -> Result<Vec<u8>, ProtocolError> {
         let mut command = START_MEASUREMENTS.to_vec();
         command[3..7].copy_from_slice(&channel_mask.to_le_bytes());
         self.encode(&command)
     }
 
     /// Stop all measurements.
-    #[must_use]
-    pub fn stop_measurements(&mut self) -> Vec<u8> {
+    pub fn stop_measurements(&mut self) -> Result<Vec<u8>, ProtocolError> {
         self.encode(STOP_MEASUREMENTS)
+    }
+
+    /// Query firmware, battery, and charging state.
+    pub fn get_status(&mut self) -> Result<Vec<u8>, ProtocolError> {
+        self.encode(GET_STATUS)
+    }
+
+    /// Query order code, serial number, and device name.
+    pub fn get_device_info(&mut self) -> Result<Vec<u8>, ProtocolError> {
+        self.encode(GET_DEVICE_INFO)
+    }
+
+    /// Query the default channel mask.
+    pub fn get_default_sensors(&mut self) -> Result<Vec<u8>, ProtocolError> {
+        self.encode(GET_DEFAULT_SENSORS)
+    }
+
+    /// Query the available channel mask.
+    pub fn get_available_sensors(&mut self) -> Result<Vec<u8>, ProtocolError> {
+        self.encode(GET_AVAILABLE_SENSORS)
+    }
+
+    /// Query metadata for one channel.
+    pub fn get_sensor_info(&mut self, channel: u8) -> Result<Vec<u8>, ProtocolError> {
+        let mut command = GET_SENSOR_INFO.to_vec();
+        command[1] = channel.min(31);
+        self.encode(&command)
+    }
+
+    /// Ask the device to end its protocol session before transport disconnect.
+    pub fn disconnect(&mut self) -> Result<Vec<u8>, ProtocolError> {
+        self.encode(DISCONNECT)
     }
 }
 
@@ -114,12 +159,80 @@ pub struct ChannelMeasurement {
     pub value: f64,
 }
 
+/// Identity fields returned by the Go Direct information command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// Vernier product/order code.
+    pub order_code: String,
+    /// Device serial number.
+    pub serial_number: String,
+    /// User-visible device name.
+    pub name: String,
+}
+
+/// Status fields used for acquisition diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceStatus {
+    /// Main firmware major/minor/build version.
+    pub main_firmware: String,
+    /// BLE firmware major/minor/build version.
+    pub ble_firmware: String,
+    /// Battery percentage as reported by the device.
+    pub battery_percent: u8,
+    /// Raw charging-state byte.
+    pub charging_state: u8,
+}
+
+/// Metadata for one Go Direct measurement channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorInfo {
+    /// Channel number used in masks and measurement packets.
+    pub channel: u8,
+    /// Vernier sensor identifier.
+    pub sensor_id: u32,
+    /// Numeric measurement representation.
+    pub numeric_type: u8,
+    /// Periodic/aperiodic sampling mode.
+    pub sampling_mode: u8,
+    /// Human-readable sensor description.
+    pub description: String,
+    /// Unit string supplied by the sensor.
+    pub unit: String,
+    /// Measurement uncertainty.
+    pub uncertainty: f64,
+    /// Minimum measurement value.
+    pub minimum: f64,
+    /// Maximum measurement value.
+    pub maximum: f64,
+    /// Minimum supported period in microseconds.
+    pub minimum_period_us: u32,
+    /// Maximum supported period in microseconds.
+    pub maximum_period_us: u64,
+    /// Typical period in microseconds.
+    pub typical_period_us: u32,
+    /// Period granularity in microseconds.
+    pub period_granularity_us: u32,
+    /// Channels that may not be active simultaneously.
+    pub mutual_exclusion_mask: u32,
+}
+
 /// Packet parsing failure.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtocolError {
+    /// A command cannot fit in the protocol's one-byte packet length.
+    #[error("Go Direct subcommand with {0} bytes exceeds the packet limit")]
+    CommandTooLong(usize),
     /// Framing is incomplete or inconsistent.
     #[error("truncated Go Direct packet")]
     Truncated,
+    /// A decoded packet must contain exactly its declared number of bytes.
+    #[error("Go Direct packet declares {declared} bytes but contains {actual}")]
+    LengthMismatch {
+        /// Header length.
+        declared: usize,
+        /// Supplied packet length.
+        actual: usize,
+    },
     /// This is a command response rather than a measurement.
     #[error("packet is not a measurement notification")]
     NotMeasurement,
@@ -148,6 +261,74 @@ fn read_u32(packet: &[u8], offset: usize) -> Result<u32, ProtocolError> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+fn read_u64(packet: &[u8], offset: usize) -> Result<u64, ProtocolError> {
+    let bytes = packet
+        .get(offset..offset + 8)
+        .ok_or(ProtocolError::Truncated)?;
+    Ok(u64::from_le_bytes(
+        bytes.try_into().expect("slice is 8 bytes"),
+    ))
+}
+
+fn read_f64(packet: &[u8], offset: usize) -> Result<f64, ProtocolError> {
+    Ok(f64::from_bits(read_u64(packet, offset)?))
+}
+
+fn wire_string(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_owned()
+}
+
+/// Parse firmware/battery state returned by command `0x10`.
+pub fn parse_device_status(payload: &[u8]) -> Result<DeviceStatus, ProtocolError> {
+    let bytes = payload.get(..12).ok_or(ProtocolError::Truncated)?;
+    Ok(DeviceStatus {
+        main_firmware: format!("{}.{}.{}", bytes[2], bytes[3], read_u16(bytes, 4)?),
+        ble_firmware: format!("{}.{}.{}", bytes[6], bytes[7], read_u16(bytes, 8)?),
+        battery_percent: bytes[10],
+        charging_state: bytes[11],
+    })
+}
+
+/// Parse identity returned by command `0x55`.
+pub fn parse_device_identity(payload: &[u8]) -> Result<DeviceIdentity, ProtocolError> {
+    let bytes = payload.get(..64).ok_or(ProtocolError::Truncated)?;
+    Ok(DeviceIdentity {
+        order_code: wire_string(&bytes[0..16]),
+        serial_number: wire_string(&bytes[16..32]),
+        name: wire_string(&bytes[32..64]),
+    })
+}
+
+/// Parse a little-endian channel mask returned by `0x51` or `0x56`.
+pub fn parse_sensor_mask(payload: &[u8]) -> Result<u32, ProtocolError> {
+    read_u32(payload, 0)
+}
+
+/// Parse the 148-byte channel metadata payload returned by command `0x50`.
+pub fn parse_sensor_info(payload: &[u8]) -> Result<SensorInfo, ProtocolError> {
+    let bytes = payload.get(..148).ok_or(ProtocolError::Truncated)?;
+    Ok(SensorInfo {
+        channel: bytes[0],
+        sensor_id: read_u32(bytes, 2)?,
+        numeric_type: bytes[6],
+        sampling_mode: bytes[7],
+        description: wire_string(&bytes[8..68]),
+        unit: wire_string(&bytes[68..100]),
+        uncertainty: read_f64(bytes, 100)?,
+        minimum: read_f64(bytes, 108)?,
+        maximum: read_f64(bytes, 116)?,
+        minimum_period_us: read_u32(bytes, 124)?,
+        maximum_period_us: read_u64(bytes, 128)?,
+        typical_period_us: read_u32(bytes, 136)?,
+        period_granularity_us: read_u32(bytes, 140)?,
+        mutual_exclusion_mask: read_u32(bytes, 144)?,
+    })
+}
+
 fn channels_from_mask(mask: u32) -> Vec<u8> {
     (0_u8..32)
         .filter(|channel| mask & (1_u32 << channel) != 0)
@@ -165,6 +346,12 @@ pub fn parse_measurements(packet: &[u8]) -> Result<Vec<ChannelMeasurement>, Prot
     let declared_length = usize::from(packet[1]);
     if declared_length > packet.len() {
         return Err(ProtocolError::Truncated);
+    }
+    if declared_length != packet.len() {
+        return Err(ProtocolError::LengthMismatch {
+            declared: declared_length,
+            actual: packet.len(),
+        });
     }
 
     let measurement_type = packet[4];
@@ -203,7 +390,7 @@ pub fn parse_measurements(packet: &[u8]) -> Result<Vec<ChannelMeasurement>, Prot
         .and_then(|values| values.checked_mul(4))
         .and_then(|bytes| offset.checked_add(bytes))
         .ok_or(ProtocolError::ValueCount)?;
-    if expected > declared_length || expected > packet.len() {
+    if expected != declared_length || expected > packet.len() {
         return Err(ProtocolError::ValueCount);
     }
 
@@ -294,38 +481,108 @@ impl GoDirectDriver {
         self
     }
 
-    async fn find_peripheral(&self) -> Result<Peripheral> {
-        let manager = Manager::new().await.context("create Bluetooth manager")?;
-        let adapters = manager
-            .adapters()
-            .await
-            .context("enumerate Bluetooth adapters")?;
-        let adapter = adapters
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no Bluetooth adapter is available"))?;
-        adapter
-            .start_scan(ScanFilter::default())
-            .await
-            .context("start Go Direct scan")?;
-        tokio::time::sleep(self.scan_duration).await;
+    async fn find_peripheral(&self, cancellation: &CancellationToken) -> Result<Peripheral> {
+        let manager = cancellable_timeout(
+            cancellation,
+            BLE_OPERATION_TIMEOUT,
+            "create Bluetooth manager",
+            Manager::new(),
+        )
+        .await?;
+        let adapters = cancellable_timeout(
+            cancellation,
+            BLE_OPERATION_TIMEOUT,
+            "enumerate Bluetooth adapters",
+            manager.adapters(),
+        )
+        .await?;
+        if adapters.is_empty() {
+            bail!("no Bluetooth adapter is available");
+        }
 
-        for peripheral in adapter.peripherals().await? {
-            let id = peripheral.id().to_string();
-            let properties = peripheral.properties().await?;
-            let name_matches = properties
-                .as_ref()
-                .and_then(|value| value.local_name.as_deref())
-                .is_some_and(|name| name.to_ascii_lowercase().contains("gdx"));
-            let service_matches = properties
-                .as_ref()
-                .is_some_and(|value| value.services.contains(&SERVICE_UUID));
-            let id_matches = self.target_id.as_ref().is_some_and(|target| target == &id);
-            if id_matches || name_matches || service_matches {
-                return Ok(peripheral);
+        let mut scanning = Vec::new();
+        for adapter in &adapters {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match cancellable_timeout(
+                cancellation,
+                BLE_OPERATION_TIMEOUT,
+                "start Go Direct scan",
+                adapter.start_scan(ScanFilter::default()),
+            )
+            .await
+            {
+                Ok(()) => scanning.push(adapter),
+                Err(_) if cancellation.is_cancelled() => break,
+                Err(error) => warn!(%error, "could not start Go Direct scan on an adapter"),
             }
         }
-        bail!("no Go Direct peripheral found")
+        if cancellation.is_cancelled() {
+            for adapter in &scanning {
+                let _ = tokio::time::timeout(CLEANUP_TIMEOUT, adapter.stop_scan()).await;
+            }
+            bail!("Go Direct scan cancelled");
+        }
+        if scanning.is_empty() {
+            bail!("no Bluetooth adapter could start a Go Direct scan");
+        }
+        let cancelled = tokio::select! {
+            () = cancellation.cancelled() => true,
+            () = tokio::time::sleep(self.scan_duration) => false,
+        };
+        for adapter in &scanning {
+            match tokio::time::timeout(CLEANUP_TIMEOUT, adapter.stop_scan()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "could not stop Go Direct scan"),
+                Err(_) => warn!("stopping Go Direct scan timed out"),
+            }
+        }
+        if cancelled {
+            bail!("Go Direct scan cancelled");
+        }
+
+        let mut fallback = None;
+        for adapter in &adapters {
+            let peripherals = cancellable_timeout(
+                cancellation,
+                BLE_OPERATION_TIMEOUT,
+                "list Go Direct peripherals",
+                adapter.peripherals(),
+            )
+            .await?;
+            for peripheral in peripherals {
+                let id = peripheral.id().to_string();
+                let properties = match cancellable_timeout(
+                    cancellation,
+                    BLE_OPERATION_TIMEOUT,
+                    "read Go Direct advertisement properties",
+                    peripheral.properties(),
+                )
+                .await
+                {
+                    Ok(properties) => properties,
+                    Err(error) => {
+                        warn!(%error, %id, "could not read Go Direct advertisement properties");
+                        continue;
+                    }
+                };
+                if self.target_id.as_ref().is_some_and(|target| target == &id) {
+                    return Ok(peripheral);
+                }
+                let name_matches = properties
+                    .as_ref()
+                    .and_then(|value| value.local_name.as_deref())
+                    .is_some_and(|name| name.to_ascii_lowercase().contains("gdx"));
+                let service_matches = properties
+                    .as_ref()
+                    .is_some_and(|value| value.services.contains(&SERVICE_UUID));
+                if fallback.is_none() && (name_matches || service_matches) {
+                    fallback = Some(peripheral);
+                }
+            }
+        }
+        fallback.ok_or_else(|| anyhow!("no Go Direct peripheral found"))
     }
 
     async fn connected_session(
@@ -333,71 +590,235 @@ impl GoDirectDriver {
         peripheral: &Peripheral,
         sender: &mpsc::Sender<DriverEvent>,
         cancellation: &CancellationToken,
+        backoff: &mut ReconnectBackoff,
     ) -> Result<()> {
-        peripheral
-            .connect()
-            .await
-            .context("connect Go Direct peripheral")?;
-        peripheral
-            .discover_services()
-            .await
-            .context("discover Go Direct services")?;
-        let characteristics = peripheral.characteristics();
-        let command = characteristics
-            .iter()
-            .find(|characteristic| characteristic.uuid == COMMAND_UUID)
-            .cloned()
-            .ok_or_else(|| anyhow!("Go Direct command characteristic is absent"))?;
-        let response = characteristics
-            .iter()
-            .find(|characteristic| characteristic.uuid == RESPONSE_UUID)
-            .cloned()
-            .ok_or_else(|| anyhow!("Go Direct response characteristic is absent"))?;
-        peripheral
-            .subscribe(&response)
-            .await
-            .context("subscribe Go Direct responses")?;
-        let mut notifications = peripheral.notifications().await?;
-        let mut assembler = PacketAssembler::default();
-        let mut encoder = CommandEncoder::default();
-
         let source_id = peripheral.id().to_string();
+        let connect_result = tokio::select! {
+            () = cancellation.cancelled() => return Ok(()),
+            result = tokio::time::timeout(BLE_OPERATION_TIMEOUT, peripheral.connect()) => {
+                result.context("connect Go Direct peripheral timed out")?
+            }
+        };
+        connect_result.context("connect Go Direct peripheral")?;
+
+        let mut subscribed: Option<Characteristic> = None;
+        let mut cleanup: Option<(Characteristic, CommandEncoder)> = None;
         let session_result: Result<()> = async {
-            for packet in [
-                encoder.initialize(),
-                encoder.set_measurement_period(
-                    self.period.as_millis().min(u128::from(u32::MAX)) as u32,
-                ),
-                encoder.start_measurements(1_u32 << self.channel),
-            ] {
-                send_command(
+            tokio::select! {
+                () = cancellation.cancelled() => return Ok(()),
+                result = tokio::time::timeout(BLE_OPERATION_TIMEOUT, peripheral.discover_services()) => {
+                    result.context("discover Go Direct services timed out")??;
+                }
+            }
+            let characteristics = peripheral.characteristics();
+            let command = characteristics
+                .iter()
+                .find(|characteristic| characteristic.uuid == COMMAND_UUID)
+                .cloned()
+                .ok_or_else(|| anyhow!("Go Direct command characteristic is absent"))?;
+            let response = characteristics
+                .iter()
+                .find(|characteristic| characteristic.uuid == RESPONSE_UUID)
+                .cloned()
+                .ok_or_else(|| anyhow!("Go Direct response characteristic is absent"))?;
+            tokio::select! {
+                () = cancellation.cancelled() => return Ok(()),
+                result = tokio::time::timeout(BLE_OPERATION_TIMEOUT, peripheral.subscribe(&response)) => {
+                    result.context("subscribe Go Direct responses timed out")??;
+                }
+            }
+            subscribed = Some(response.clone());
+            let mut notifications = cancellable_timeout(
+                cancellation,
+                BLE_OPERATION_TIMEOUT,
+                "open Go Direct notification stream",
+                peripheral.notifications(),
+            )
+            .await?;
+            let mut assembler = PacketAssembler::default();
+            let mut encoder = CommandEncoder::default();
+
+            send_checked_command(
+                peripheral,
+                &command,
+                &response,
+                &mut notifications,
+                &mut assembler,
+                &encoder.initialize()?,
+                cancellation,
+            )
+            .await?;
+            let status = parse_device_status(
+                &send_command(
                     peripheral,
                     &command,
                     &response,
                     &mut notifications,
                     &mut assembler,
-                    &packet,
+                    &encoder.get_status()?,
                     cancellation,
                 )
-                .await?;
+                .await?,
+            )?;
+            let identity = parse_device_identity(
+                &send_command(
+                    peripheral,
+                    &command,
+                    &response,
+                    &mut notifications,
+                    &mut assembler,
+                    &encoder.get_device_info()?,
+                    cancellation,
+                )
+                .await?,
+            )?;
+            let default_sensors = parse_sensor_mask(
+                &send_command(
+                    peripheral,
+                    &command,
+                    &response,
+                    &mut notifications,
+                    &mut assembler,
+                    &encoder.get_default_sensors()?,
+                    cancellation,
+                )
+                .await?,
+            )?;
+            let available_sensors = parse_sensor_mask(
+                &send_command(
+                    peripheral,
+                    &command,
+                    &response,
+                    &mut notifications,
+                    &mut assembler,
+                    &encoder.get_available_sensors()?,
+                    cancellation,
+                )
+                .await?,
+            )?;
+            if available_sensors & (1_u32 << self.channel) == 0 {
+                bail!(
+                    "Go Direct channel {} is unavailable (mask {available_sensors:#010x})",
+                    self.channel
+                );
+            }
+            let sensor = parse_sensor_info(
+                &send_command(
+                    peripheral,
+                    &command,
+                    &response,
+                    &mut notifications,
+                    &mut assembler,
+                    &encoder.get_sensor_info(self.channel)?,
+                    cancellation,
+                )
+                .await?,
+            )?;
+            if sensor.channel != self.channel {
+                bail!(
+                    "Go Direct returned metadata for channel {} while channel {} was requested",
+                    sensor.channel,
+                    self.channel
+                );
+            }
+            let requested_period_us = self
+                .period
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            if requested_period_us < u64::from(sensor.minimum_period_us)
+                || (sensor.maximum_period_us != 0
+                    && requested_period_us > sensor.maximum_period_us)
+            {
+                bail!(
+                    "requested Go Direct period {requested_period_us} us is outside channel {} range {}..={} us",
+                    self.channel,
+                    sensor.minimum_period_us,
+                    sensor.maximum_period_us
+                );
+            }
+            info!(
+                id = %source_id,
+                order_code = %identity.order_code,
+                serial = %identity.serial_number,
+                device_name = %identity.name,
+                main_firmware = %status.main_firmware,
+                ble_firmware = %status.ble_firmware,
+                battery_percent = status.battery_percent,
+                channel = sensor.channel,
+                sensor = %sensor.description,
+                unit = %sensor.unit,
+                default_sensors = format_args!("{default_sensors:#010x}"),
+                available_sensors = format_args!("{available_sensors:#010x}"),
+                "Go Direct metadata loaded"
+            );
+
+            send_checked_command(
+                peripheral,
+                &command,
+                &response,
+                &mut notifications,
+                &mut assembler,
+                &encoder.set_measurement_period(
+                    self.period.as_millis().min(u128::from(u32::MAX)) as u32,
+                )?,
+                cancellation,
+            )
+            .await?;
+            send_checked_command(
+                peripheral,
+                &command,
+                &response,
+                &mut notifications,
+                &mut assembler,
+                &encoder.start_measurements(1_u32 << self.channel)?,
+                cancellation,
+            )
+            .await?;
+            cleanup = Some((command, encoder));
+            backoff.reset();
+
+            if !send_driver_event(
+                sender,
+                cancellation,
+                DriverEvent::Status {
+                    source_id: source_id.clone(),
+                    state: DriverConnectionState::Connected,
+                    detail: format!(
+                        "{} channel {}: {} [{}] at {} ms",
+                        identity.name,
+                        sensor.channel,
+                        sensor.description,
+                        sensor.unit,
+                        self.period.as_millis()
+                    ),
+                },
+            )
+            .await?
+            {
+                return Ok(());
             }
 
-            sender
-                .send(DriverEvent::Status {
-                    source_id: source_id.clone(),
-                    detail: "connected".to_owned(),
-                })
-                .await?;
-
+            let notification_timeout = NOTIFICATION_TIMEOUT_MINIMUM.max(
+                self.period
+                    .checked_mul(10)
+                    .unwrap_or(NOTIFICATION_TIMEOUT_MINIMUM),
+            );
+            let silence = tokio::time::sleep(notification_timeout);
+            tokio::pin!(silence);
             'session: loop {
                 tokio::select! {
                     () = cancellation.cancelled() => break Ok(()),
+                    () = &mut silence => bail!(
+                        "Go Direct notifications silent for {} ms",
+                        notification_timeout.as_millis()
+                    ),
                     notification = notifications.next() => {
                         let notification = notification
                             .ok_or_else(|| anyhow!("Go Direct notification stream ended"))?;
                         if notification.uuid != RESPONSE_UUID {
                             continue;
                         }
+                        silence.as_mut().reset(tokio::time::Instant::now() + notification_timeout);
                         let mut packet = assembler.push(&notification.value)?;
                         while let Some(complete) = packet {
                             match parse_measurements(&complete) {
@@ -406,13 +827,20 @@ impl GoDirectDriver {
                                         .into_iter()
                                         .filter(|measurement| measurement.channel == self.channel)
                                     {
-                                        sender.send(DriverEvent::Measurement {
+                                        let quality_flags = if measurement.value.is_finite() {
+                                            0
+                                        } else {
+                                            quality::SOURCE_INVALID
+                                        };
+                                        if !send_driver_event(sender, cancellation, DriverEvent::Measurement {
                                             stream: StreamKind::RespirationForce,
                                             source_id: source_id.clone(),
                                             device_time_ns: None,
                                             value: measurement.value,
-                                            quality_flags: 0,
-                                        }).await?;
+                                            quality_flags,
+                                        }).await? {
+                                            break 'session Ok(());
+                                        }
                                     }
                                 }
                                 Err(ProtocolError::Metadata(_)) => {}
@@ -429,12 +857,26 @@ impl GoDirectDriver {
         }
         .await;
 
-        if peripheral.is_connected().await.unwrap_or(false) {
-            let stop = encoder.stop_measurements();
-            let _ = write_packet(peripheral, &command, &stop).await;
-            let _ = peripheral.unsubscribe(&response).await;
-            let _ = peripheral.disconnect().await;
+        if let Some((command, mut encoder)) = cleanup {
+            if let Ok(stop) = encoder.stop_measurements() {
+                let _ = tokio::time::timeout(
+                    CLEANUP_TIMEOUT,
+                    write_packet(peripheral, &command, &stop),
+                )
+                .await;
+            }
+            if let Ok(disconnect) = encoder.disconnect() {
+                let _ = tokio::time::timeout(
+                    CLEANUP_TIMEOUT,
+                    write_packet(peripheral, &command, &disconnect),
+                )
+                .await;
+            }
         }
+        if let Some(response) = &subscribed {
+            let _ = tokio::time::timeout(CLEANUP_TIMEOUT, peripheral.unsubscribe(response)).await;
+        }
+        let _ = tokio::time::timeout(CLEANUP_TIMEOUT, peripheral.disconnect()).await;
         session_result
     }
 }
@@ -463,13 +905,26 @@ impl SensorDriver for GoDirectDriver {
         sender: mpsc::Sender<DriverEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let mut retry = Duration::from_millis(500);
+        let mut backoff =
+            ReconnectBackoff::new(Duration::from_millis(500), Duration::from_secs(30));
         while !cancellation.is_cancelled() {
-            let result = match self.find_peripheral().await {
+            if !send_driver_event(
+                &sender,
+                &cancellation,
+                DriverEvent::Status {
+                    source_id: self.descriptor().id,
+                    state: DriverConnectionState::Connecting,
+                    detail: "discovering Go Direct sensor".to_owned(),
+                },
+            )
+            .await?
+            {
+                break;
+            }
+            let result = match self.find_peripheral(&cancellation).await {
                 Ok(peripheral) => {
-                    retry = Duration::from_millis(500);
                     info!(id = %peripheral.id(), "found Go Direct peripheral");
-                    self.connected_session(&peripheral, &sender, &cancellation)
+                    self.connected_session(&peripheral, &sender, &cancellation, &mut backoff)
                         .await
                 }
                 Err(error) => Err(error),
@@ -477,20 +932,27 @@ impl SensorDriver for GoDirectDriver {
             if cancellation.is_cancelled() {
                 break;
             }
+            let retry = backoff.next_delay();
             if let Err(error) = &result {
                 warn!(%error, ?retry, "Go Direct session failed; retrying");
             }
-            sender
-                .send(DriverEvent::Status {
+            if !send_driver_event(
+                &sender,
+                &cancellation,
+                DriverEvent::Status {
                     source_id: self.descriptor().id,
+                    state: DriverConnectionState::Reconnecting,
                     detail: format!("reconnecting in {} ms", retry.as_millis()),
-                })
-                .await?;
+                },
+            )
+            .await?
+            {
+                break;
+            }
             tokio::select! {
                 () = cancellation.cancelled() => break,
                 () = tokio::time::sleep(retry) => {}
             }
-            retry = (retry * 2).min(Duration::from_secs(30));
         }
         Ok(())
     }
@@ -524,7 +986,14 @@ where
 {
     let command = *packet.get(4).ok_or(ProtocolError::Truncated)?;
     let counter = *packet.get(2).ok_or(ProtocolError::Truncated)?;
-    write_packet(peripheral, command_characteristic, packet).await?;
+    tokio::select! {
+        () = cancellation.cancelled() => bail!("Go Direct session cancelled"),
+        result = tokio::time::timeout(Duration::from_secs(5), write_packet(
+            peripheral,
+            command_characteristic,
+            packet,
+        )) => result.context("Go Direct command write timed out")??,
+    }
     let response = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let complete = if let Some(buffered) = assembler.take_ready()? {
@@ -553,7 +1022,32 @@ where
     })
     .await
     .context("Go Direct command timed out")??;
-    let payload = response.get(6..).ok_or(ProtocolError::Truncated)?.to_vec();
+    Ok(response.get(6..).ok_or(ProtocolError::Truncated)?.to_vec())
+}
+
+async fn send_checked_command<S>(
+    peripheral: &Peripheral,
+    command_characteristic: &Characteristic,
+    response_characteristic: &Characteristic,
+    notifications: &mut S,
+    assembler: &mut PacketAssembler,
+    packet: &[u8],
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>>
+where
+    S: Stream<Item = ValueNotification> + Unpin,
+{
+    let command = *packet.get(4).ok_or(ProtocolError::Truncated)?;
+    let payload = send_command(
+        peripheral,
+        command_characteristic,
+        response_characteristic,
+        notifications,
+        assembler,
+        packet,
+        cancellation,
+    )
+    .await?;
     if payload.first().is_some_and(|status| *status != 0) {
         bail!(
             "Go Direct command {command:#04x} returned status {:#04x}",
@@ -570,16 +1064,16 @@ mod tests {
     #[test]
     fn encodes_reference_period_and_start_commands() {
         let mut encoder = CommandEncoder::default();
-        let initialize = encoder.initialize();
+        let initialize = encoder.initialize().unwrap();
         assert_eq!(initialize.len(), 25);
         assert_eq!(initialize[2], 0xfe);
         assert_eq!(initialize[4], 0x1a);
-        let period = encoder.set_measurement_period(100);
+        let period = encoder.set_measurement_period(100).unwrap();
         assert_eq!(&period[0..4], &[0x58, 15, 0xfd, period[3]]);
         assert_eq!(&period[7..11], &100_000_u32.to_le_bytes());
         assert_eq!(period[3], packet_checksum(&period));
 
-        let start = encoder.start_measurements(1 << 2);
+        let start = encoder.start_measurements(1 << 2).unwrap();
         assert_eq!(start[2], 0xfc);
         assert_eq!(&start[7..11], &(1_u32 << 2).to_le_bytes());
     }
@@ -613,5 +1107,168 @@ mod tests {
             assembler.push(&[2, 3, 4]).unwrap(),
             Some(vec![0x20, 6, 1, 2, 3, 4])
         );
+
+        let combined = [0x20, 5, 0, 0, 0x0c, 0x20, 5, 0, 0, 0x0d];
+        assert_eq!(
+            assembler.push(&combined).unwrap(),
+            Some(combined[..5].to_vec())
+        );
+        assert_eq!(
+            assembler.take_ready().unwrap(),
+            Some(combined[5..].to_vec())
+        );
+    }
+
+    #[test]
+    fn command_encoder_rejects_packets_larger_than_wire_length() {
+        assert_eq!(
+            CommandEncoder::default().encode(&[0; 252]),
+            Err(ProtocolError::CommandTooLong(252))
+        );
+    }
+
+    #[test]
+    fn parses_wide_single_float_and_single_integer_layouts() {
+        let mut wide = vec![0x20, 0, 0, 0, 0x07, 0, 0, 0, 0x80, 1, 0];
+        wide.extend_from_slice(&3.25_f32.to_le_bytes());
+        wide[1] = wide.len() as u8;
+        assert_eq!(
+            parse_measurements(&wide).unwrap(),
+            vec![ChannelMeasurement {
+                channel: 31,
+                value: 3.25
+            }]
+        );
+
+        let mut single_float = vec![0x20, 0, 0, 0, 0x0a, 0, 7, 2];
+        single_float.extend_from_slice(&1.5_f32.to_le_bytes());
+        single_float.extend_from_slice(&(-4.0_f32).to_le_bytes());
+        single_float[1] = single_float.len() as u8;
+        assert_eq!(
+            parse_measurements(&single_float).unwrap(),
+            vec![
+                ChannelMeasurement {
+                    channel: 7,
+                    value: 1.5
+                },
+                ChannelMeasurement {
+                    channel: 7,
+                    value: -4.0
+                }
+            ]
+        );
+
+        let mut single_integer = vec![0x20, 0, 0, 0, 0x0b, 0, 2, 1];
+        single_integer.extend_from_slice(&(-123_i32).to_le_bytes());
+        single_integer[1] = single_integer.len() as u8;
+        assert_eq!(
+            parse_measurements(&single_integer).unwrap(),
+            vec![ChannelMeasurement {
+                channel: 2,
+                value: -123.0
+            }]
+        );
+
+        single_float[4] = 0x08;
+        assert_eq!(parse_measurements(&single_float).unwrap().len(), 2);
+        single_integer[4] = 0x09;
+        assert_eq!(
+            parse_measurements(&single_integer).unwrap()[0].value,
+            -123.0
+        );
+    }
+
+    #[test]
+    fn parses_reference_metadata_payloads() {
+        let mut status = [0_u8; 12];
+        status[2] = 2;
+        status[3] = 7;
+        status[4..6].copy_from_slice(&123_u16.to_le_bytes());
+        status[6] = 1;
+        status[7] = 9;
+        status[8..10].copy_from_slice(&456_u16.to_le_bytes());
+        status[10] = 83;
+        status[11] = 1;
+        assert_eq!(
+            parse_device_status(&status).unwrap(),
+            DeviceStatus {
+                main_firmware: "2.7.123".to_owned(),
+                ble_firmware: "1.9.456".to_owned(),
+                battery_percent: 83,
+                charging_state: 1,
+            }
+        );
+
+        let mut identity = [0_u8; 64];
+        identity[0..7].copy_from_slice(b"GDX-RB\0");
+        identity[16..23].copy_from_slice(b"123456\0");
+        identity[32..49].copy_from_slice(b"Respiration Belt\0");
+        assert_eq!(
+            parse_device_identity(&identity).unwrap(),
+            DeviceIdentity {
+                order_code: "GDX-RB".to_owned(),
+                serial_number: "123456".to_owned(),
+                name: "Respiration Belt".to_owned(),
+            }
+        );
+
+        let mut sensor = [0_u8; 148];
+        sensor[0] = 1;
+        sensor[2..6].copy_from_slice(&42_u32.to_le_bytes());
+        sensor[6] = 0;
+        sensor[7] = 0;
+        sensor[8..26].copy_from_slice(b"Respiration Force\0");
+        sensor[68..70].copy_from_slice(b"N\0");
+        sensor[100..108].copy_from_slice(&0.01_f64.to_le_bytes());
+        sensor[108..116].copy_from_slice(&(-50.0_f64).to_le_bytes());
+        sensor[116..124].copy_from_slice(&50.0_f64.to_le_bytes());
+        sensor[124..128].copy_from_slice(&10_000_u32.to_le_bytes());
+        sensor[128..136].copy_from_slice(&1_000_000_u64.to_le_bytes());
+        sensor[136..140].copy_from_slice(&100_000_u32.to_le_bytes());
+        sensor[140..144].copy_from_slice(&1_000_u32.to_le_bytes());
+        sensor[144..148].copy_from_slice(&4_u32.to_le_bytes());
+        assert_eq!(
+            parse_sensor_info(&sensor).unwrap(),
+            SensorInfo {
+                channel: 1,
+                sensor_id: 42,
+                numeric_type: 0,
+                sampling_mode: 0,
+                description: "Respiration Force".to_owned(),
+                unit: "N".to_owned(),
+                uncertainty: 0.01,
+                minimum: -50.0,
+                maximum: 50.0,
+                minimum_period_us: 10_000,
+                maximum_period_us: 1_000_000,
+                typical_period_us: 100_000,
+                period_granularity_us: 1_000,
+                mutual_exclusion_mask: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_inconsistent_measurement_lengths_and_value_counts() {
+        assert_eq!(
+            parse_measurements(&[0x20, 5, 0, 0, 0x0c]),
+            Err(ProtocolError::Metadata(0x0c))
+        );
+        assert_eq!(
+            parse_measurements(&[0x20, 5, 0, 0, 0x06, 0]),
+            Err(ProtocolError::LengthMismatch {
+                declared: 5,
+                actual: 6
+            })
+        );
+        assert_eq!(
+            parse_measurements(&[0x20, 9, 0, 0, 0x06, 1, 0, 1, 0]),
+            Err(ProtocolError::ValueCount)
+        );
+        assert_eq!(
+            parse_measurements(&[0x20, 13, 0, 0, 0x06, 1, 0, 0, 0, 0, 0, 0, 0]),
+            Err(ProtocolError::ValueCount)
+        );
+        assert_eq!(parse_sensor_info(&[0; 147]), Err(ProtocolError::Truncated));
     }
 }

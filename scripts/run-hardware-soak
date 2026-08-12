@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+duration=${1:-8h}
+output_path=${2:-hardware-soak-$(date -u +%Y%m%dT%H%M%SZ).jsonl}
+interval_seconds=${3:-10}
+[ "$#" -eq 0 ] || shift
+[ "$#" -eq 0 ] || shift
+[ "$#" -eq 0 ] || shift
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(dirname -- "$script_dir")
+cd "$project_dir"
+
+if ! command -v timeout >/dev/null 2>&1; then
+    printf 'run-hardware-soak requires GNU timeout (standard on Linux)\n' >&2
+    exit 1
+fi
+
+"$script_dir/cargo-local" build --release -p kasina-service
+timeout \
+    --preserve-status \
+    --signal=INT \
+    --kill-after=30s \
+    "$duration" \
+    target/release/kasina-service \
+    --source hardware \
+    --diagnostics-jsonl "$output_path" \
+    --diagnostics-interval-seconds "$interval_seconds" \
+    "$@"
+
+if [ ! -s "$output_path" ]; then
+    printf 'hardware soak produced no diagnostics at %s\n' "$output_path" >&2
+    exit 1
+fi
+printf 'newKasina hardware soak diagnostics: %s\n' "$output_path"

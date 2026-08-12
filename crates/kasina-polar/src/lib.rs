@@ -4,16 +4,23 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::api::{Central, Characteristic, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Manager, Peripheral};
 use futures::StreamExt;
-use kasina_devices::{DeviceDescriptor, DeviceKind, DriverEvent, SensorDriver};
-use kasina_domain::StreamKind;
+use kasina_devices::{
+    DeviceDescriptor, DeviceKind, DriverConnectionState, DriverEvent, ReconnectBackoff,
+    SensorDriver, cancellable_timeout, send_driver_event,
+};
+use kasina_domain::{StreamKind, quality};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+const BLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bluetooth SIG Heart Rate service UUID.
 pub const HEART_RATE_SERVICE_UUID: Uuid =
@@ -146,38 +153,108 @@ impl PolarDriver {
         }
     }
 
-    async fn find_peripheral(&self) -> Result<Peripheral> {
-        let manager = Manager::new().await.context("create Bluetooth manager")?;
-        let adapters = manager
-            .adapters()
-            .await
-            .context("enumerate Bluetooth adapters")?;
-        let adapter = adapters
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no Bluetooth adapter is available"))?;
-        adapter
-            .start_scan(ScanFilter::default())
-            .await
-            .context("start Polar scan")?;
-        tokio::time::sleep(self.scan_duration).await;
+    async fn find_peripheral(&self, cancellation: &CancellationToken) -> Result<Peripheral> {
+        let manager = cancellable_timeout(
+            cancellation,
+            BLE_OPERATION_TIMEOUT,
+            "create Bluetooth manager",
+            Manager::new(),
+        )
+        .await?;
+        let adapters = cancellable_timeout(
+            cancellation,
+            BLE_OPERATION_TIMEOUT,
+            "enumerate Bluetooth adapters",
+            manager.adapters(),
+        )
+        .await?;
+        if adapters.is_empty() {
+            bail!("no Bluetooth adapter is available");
+        }
 
-        for peripheral in adapter.peripherals().await? {
-            let id = peripheral.id().to_string();
-            let properties = peripheral.properties().await?;
-            let name_matches = properties
-                .as_ref()
-                .and_then(|value| value.local_name.as_deref())
-                .is_some_and(|name| name.to_ascii_lowercase().contains("polar"));
-            let service_matches = properties
-                .as_ref()
-                .is_some_and(|value| value.services.contains(&HEART_RATE_SERVICE_UUID));
-            let id_matches = self.target_id.as_ref().is_some_and(|target| target == &id);
-            if id_matches || name_matches || service_matches {
-                return Ok(peripheral);
+        let mut scanning = Vec::new();
+        for adapter in &adapters {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match cancellable_timeout(
+                cancellation,
+                BLE_OPERATION_TIMEOUT,
+                "start Polar scan",
+                adapter.start_scan(ScanFilter::default()),
+            )
+            .await
+            {
+                Ok(()) => scanning.push(adapter),
+                Err(_) if cancellation.is_cancelled() => break,
+                Err(error) => warn!(%error, "could not start Polar scan on an adapter"),
             }
         }
-        bail!("no Polar heart-rate peripheral found")
+        if cancellation.is_cancelled() {
+            for adapter in &scanning {
+                let _ = tokio::time::timeout(CLEANUP_TIMEOUT, adapter.stop_scan()).await;
+            }
+            bail!("Polar scan cancelled");
+        }
+        if scanning.is_empty() {
+            bail!("no Bluetooth adapter could start a Polar scan");
+        }
+        let cancelled = tokio::select! {
+            () = cancellation.cancelled() => true,
+            () = tokio::time::sleep(self.scan_duration) => false,
+        };
+        for adapter in &scanning {
+            match tokio::time::timeout(CLEANUP_TIMEOUT, adapter.stop_scan()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "could not stop Polar scan"),
+                Err(_) => warn!("stopping Polar scan timed out"),
+            }
+        }
+        if cancelled {
+            bail!("Polar scan cancelled");
+        }
+
+        let mut fallback = None;
+        for adapter in &adapters {
+            let peripherals = cancellable_timeout(
+                cancellation,
+                BLE_OPERATION_TIMEOUT,
+                "list Polar peripherals",
+                adapter.peripherals(),
+            )
+            .await?;
+            for peripheral in peripherals {
+                let id = peripheral.id().to_string();
+                let properties = match cancellable_timeout(
+                    cancellation,
+                    BLE_OPERATION_TIMEOUT,
+                    "read Polar advertisement properties",
+                    peripheral.properties(),
+                )
+                .await
+                {
+                    Ok(properties) => properties,
+                    Err(error) => {
+                        warn!(%error, %id, "could not read Polar advertisement properties");
+                        continue;
+                    }
+                };
+                if self.target_id.as_ref().is_some_and(|target| target == &id) {
+                    return Ok(peripheral);
+                }
+                let name_matches = properties
+                    .as_ref()
+                    .and_then(|value| value.local_name.as_deref())
+                    .is_some_and(|name| name.to_ascii_lowercase().contains("polar"));
+                let service_matches = properties
+                    .as_ref()
+                    .is_some_and(|value| value.services.contains(&HEART_RATE_SERVICE_UUID));
+                if fallback.is_none() && (name_matches || service_matches) {
+                    fallback = Some(peripheral);
+                }
+            }
+        }
+        fallback.ok_or_else(|| anyhow!("no Polar heart-rate peripheral found"))
     }
 
     async fn connected_session(
@@ -185,60 +262,116 @@ impl PolarDriver {
         peripheral: &Peripheral,
         sender: &mpsc::Sender<DriverEvent>,
         cancellation: &CancellationToken,
+        backoff: &mut ReconnectBackoff,
     ) -> Result<()> {
         let source_id = peripheral.id().to_string();
-        peripheral
-            .connect()
-            .await
-            .context("connect Polar peripheral")?;
-        peripheral
-            .discover_services()
-            .await
-            .context("discover Polar services")?;
-        let characteristic = peripheral
-            .characteristics()
-            .into_iter()
-            .find(|characteristic| characteristic.uuid == HEART_RATE_MEASUREMENT_UUID)
-            .ok_or_else(|| anyhow!("Polar Heart Rate Measurement characteristic is absent"))?;
-        peripheral
-            .subscribe(&characteristic)
-            .await
-            .context("subscribe Polar HR")?;
-        sender
-            .send(DriverEvent::Status {
-                source_id: source_id.clone(),
-                detail: "connected".to_owned(),
-            })
-            .await?;
-        let mut notifications = peripheral.notifications().await?;
-        loop {
+        let connect_result = tokio::select! {
+            () = cancellation.cancelled() => return Ok(()),
+            result = tokio::time::timeout(BLE_OPERATION_TIMEOUT, peripheral.connect()) => {
+                result.context("connect Polar peripheral timed out")?
+            }
+        };
+        connect_result.context("connect Polar peripheral")?;
+
+        let mut subscribed: Option<Characteristic> = None;
+        let session_result: Result<()> = async {
             tokio::select! {
                 () = cancellation.cancelled() => return Ok(()),
-                notification = notifications.next() => {
-                    let notification = notification.ok_or_else(|| anyhow!("Polar notification stream ended"))?;
-                    if notification.uuid != HEART_RATE_MEASUREMENT_UUID {
-                        continue;
-                    }
-                    let measurement = parse_heart_rate_measurement(&notification.value)?;
-                    sender.send(DriverEvent::Measurement {
-                        stream: StreamKind::HeartRate,
-                        source_id: source_id.clone(),
-                        device_time_ns: None,
-                        value: f64::from(measurement.heart_rate_bpm),
-                        quality_flags: 0,
-                    }).await?;
-                    for ticks in measurement.rr_intervals_1024 {
-                        sender.send(DriverEvent::Measurement {
-                            stream: StreamKind::RrInterval,
+                result = tokio::time::timeout(BLE_OPERATION_TIMEOUT, peripheral.discover_services()) => {
+                    result.context("discover Polar services timed out")??;
+                }
+            }
+            let characteristic = peripheral
+                .characteristics()
+                .into_iter()
+                .find(|characteristic| characteristic.uuid == HEART_RATE_MEASUREMENT_UUID)
+                .ok_or_else(|| anyhow!("Polar Heart Rate Measurement characteristic is absent"))?;
+            tokio::select! {
+                () = cancellation.cancelled() => return Ok(()),
+                result = tokio::time::timeout(BLE_OPERATION_TIMEOUT, peripheral.subscribe(&characteristic)) => {
+                    result.context("subscribe Polar HR timed out")??;
+                }
+            }
+            subscribed = Some(characteristic);
+            backoff.reset();
+            if !send_driver_event(
+                sender,
+                cancellation,
+                DriverEvent::Status {
+                    source_id: source_id.clone(),
+                    state: DriverConnectionState::Connected,
+                    detail: "subscribed to Heart Rate Measurement".to_owned(),
+                },
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            let mut notifications = cancellable_timeout(
+                cancellation,
+                BLE_OPERATION_TIMEOUT,
+                "open Polar notification stream",
+                peripheral.notifications(),
+            )
+            .await?;
+            let silence = tokio::time::sleep(NOTIFICATION_TIMEOUT);
+            tokio::pin!(silence);
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break Ok(()),
+                    () = &mut silence => bail!("Polar notifications silent for {} seconds", NOTIFICATION_TIMEOUT.as_secs()),
+                    notification = notifications.next() => {
+                        let notification = notification
+                            .ok_or_else(|| anyhow!("Polar notification stream ended"))?;
+                        if notification.uuid != HEART_RATE_MEASUREMENT_UUID {
+                            continue;
+                        }
+                        silence.as_mut().reset(tokio::time::Instant::now() + NOTIFICATION_TIMEOUT);
+                        let measurement = match parse_heart_rate_measurement(&notification.value) {
+                            Ok(measurement) => measurement,
+                            Err(error) => {
+                                warn!(%error, "discarding malformed Polar notification");
+                                continue;
+                            }
+                        };
+                        let hr_quality = if measurement.heart_rate_bpm == 0 {
+                            quality::SOURCE_INVALID
+                        } else {
+                            0
+                        };
+                        if !send_driver_event(sender, cancellation, DriverEvent::Measurement {
+                            stream: StreamKind::HeartRate,
                             source_id: source_id.clone(),
                             device_time_ns: None,
-                            value: rr_ticks_to_microseconds(ticks),
-                            quality_flags: 0,
-                        }).await?;
+                            value: f64::from(measurement.heart_rate_bpm),
+                            quality_flags: hr_quality,
+                        }).await? {
+                            break Ok(());
+                        }
+                        for ticks in measurement.rr_intervals_1024 {
+                            let rr_quality = if ticks == 0 { quality::SOURCE_INVALID } else { 0 };
+                            if !send_driver_event(sender, cancellation, DriverEvent::Measurement {
+                                stream: StreamKind::RrInterval,
+                                source_id: source_id.clone(),
+                                device_time_ns: None,
+                                value: rr_ticks_to_microseconds(ticks),
+                                quality_flags: rr_quality,
+                            }).await? {
+                                break;
+                            }
+                        }
                     }
                 }
             }
         }
+        .await;
+
+        if let Some(characteristic) = &subscribed {
+            let _ =
+                tokio::time::timeout(CLEANUP_TIMEOUT, peripheral.unsubscribe(characteristic)).await;
+        }
+        let _ = tokio::time::timeout(CLEANUP_TIMEOUT, peripheral.disconnect()).await;
+        session_result
     }
 }
 
@@ -266,13 +399,26 @@ impl SensorDriver for PolarDriver {
         sender: mpsc::Sender<DriverEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let mut retry = Duration::from_millis(500);
+        let mut backoff =
+            ReconnectBackoff::new(Duration::from_millis(500), Duration::from_secs(30));
         while !cancellation.is_cancelled() {
-            let result = match self.find_peripheral().await {
+            if !send_driver_event(
+                &sender,
+                &cancellation,
+                DriverEvent::Status {
+                    source_id: self.descriptor().id,
+                    state: DriverConnectionState::Connecting,
+                    detail: "discovering Polar heart-rate sensor".to_owned(),
+                },
+            )
+            .await?
+            {
+                break;
+            }
+            let result = match self.find_peripheral(&cancellation).await {
                 Ok(peripheral) => {
-                    retry = Duration::from_millis(500);
                     info!(id = %peripheral.id(), "found Polar peripheral");
-                    self.connected_session(&peripheral, &sender, &cancellation)
+                    self.connected_session(&peripheral, &sender, &cancellation, &mut backoff)
                         .await
                 }
                 Err(error) => Err(error),
@@ -280,20 +426,27 @@ impl SensorDriver for PolarDriver {
             if cancellation.is_cancelled() {
                 break;
             }
+            let retry = backoff.next_delay();
             if let Err(error) = &result {
                 warn!(%error, ?retry, "Polar session failed; retrying");
             }
-            sender
-                .send(DriverEvent::Status {
+            if !send_driver_event(
+                &sender,
+                &cancellation,
+                DriverEvent::Status {
                     source_id: self.descriptor().id,
+                    state: DriverConnectionState::Reconnecting,
                     detail: format!("reconnecting in {} ms", retry.as_millis()),
-                })
-                .await?;
+                },
+            )
+            .await?
+            {
+                break;
+            }
             tokio::select! {
                 () = cancellation.cancelled() => break,
                 () = tokio::time::sleep(retry) => {}
             }
-            retry = (retry * 2).min(Duration::from_secs(30));
         }
         Ok(())
     }

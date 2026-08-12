@@ -24,6 +24,10 @@ against a physical belt before Milestone 3 can be marked complete.
 The JavaScript and Python implementations agree on the framing, BLE characteristics,
 20-byte write chunking, rolling counter, and streamed measurement layouts.
 
+One status-parser discrepancy was resolved in favor of Python's explicit packed struct:
+`godirect-js` reads the secondary firmware minor version at payload byte 9, which is part
+of its 16-bit build number; Rust reads major/minor/build at bytes 6/7/8..10.
+
 ## BLE transport
 
 | Purpose | UUID | Operation |
@@ -44,14 +48,17 @@ Commands have a four-byte envelope followed by a subcommand:
 ```
 
 The checksum is the wrapping sum of every packet byte except the checksum byte itself.
-On a fresh connection the required subset is:
+On a fresh connection the implemented sequence, matching the official libraries, is:
 
 1. subscribe to the response characteristic;
 2. send initialization command `0x1a` and its 20-byte initialization payload;
-3. send `0x1b` with the measurement period as little-endian microseconds;
-4. send `0x18` with a little-endian channel bit mask;
-5. consume measurement notifications beginning with `0x20`;
-6. send `0x19` before a clean disconnect.
+3. query status (`0x10`), identity (`0x55`), default channels (`0x56`), available
+   channels (`0x51`), and selected-channel metadata (`0x50`);
+4. reject an unavailable selected channel or a period outside its advertised bounds;
+5. send `0x1b` with the measurement period as little-endian microseconds;
+6. send `0x18` with a little-endian channel bit mask;
+7. consume measurement notifications beginning with `0x20`;
+8. send `0x19` and protocol disconnect `0x54` before transport disconnect.
 
 Command responses echo the subcommand at byte 4 and rolling counter at byte 5. Only one
 command may be outstanding at a time. Notifications can be fragmented, so the declared
@@ -67,10 +74,17 @@ length at byte 1 drives reassembly.
 | `0x09`, `0x0b` single/aperiodic int32 | channel number, value count, LE `i32` values |
 | `0x0c`–`0x0e` | start time, dropped-count, and period metadata; recognized, not values |
 
-The Rust driver currently exposes channel 1 as raw `RespirationForce` values with the
-domain unit `device`, matching pyKasina's behavior. Sensor-info parsing and a physical
-capture must confirm the actual device description and unit before a user-facing unit is
-claimed.
+The Rust driver exposes channel 1 as raw `RespirationForce` values with the conservative
+domain unit `device`, matching pyKasina's behavior. It parses and logs the actual device
+identity, firmware, battery state, selected-channel description/unit, numeric type,
+sampling mode, ranges, supported periods, and mutual exclusions. A physical capture must
+still confirm the returned description and unit before the domain/user-facing unit is
+changed.
+
+All command construction and metadata/value parsing are pure Rust and hardware-independent.
+Tests cover the normal/wide/single/aperiodic floating and integer layouts, fragmented and
+back-to-back framing, malformed lengths/counts, oversized commands, identity/status, and
+the complete 148-byte channel metadata structure.
 
 ## Remaining physical validation
 
@@ -79,4 +93,4 @@ claimed.
 - Capture consent-safe request/response/measurement bytes and add them as fixtures.
 - Compare native and Python values sample-for-sample for at least 30 minutes at 100 ms.
 - Power-cycle the belt, disable/enable the adapter, and verify automatic reconnection.
-- Run a dual-device eight-hour soak and retain sequence-gap and reconnect diagnostics.
+- Run `scripts/run-hardware-soak 8h` with both devices and retain its private JSONL report.

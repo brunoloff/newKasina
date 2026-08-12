@@ -2154,6 +2154,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "clap",
  "directories",
  "fs2",
@@ -2164,6 +2165,8 @@ dependencies = [
  "kasina-polar",
  "kasina-protocol",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",

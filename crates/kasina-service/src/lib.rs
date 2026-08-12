@@ -14,7 +14,9 @@ use anyhow::{Context, Result};
 use async_stream::try_stream;
 use fs2::FileExt;
 use futures::Stream;
-use kasina_devices::{DeviceDescriptor, DeviceKind, DriverEvent, SensorDriver};
+use kasina_devices::{
+    DeviceDescriptor, DeviceKind, DriverConnectionState, DriverEvent, SensorDriver,
+};
 use kasina_domain::{Sample, ServiceBuffers, StreamKind};
 use kasina_protocol::v1::kasina_server::{Kasina, KasinaServer};
 use kasina_protocol::v1::{
@@ -24,6 +26,7 @@ use kasina_protocol::v1::{
 };
 use kasina_protocol::{AUTH_HEADER, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -37,6 +40,63 @@ pub const DEFAULT_PORT: u16 = 18_861;
 /// Short transport batching interval.
 pub const BATCH_INTERVAL: Duration = Duration::from_millis(20);
 const SAMPLE_BROADCAST_CAPACITY: usize = 4_096;
+
+/// Append-only service health record suitable for long hardware soaks.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceDiagnosticRecord {
+    /// Schema revision for future compatible readers.
+    pub schema_version: u32,
+    /// Wall-clock time when the snapshot was taken.
+    pub wall_time_unix_ns: u64,
+    /// Unique service process instance.
+    pub service_instance_id: String,
+    /// Service uptime.
+    pub uptime_millis: u64,
+    /// Current per-device status.
+    pub devices: Vec<DeviceDiagnosticRecord>,
+    /// Current per-stream retention and loss status.
+    pub streams: Vec<StreamDiagnosticRecord>,
+    /// Number of connected RPC clients.
+    pub connected_clients: u64,
+    /// Samples skipped because a live transport subscriber lagged.
+    pub transport_lagged_samples: u64,
+}
+
+/// Serializable device subsection of a soak record.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceDiagnosticRecord {
+    /// Stable configured device identifier.
+    pub id: String,
+    /// User-visible driver name.
+    pub name: String,
+    /// Protocol device kind name.
+    pub kind: String,
+    /// Protocol connection state name.
+    pub state: String,
+    /// Driver-provided diagnostic detail.
+    pub detail: String,
+    /// Number of supervised reconnect attempts.
+    pub reconnect_attempts: u64,
+    /// Age of the newest sample from this source.
+    pub last_sample_age_millis: u64,
+}
+
+/// Serializable stream subsection of a soak record.
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamDiagnosticRecord {
+    /// Protocol stream kind name.
+    pub stream: String,
+    /// Newest service-assigned sequence.
+    pub newest_sequence: u64,
+    /// Samples currently retained in memory.
+    pub retained_samples: u64,
+    /// Retained time span.
+    pub retained_duration_millis: u64,
+    /// Samples evicted from bounded retention.
+    pub dropped_samples: u64,
+    /// Age of the newest sample.
+    pub last_sample_age_millis: u64,
+}
 
 /// Paths used by the per-user service.
 #[derive(Debug, Clone)]
@@ -106,7 +166,7 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
             let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
             file.write_all(token.as_bytes())?;
             file.sync_all()?;
-            restrict_token_permissions(path)?;
+            restrict_user_permissions(path)?;
             Ok(token)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => read_token(path),
@@ -126,14 +186,14 @@ pub fn read_token(path: &Path) -> Result<String> {
 }
 
 #[cfg(unix)]
-fn restrict_token_permissions(path: &Path) -> Result<()> {
+fn restrict_user_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_token_permissions(_path: &Path) -> Result<()> {
+fn restrict_user_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -141,8 +201,7 @@ fn restrict_token_permissions(_path: &Path) -> Result<()> {
 struct DeviceRuntime {
     descriptor: DeviceDescriptor,
     active_source_id: String,
-    connected: bool,
-    finished: bool,
+    state: DriverConnectionState,
     detail: String,
     reconnect_attempts: u64,
 }
@@ -184,8 +243,7 @@ impl ServiceState {
                     DeviceRuntime {
                         descriptor,
                         active_source_id: id,
-                        connected: false,
-                        finished: false,
+                        state: DriverConnectionState::Connecting,
                         detail: "starting".to_owned(),
                         reconnect_attempts: 0,
                     },
@@ -250,11 +308,15 @@ impl ServiceState {
                         .context("service buffer rejected driver sample")?;
                     let _ = self.sample_sender.send(sample);
                 }
-                DriverEvent::Status { source_id, detail } => {
+                DriverEvent::Status {
+                    source_id,
+                    state,
+                    detail,
+                } => {
                     if let Some(device) = self.devices.write().get_mut(&runtime_id) {
                         device.active_source_id = source_id;
-                        device.connected = detail == "connected";
-                        if detail.starts_with("reconnecting") {
+                        device.state = state;
+                        if state == DriverConnectionState::Reconnecting {
                             device.reconnect_attempts = device.reconnect_attempts.saturating_add(1);
                         }
                         device.detail = detail;
@@ -264,17 +326,16 @@ impl ServiceState {
         }
 
         driver_cancel.cancel();
-        driver_task.await.context("driver task panicked")??;
+        let driver_result = driver_task.await.context("driver task panicked")?;
         if let Some(device) = self.devices.write().get_mut(&runtime_id) {
-            device.connected = false;
-            device.finished = true;
-            device.detail = if cancellation.is_cancelled() {
-                "stopped".to_owned()
-            } else {
-                "driver finished".to_owned()
+            device.state = DriverConnectionState::Disconnected;
+            device.detail = match (&driver_result, cancellation.is_cancelled()) {
+                (_, true) => "stopped".to_owned(),
+                (Ok(()), false) => "driver finished".to_owned(),
+                (Err(error), false) => format!("driver failed: {error:#}"),
             };
         }
-        Ok(())
+        driver_result
     }
 
     fn status_snapshot(&self) -> StatusSnapshot {
@@ -313,6 +374,54 @@ impl ServiceState {
         }
     }
 
+    /// Produce a stable serializable health snapshot for soak-test logging.
+    #[must_use]
+    pub fn diagnostic_record(&self) -> ServiceDiagnosticRecord {
+        let status = self.status_snapshot();
+        ServiceDiagnosticRecord {
+            schema_version: 1,
+            wall_time_unix_ns: unix_time_ns(),
+            service_instance_id: self.instance_id.clone(),
+            uptime_millis: status.uptime_millis,
+            devices: status
+                .devices
+                .into_iter()
+                .map(|status| {
+                    let device = status.device.unwrap_or_default();
+                    DeviceDiagnosticRecord {
+                        id: device.id,
+                        name: device.name,
+                        kind: kasina_protocol::v1::DeviceKind::try_from(device.kind)
+                            .map_or("DEVICE_KIND_UNSPECIFIED", |kind| kind.as_str_name())
+                            .to_owned(),
+                        state: ConnectionState::try_from(status.state)
+                            .map_or("CONNECTION_STATE_UNSPECIFIED", |state| state.as_str_name())
+                            .to_owned(),
+                        detail: status.detail,
+                        reconnect_attempts: status.reconnect_attempts,
+                        last_sample_age_millis: status.last_sample_age_millis,
+                    }
+                })
+                .collect(),
+            streams: status
+                .streams
+                .into_iter()
+                .map(|stream| StreamDiagnosticRecord {
+                    stream: kasina_protocol::v1::StreamKind::try_from(stream.stream)
+                        .map_or("STREAM_KIND_UNSPECIFIED", |kind| kind.as_str_name())
+                        .to_owned(),
+                    newest_sequence: stream.newest_sequence,
+                    retained_samples: stream.retained_samples,
+                    retained_duration_millis: stream.retained_duration_millis,
+                    dropped_samples: stream.dropped_samples,
+                    last_sample_age_millis: stream.last_sample_age_millis,
+                })
+                .collect(),
+            connected_clients: status.connected_clients,
+            transport_lagged_samples: status.transport_lagged_samples,
+        }
+    }
+
     fn proto_device_status(&self, runtime: &DeviceRuntime, now_ns: u64) -> DeviceStatus {
         let last_sample_time = self
             .buffers
@@ -329,19 +438,71 @@ impl ServiceState {
                 kind: proto_device_kind(runtime.descriptor.kind) as i32,
                 preferred: true,
             }),
-            state: if runtime.connected {
-                ConnectionState::Connected as i32
-            } else if runtime.finished {
-                ConnectionState::Disconnected as i32
-            } else {
-                ConnectionState::Connecting as i32
-            },
+            state: match runtime.state {
+                DriverConnectionState::Connecting => ConnectionState::Connecting,
+                DriverConnectionState::Connected => ConnectionState::Connected,
+                DriverConnectionState::Reconnecting => ConnectionState::Reconnecting,
+                DriverConnectionState::Disconnected => ConnectionState::Disconnected,
+            } as i32,
             detail: runtime.detail.clone(),
             reconnect_attempts: runtime.reconnect_attempts,
             last_sample_age_millis: last_sample_time
                 .map_or(0, |time| now_ns.saturating_sub(time) / 1_000_000),
         }
     }
+}
+
+/// Periodically append service health snapshots until cancellation.
+pub async fn write_diagnostics_jsonl(
+    state: Arc<ServiceState>,
+    path: PathBuf,
+    interval: Duration,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    if interval.is_zero() {
+        anyhow::bail!("diagnostics interval must be greater than zero");
+    }
+    ensure_parent(&path)?;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            _ = ticker.tick() => {
+                append_diagnostic_snapshot(&state, &path).await?;
+            }
+        }
+    }
+    append_diagnostic_snapshot(&state, &path).await
+}
+
+async fn append_diagnostic_snapshot(state: &ServiceState, path: &Path) -> Result<()> {
+    let record = state.diagnostic_record();
+    let output = path.to_owned();
+    tokio::task::spawn_blocking(move || append_diagnostic_record(&output, &record))
+        .await
+        .context("diagnostics writer task panicked")?
+}
+
+fn append_diagnostic_record(path: &Path, record: &ServiceDiagnosticRecord) -> Result<()> {
+    let mut file = open_private_append(path)
+        .with_context(|| format!("open diagnostics file {}", path.display()))?;
+    restrict_user_permissions(path)?;
+    serde_json::to_writer(&mut file, record).context("serialize service diagnostics")?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
+}
+
+fn open_private_append(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 fn unix_time_ns() -> u64 {
@@ -721,6 +882,35 @@ mod tests {
     use kasina_devices::SimulatedDriver;
     use kasina_protocol::client_hello;
 
+    #[derive(Debug)]
+    struct FailingDriver;
+
+    #[async_trait::async_trait]
+    impl SensorDriver for FailingDriver {
+        fn descriptor(&self) -> DeviceDescriptor {
+            DeviceDescriptor {
+                id: "failing:test".to_owned(),
+                name: "Failing test device".to_owned(),
+                kind: DeviceKind::Simulated,
+            }
+        }
+
+        async fn run(
+            self: Box<Self>,
+            sender: mpsc::Sender<DriverEvent>,
+            _cancellation: CancellationToken,
+        ) -> Result<()> {
+            sender
+                .send(DriverEvent::Status {
+                    source_id: "failing:test".to_owned(),
+                    state: DriverConnectionState::Connected,
+                    detail: "connected before failure".to_owned(),
+                })
+                .await?;
+            anyhow::bail!("intentional driver failure")
+        }
+    }
+
     #[tokio::test]
     async fn broadcast_backpressure_is_reported_as_an_explicit_gap() {
         let descriptor = SimulatedDriver::default().descriptor();
@@ -812,5 +1002,70 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["godirect:auto", "polar:auto"]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_driver_is_reported_as_disconnected() {
+        let descriptor = FailingDriver.descriptor();
+        let state = ServiceState::new(Duration::from_secs(30), descriptor);
+        let result = Arc::clone(&state)
+            .run_driver(Box::new(FailingDriver), CancellationToken::new())
+            .await;
+        assert!(result.is_err());
+        let status = state.status_snapshot();
+        assert_eq!(status.devices.len(), 1);
+        assert_eq!(
+            status.devices[0].state,
+            ConnectionState::Disconnected as i32
+        );
+        assert!(
+            status.devices[0]
+                .detail
+                .contains("intentional driver failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn soak_diagnostics_are_append_only_json_lines() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("health.jsonl");
+        let state = ServiceState::new(
+            Duration::from_secs(30),
+            SimulatedDriver::default().descriptor(),
+        );
+        let cancellation = CancellationToken::new();
+        let writer = tokio::spawn(write_diagnostics_jsonl(
+            Arc::clone(&state),
+            output.clone(),
+            Duration::from_millis(5),
+            cancellation.clone(),
+        ));
+
+        let contents = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = fs::read_to_string(&output)
+                    && contents.lines().count() >= 2
+                {
+                    break contents;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        writer.await.unwrap().unwrap();
+
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(records.len() >= 2);
+        assert_eq!(records[0]["schema_version"], 1);
+        assert_eq!(
+            records[0]["service_instance_id"],
+            records[1]["service_instance_id"]
+        );
+        assert_eq!(records[0]["devices"][0]["id"], "simulated:biofeedback");
     }
 }
