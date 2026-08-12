@@ -4,10 +4,11 @@ use std::time::Duration;
 use kasina_devices::{SensorDriver, SimulatedDriver};
 use kasina_protocol::client_hello;
 use kasina_protocol::v1::kasina_client::KasinaClient;
-use kasina_protocol::v1::{SamplesSinceRequest, StreamCursor, StreamKind};
+use kasina_protocol::v1::{ClientHello, SamplesSinceRequest, StreamCursor, StreamKind};
 use kasina_service::{KasinaRpc, ServiceState, authenticated_request, serve};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tonic::Code;
 
 #[tokio::test]
 async fn client_restart_preserves_sequences_and_recovers_gap_without_duplicates() {
@@ -93,4 +94,50 @@ async fn history_request(
         .await
         .unwrap()
         .into_inner()
+}
+
+#[tokio::test]
+async fn server_rejects_bad_tokens_and_incompatible_protocol_versions() {
+    let token = "integration-test-token";
+    let driver = SimulatedDriver::default();
+    let state = ServiceState::new(Duration::from_secs(30), driver.descriptor());
+    let cancellation = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        KasinaRpc::new(state, token),
+        cancellation.child_token(),
+    ));
+    let mut client = KasinaClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+
+    let authentication_error = client
+        .get_service_info(
+            authenticated_request(client_hello("integration-test", "0"), "wrong-token").unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(authentication_error.code(), Code::Unauthenticated);
+
+    let version_error = client
+        .get_service_info(
+            authenticated_request(
+                ClientHello {
+                    protocol_major: 999,
+                    protocol_minor: 0,
+                    client_name: "integration-test".to_owned(),
+                    client_version: "0".to_owned(),
+                },
+                token,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(version_error.code(), Code::FailedPrecondition);
+
+    cancellation.cancel();
+    server.await.unwrap().unwrap();
 }

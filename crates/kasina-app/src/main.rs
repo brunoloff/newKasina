@@ -784,4 +784,25 @@ mod tests {
         assert_eq!(model.inferred_gap_samples, 1);
         assert_eq!(model.last_sequences[&(StreamKind::HeartRate as i32)], 3);
     }
+
+    #[test]
+    fn full_ui_queue_is_visible_and_does_not_advance_recovery_cursor() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(0);
+        let dropped = AtomicU64::new(0);
+        let mut cursors = BTreeMap::new();
+        let result = publish_batch(
+            SampleBatch {
+                samples: vec![sample(StreamKind::HeartRate, 7)],
+                gaps: Vec::new(),
+                service_batch_sequence: 1,
+            },
+            &sender,
+            &dropped,
+            &egui::Context::default(),
+            &mut cursors,
+        );
+        assert!(result.is_err());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(cursors.is_empty());
+    }
 }

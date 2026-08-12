@@ -312,4 +312,9 @@ mod tests {
         assert!(stats.is_empty());
         assert_eq!(stats.uploaded_bytes(), 0);
     }
+
+    #[test]
+    fn biofeedback_shader_parses_without_a_gpu() {
+        naga::front::wgsl::parse_str(include_str!("biofeedback.wgsl")).unwrap();
+    }
 }

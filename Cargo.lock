@@ -2142,6 +2142,7 @@ dependencies = [
  "bytemuck",
  "egui",
  "egui-wgpu",
+ "naga",
  "parking_lot",
 ]
 

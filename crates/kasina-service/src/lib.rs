@@ -670,3 +670,76 @@ pub fn authenticated_request<T>(message: T, token: &str) -> Result<Request<T>> {
     );
     Ok(request)
 }
+
+#[cfg(test)]
+mod tests {
+    use async_stream::stream;
+    use futures::StreamExt as _;
+
+    use super::*;
+    use kasina_devices::SimulatedDriver;
+    use kasina_protocol::client_hello;
+
+    #[tokio::test]
+    async fn broadcast_backpressure_is_reported_as_an_explicit_gap() {
+        let descriptor = SimulatedDriver::default().descriptor();
+        let state = ServiceState::new(Duration::from_secs(30), descriptor);
+        let rpc = KasinaRpc::new(Arc::clone(&state), "test-token");
+        let response = Kasina::subscribe_samples(
+            &rpc,
+            authenticated_request(
+                SubscribeRequest {
+                    client: Some(client_hello("test", "0")),
+                    streams: vec![kasina_protocol::v1::StreamKind::RespirationForce as i32],
+                },
+                "test-token",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut output = response.into_inner();
+
+        let events = stream! {
+            for value in 0..(SAMPLE_BROADCAST_CAPACITY + 1_024) {
+                yield DriverEvent::Measurement {
+                    stream: StreamKind::RespirationForce,
+                    source_id: "burst".to_owned(),
+                    device_time_ns: None,
+                    value: value as f64,
+                    quality_flags: 0,
+                };
+            }
+        };
+        tokio::pin!(events);
+        while let Some(event) = events.next().await {
+            let sequence = {
+                let mut sequences = state.sequences.lock();
+                let next = sequences.entry(StreamKind::RespirationForce).or_insert(0);
+                *next += 1;
+                *next
+            };
+            let sample = Sample::new(
+                StreamKind::RespirationForce,
+                "burst",
+                sequence,
+                sequence,
+                sequence,
+                match event {
+                    DriverEvent::Measurement { value, .. } => value,
+                    DriverEvent::Status { .. } => unreachable!(),
+                },
+            );
+            state.buffers.write().push(sample.clone()).unwrap();
+            let _ = state.sample_sender.send(sample);
+        }
+
+        let batch = tokio::time::timeout(Duration::from_secs(1), output.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(batch.gaps.iter().any(|gap| gap.dropped_samples > 0));
+        assert!(state.transport_lagged_samples.load(Ordering::Relaxed) > 0);
+    }
+}

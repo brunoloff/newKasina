@@ -34,6 +34,7 @@ egui = "0.36.1"
 egui-wgpu = "0.36.1"
 fs2 = "0.4.3"
 futures = "0.3.32"
+naga = { version = "30.0.0", features = ["wgsl-in"] }
 parking_lot = "0.12.5"
 prost = "0.14.3"
 protoc-bin-vendored = "3.2.0"
@@ -69,4 +70,3 @@ lto = "thin"
 [profile.profiling]
 inherits = "release"
 debug = true
-
