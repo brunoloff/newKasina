@@ -2158,6 +2158,8 @@ dependencies = [
  "futures",
  "kasina-devices",
  "kasina-domain",
+ "kasina-godirect",
+ "kasina-polar",
  "kasina-protocol",
  "parking_lot",
  "tempfile",

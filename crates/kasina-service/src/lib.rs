@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -140,7 +140,9 @@ fn restrict_token_permissions(_path: &Path) -> Result<()> {
 #[derive(Debug, Clone)]
 struct DeviceRuntime {
     descriptor: DeviceDescriptor,
+    active_source_id: String,
     connected: bool,
+    finished: bool,
     detail: String,
     reconnect_attempts: u64,
 }
@@ -153,34 +155,53 @@ pub struct ServiceState {
     buffers: RwLock<ServiceBuffers>,
     sequences: Mutex<std::collections::BTreeMap<StreamKind, u64>>,
     sample_sender: broadcast::Sender<Sample>,
-    device: RwLock<DeviceRuntime>,
+    devices: RwLock<std::collections::BTreeMap<String, DeviceRuntime>>,
     connected_clients: AtomicU64,
     transport_lagged_samples: AtomicU64,
     service_batch_sequence: AtomicU64,
-    driver_finished: AtomicBool,
 }
 
 impl ServiceState {
     /// Create isolated persistent state for one service instance.
     #[must_use]
     pub fn new(retention: Duration, device: DeviceDescriptor) -> Arc<Self> {
+        Self::new_multi(retention, [device])
+    }
+
+    /// Create service state for multiple independently supervised devices.
+    #[must_use]
+    pub fn new_multi(
+        retention: Duration,
+        devices: impl IntoIterator<Item = DeviceDescriptor>,
+    ) -> Arc<Self> {
         let (sample_sender, _) = broadcast::channel(SAMPLE_BROADCAST_CAPACITY);
+        let devices = devices
+            .into_iter()
+            .map(|descriptor| {
+                let id = descriptor.id.clone();
+                (
+                    id.clone(),
+                    DeviceRuntime {
+                        descriptor,
+                        active_source_id: id,
+                        connected: false,
+                        finished: false,
+                        detail: "starting".to_owned(),
+                        reconnect_attempts: 0,
+                    },
+                )
+            })
+            .collect();
         Arc::new(Self {
             started: Instant::now(),
             instance_id: Uuid::new_v4().to_string(),
             buffers: RwLock::new(ServiceBuffers::new(retention)),
             sequences: Mutex::new(std::collections::BTreeMap::new()),
             sample_sender,
-            device: RwLock::new(DeviceRuntime {
-                descriptor: device,
-                connected: false,
-                detail: "starting".to_owned(),
-                reconnect_attempts: 0,
-            }),
+            devices: RwLock::new(devices),
             connected_clients: AtomicU64::new(0),
             transport_lagged_samples: AtomicU64::new(0),
             service_batch_sequence: AtomicU64::new(0),
-            driver_finished: AtomicBool::new(false),
         })
     }
 
@@ -190,6 +211,7 @@ impl ServiceState {
         driver: Box<dyn SensorDriver>,
         cancellation: CancellationToken,
     ) -> Result<()> {
+        let runtime_id = driver.descriptor().id;
         let (sender, mut receiver) = mpsc::channel(1_024);
         let driver_cancel = cancellation.child_token();
         let driver_task = tokio::spawn(driver.run(sender, driver_cancel.clone()));
@@ -203,6 +225,9 @@ impl ServiceState {
                     value,
                     quality_flags,
                 } => {
+                    if let Some(device) = self.devices.write().get_mut(&runtime_id) {
+                        device.active_source_id.clone_from(&source_id);
+                    }
                     let sequence = {
                         let mut sequences = self.sequences.lock();
                         let next = sequences.entry(stream).or_insert(0);
@@ -225,24 +250,30 @@ impl ServiceState {
                         .context("service buffer rejected driver sample")?;
                     let _ = self.sample_sender.send(sample);
                 }
-                DriverEvent::Status { detail, .. } => {
-                    let mut device = self.device.write();
-                    device.connected = detail == "connected";
-                    device.detail = detail;
+                DriverEvent::Status { source_id, detail } => {
+                    if let Some(device) = self.devices.write().get_mut(&runtime_id) {
+                        device.active_source_id = source_id;
+                        device.connected = detail == "connected";
+                        if detail.starts_with("reconnecting") {
+                            device.reconnect_attempts = device.reconnect_attempts.saturating_add(1);
+                        }
+                        device.detail = detail;
+                    }
                 }
             }
         }
 
         driver_cancel.cancel();
         driver_task.await.context("driver task panicked")??;
-        self.driver_finished.store(true, Ordering::Release);
-        let mut device = self.device.write();
-        device.connected = false;
-        device.detail = if cancellation.is_cancelled() {
-            "stopped".to_owned()
-        } else {
-            "driver finished".to_owned()
-        };
+        if let Some(device) = self.devices.write().get_mut(&runtime_id) {
+            device.connected = false;
+            device.finished = true;
+            device.detail = if cancellation.is_cancelled() {
+                "stopped".to_owned()
+            } else {
+                "driver finished".to_owned()
+            };
+        }
         Ok(())
     }
 
@@ -266,22 +297,30 @@ impl ServiceState {
                 }
             })
             .collect();
+        drop(buffers);
+        let devices = self
+            .devices
+            .read()
+            .values()
+            .map(|runtime| self.proto_device_status(runtime, now_ns))
+            .collect();
         StatusSnapshot {
             uptime_millis: uptime.as_millis() as u64,
-            devices: vec![self.proto_device_status(now_ns)],
+            devices,
             streams,
             connected_clients: self.connected_clients.load(Ordering::Relaxed),
             transport_lagged_samples: self.transport_lagged_samples.load(Ordering::Relaxed),
         }
     }
 
-    fn proto_device_status(&self, now_ns: u64) -> DeviceStatus {
-        let runtime = self.device.read();
+    fn proto_device_status(&self, runtime: &DeviceRuntime, now_ns: u64) -> DeviceStatus {
         let last_sample_time = self
             .buffers
             .read()
             .iter()
-            .filter_map(|(_, buffer)| buffer.newest().map(|sample| sample.monotonic_time_ns))
+            .filter_map(|(_, buffer)| buffer.newest())
+            .filter(|sample| sample.source_id == runtime.active_source_id)
+            .map(|sample| sample.monotonic_time_ns)
             .max();
         DeviceStatus {
             device: Some(DeviceInfo {
@@ -292,7 +331,7 @@ impl ServiceState {
             }),
             state: if runtime.connected {
                 ConnectionState::Connected as i32
-            } else if self.driver_finished.load(Ordering::Acquire) {
+            } else if runtime.finished {
                 ConnectionState::Disconnected as i32
             } else {
                 ConnectionState::Connecting as i32
@@ -400,6 +439,14 @@ impl KasinaRpc {
         }
         Ok(())
     }
+
+    fn now_ns(&self) -> u64 {
+        self.state
+            .started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64
+    }
 }
 
 struct ClientGuard(Arc<ServiceState>);
@@ -451,9 +498,14 @@ impl Kasina for KasinaRpc {
             .elapsed()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        Ok(Response::new(DeviceList {
-            devices: vec![self.state.proto_device_status(now_ns)],
-        }))
+        let devices = self
+            .state
+            .devices
+            .read()
+            .values()
+            .map(|runtime| self.state.proto_device_status(runtime, now_ns))
+            .collect();
+        Ok(Response::new(DeviceList { devices }))
     }
 
     async fn set_device_connection(
@@ -463,24 +515,18 @@ impl Kasina for KasinaRpc {
         self.authorize(&request)?;
         Self::check_hello(request.get_ref().client.as_ref())?;
         let command = request.into_inner();
-        let mut runtime = self.state.device.write();
-        if command.device_id != runtime.descriptor.id {
-            return Err(Status::not_found("unknown device"));
-        }
+        let mut devices = self.state.devices.write();
+        let runtime = devices
+            .get_mut(&command.device_id)
+            .ok_or_else(|| Status::not_found("unknown device"))?;
         runtime.detail = if command.connect {
-            "connection requested; driver supervisor owns lifecycle"
+            "connection requested; driver supervisor owns lifecycle".to_owned()
         } else {
-            "disconnect requested; simulated driver remains service-managed"
-        }
-        .to_owned();
-        drop(runtime);
-        let now_ns = self
-            .state
-            .started
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
-        Ok(Response::new(self.state.proto_device_status(now_ns)))
+            "disconnect requested; driver supervisor owns lifecycle".to_owned()
+        };
+        let status = self.state.proto_device_status(runtime, self.now_ns());
+        drop(devices);
+        Ok(Response::new(status))
     }
 
     async fn set_preferred_device(
@@ -490,18 +536,13 @@ impl Kasina for KasinaRpc {
         self.authorize(&request)?;
         Self::check_hello(request.get_ref().client.as_ref())?;
         let command = request.into_inner();
-        let runtime = self.state.device.read();
-        if command.device_id != runtime.descriptor.id {
-            return Err(Status::not_found("unknown device"));
-        }
-        drop(runtime);
-        let now_ns = self
-            .state
-            .started
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
-        Ok(Response::new(self.state.proto_device_status(now_ns)))
+        let devices = self.state.devices.read();
+        let runtime = devices
+            .get(&command.device_id)
+            .ok_or_else(|| Status::not_found("unknown device"))?;
+        Ok(Response::new(
+            self.state.proto_device_status(runtime, self.now_ns()),
+        ))
     }
 
     async fn get_status(
@@ -741,5 +782,35 @@ mod tests {
             .unwrap();
         assert!(batch.gaps.iter().any(|gap| gap.dropped_samples > 0));
         assert!(state.transport_lagged_samples.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn service_tracks_multiple_device_supervisors() {
+        let state = ServiceState::new_multi(
+            Duration::from_secs(30),
+            [
+                DeviceDescriptor {
+                    id: "polar:auto".to_owned(),
+                    name: "Polar H10".to_owned(),
+                    kind: DeviceKind::Polar,
+                },
+                DeviceDescriptor {
+                    id: "godirect:auto".to_owned(),
+                    name: "Go Direct Respiration Belt".to_owned(),
+                    kind: DeviceKind::GoDirect,
+                },
+            ],
+        );
+        let status = state.status_snapshot();
+        assert_eq!(status.devices.len(), 2);
+        assert_eq!(
+            status
+                .devices
+                .iter()
+                .filter_map(|device| device.device.as_ref())
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            ["godirect:auto", "polar:auto"]
+        );
     }
 }

@@ -18,12 +18,17 @@ simulated Polar and respiration data.
 
 ## Build and test
 
+To keep downloaded Cargo metadata and crates in the ignored project-local cache, use the
+included wrapper:
+
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo build --workspace --release
+scripts/cargo-local fmt --all --check
+scripts/cargo-local clippy --workspace --all-targets --all-features -- -D warnings
+scripts/cargo-local test --workspace --all-features
+scripts/cargo-local build --workspace --release
 ```
+
+Plain `cargo` works normally if a shared Cargo cache is preferred.
 
 ## Run
 
@@ -42,9 +47,17 @@ cargo run --release -p kasina-app
 The service binds only to `127.0.0.1:18861`. Its per-user authentication token is created
 in the operating system's standard configuration directory.
 
+The default is a deterministic dual-stream simulator. When both physical devices are
+available, select the independently reconnecting hardware drivers with:
+
+```sh
+cargo run --release -p kasina-service -- --source hardware
+```
+
+`--source polar` and `--source go-direct` run one hardware driver for focused testing.
+
 ## GPU smoke testing
 
 The Codex sandbox used during initial development cannot see `/dev/dri`. Run the client
 from a normal graphical desktop session and inspect the Diagnostics panel for the selected
 wgpu backend, adapter, frame-time percentiles, and upload counters.
-

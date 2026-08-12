@@ -155,6 +155,7 @@ struct KasinaApp {
     renderer: Option<BiofeedbackRenderer>,
     renderer_name: String,
     stress_instances: u32,
+    fullscreen: bool,
     started: Instant,
     last_frame: Instant,
     frame_stats: FrameStats,
@@ -197,6 +198,7 @@ impl KasinaApp {
             renderer,
             renderer_name,
             stress_instances: 8_000,
+            fullscreen: false,
             started: now,
             last_frame: now,
             frame_stats: FrameStats::default(),
@@ -444,8 +446,12 @@ impl KasinaApp {
 }
 
 impl eframe::App for KasinaApp {
-    fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        if context.input(|input| input.key_pressed(egui::Key::F11)) {
+            self.fullscreen = !self.fullscreen;
+            context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -637,6 +643,19 @@ async fn connected_session(
     send_event(sender, ClientEvent::ServiceInfo(info), repaint);
 
     let streams = all_streams();
+    // Establish the live receiver before taking the history snapshot. Samples produced
+    // during the snapshot are then present in both paths and de-duplicated by cursor,
+    // instead of being lost in a history/subscription race.
+    let mut sample_stream = client
+        .subscribe_samples(authenticated_request(
+            SubscribeRequest {
+                client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
+                streams: streams.clone(),
+            },
+            token,
+        )?)
+        .await?
+        .into_inner();
     let history = client
         .get_samples_since(authenticated_request(
             SamplesSinceRequest {
@@ -654,17 +673,6 @@ async fn connected_session(
         .await?
         .into_inner();
     publish_batch(history, sender, dropped_batches, repaint, cursors)?;
-
-    let mut sample_stream = client
-        .subscribe_samples(authenticated_request(
-            SubscribeRequest {
-                client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
-                streams: streams.clone(),
-            },
-            token,
-        )?)
-        .await?
-        .into_inner();
     let mut status_client = client.clone();
     let mut status_tick = tokio::time::interval(Duration::from_millis(500));
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -696,12 +704,18 @@ async fn connected_session(
 }
 
 fn publish_batch(
-    batch: SampleBatch,
+    mut batch: SampleBatch,
     sender: &SyncSender<ClientEvent>,
     dropped_batches: &AtomicU64,
     repaint: &egui::Context,
     cursors: &mut BTreeMap<i32, u64>,
 ) -> Result<()> {
+    batch
+        .samples
+        .retain(|sample| sample.sequence > cursors.get(&sample.stream).copied().unwrap_or(0));
+    if batch.samples.is_empty() && batch.gaps.is_empty() {
+        return Ok(());
+    }
     let next_cursors: Vec<_> = batch
         .samples
         .iter()
@@ -804,5 +818,34 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert!(cursors.is_empty());
+    }
+
+    #[test]
+    fn live_overlap_is_removed_after_history_advances_cursor() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let dropped = AtomicU64::new(0);
+        let mut cursors = BTreeMap::from([(StreamKind::HeartRate as i32, 5)]);
+        publish_batch(
+            SampleBatch {
+                samples: vec![
+                    sample(StreamKind::HeartRate, 4),
+                    sample(StreamKind::HeartRate, 5),
+                    sample(StreamKind::HeartRate, 6),
+                ],
+                gaps: Vec::new(),
+                service_batch_sequence: 1,
+            },
+            &sender,
+            &dropped,
+            &egui::Context::default(),
+            &mut cursors,
+        )
+        .unwrap();
+        let ClientEvent::Samples(batch) = receiver.recv().unwrap() else {
+            panic!("expected a sample batch");
+        };
+        assert_eq!(batch.samples.len(), 1);
+        assert_eq!(batch.samples[0].sequence, 6);
+        assert_eq!(cursors[&(StreamKind::HeartRate as i32)], 6);
     }
 }

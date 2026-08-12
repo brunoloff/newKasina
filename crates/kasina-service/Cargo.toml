@@ -14,6 +14,8 @@ fs2.workspace = true
 futures.workspace = true
 kasina-devices = { path = "../kasina-devices" }
 kasina-domain = { path = "../kasina-domain" }
+kasina-godirect = { path = "../kasina-godirect" }
+kasina-polar = { path = "../kasina-polar" }
 kasina-protocol = { path = "../kasina-protocol" }
 parking_lot.workspace = true
 tokio.workspace = true
@@ -29,4 +31,3 @@ tempfile = "3.26.0"
 
 [lints]
 workspace = true
-

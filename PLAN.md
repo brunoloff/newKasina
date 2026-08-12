@@ -5,8 +5,8 @@ Last updated: 2026-08-12
 ## Progress
 
 - [x] Architecture and implementation plan written.
-- [ ] Milestone 0 — repository and quality baseline.
-- [ ] Milestone 1 — simulated end-to-end vertical slice.
+- [x] Milestone 0 — repository and quality baseline.
+- [x] Milestone 1 — simulated end-to-end vertical slice.
 - [ ] Milestone 2 — rendering proof.
 - [ ] Milestone 3 — hardware feasibility and acquisition.
 - [ ] Milestone 4 — analysis parity.
@@ -15,6 +15,29 @@ Last updated: 2026-08-12
 
 Update this ledger and add brief dated evidence beneath a milestone as work is completed.
 Do not mark a milestone complete until its exit criteria pass.
+
+### Evidence — 2026-08-12
+
+- Milestone 0: the workspace passes `cargo fmt --all --check`, warning-free Clippy,
+  all-feature workspace tests, and an optimized release build. CI contains Linux,
+  Windows, and macOS jobs. The project-local Cargo and rustup caches are ignored.
+- Milestone 1: an authenticated real tonic server/client test proves that a client
+  restart preserves service sequence numbers and fills retained history without
+  duplicates. Forced service-broadcast and UI-queue pressure tests expose drops. A
+  release Xvfb/llvmpipe smoke test restarted the real UI while the service instance
+  remained unchanged and its recoverable history grew from 180 to 1,183 samples.
+- Milestone 2 partial: the release client visibly rendered 8,000 instanced particles via
+  `egui_wgpu::CallbackTrait`; shader parsing, 32-byte uniform uploads, resize, unmap/map,
+  and F11 handling were exercised without validation errors. The sandbox exposes no
+  `/dev/dri`, so native GPU 60/120 Hz measurements, real-window-manager fullscreen, and
+  mixed-DPI validation remain exit blockers. Software llvmpipe timing is recorded only
+  as a functional smoke result and is not treated as performance evidence.
+- Milestone 3 hardware-independent work: Polar HR/RR parsing covers 8/16-bit heart rate,
+  energy, contact, multiple RR intervals, and malformed frames; both Polar and Go Direct
+  have cancellable reconnecting `btleplug` drivers; Go Direct command framing,
+  fragmentation, and four value layouts are tested and documented from Vernier's
+  reference implementations; the service can supervise both drivers concurrently with
+  `--source hardware`. Physical-device comparison, power-cycle, and soak criteria remain.
 
 ## 1. Objective
 
