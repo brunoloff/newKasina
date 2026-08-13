@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 const HISTORY_CAPACITY_PER_STREAM: usize = 6_000;
 const UI_EVENT_CAPACITY: usize = 256;
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(8);
 #[derive(Debug, Parser)]
 #[command(about = "newKasina biofeedback desktop client")]
 struct Args {
@@ -182,8 +183,8 @@ enum View {
     Diagnostics,
 }
 
-fn should_animate(view: View, viewport_visible: Option<bool>) -> bool {
-    view == View::Visualizer && viewport_visible != Some(false)
+fn animation_repaint_interval(view: View, viewport_visible: Option<bool>) -> Option<Duration> {
+    (view == View::Visualizer && viewport_visible != Some(false)).then_some(ANIMATION_INTERVAL)
 }
 
 #[derive(Debug)]
@@ -959,8 +960,8 @@ impl eframe::App for KasinaApp {
             context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
         let viewport_visible = context.input(|input| input.viewport().visible());
-        if should_animate(self.view, viewport_visible) {
-            context.request_repaint();
+        if let Some(interval) = animation_repaint_interval(self.view, viewport_visible) {
+            context.request_repaint_after(interval);
         }
         self.poll_benchmark_writer(context);
     }
@@ -1366,10 +1367,22 @@ mod tests {
 
     #[test]
     fn continuous_animation_requires_a_visible_visualizer() {
-        assert!(should_animate(View::Visualizer, Some(true)));
-        assert!(should_animate(View::Visualizer, None));
-        assert!(!should_animate(View::Visualizer, Some(false)));
-        assert!(!should_animate(View::Dashboard, Some(true)));
+        assert_eq!(
+            animation_repaint_interval(View::Visualizer, Some(true)),
+            Some(ANIMATION_INTERVAL)
+        );
+        assert_eq!(
+            animation_repaint_interval(View::Visualizer, None),
+            Some(ANIMATION_INTERVAL)
+        );
+        assert_eq!(
+            animation_repaint_interval(View::Visualizer, Some(false)),
+            None
+        );
+        assert_eq!(
+            animation_repaint_interval(View::Dashboard, Some(true)),
+            None
+        );
     }
 
     #[test]

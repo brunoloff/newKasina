@@ -128,9 +128,10 @@ clears the subsequently selected 60 Hz requirement of 16.667 ms. It also reveale
 Wayland intentionally omits native window-position rectangles, leaving the recorded
 viewport dimensions null. Schema 2 therefore separates actual display refresh from the
 required application target, falls back to egui's viewport rectangle for dimensions,
-records presentation configuration and achieved FPS, and requests the next visible
-visualizer frame directly instead of waking from an 8 ms timer. A current-revision native
-rerun is required before the result is promoted from baseline to exit evidence.
+and records presentation configuration and achieved FPS. A five-second native experiment
+with immediate repaint reduced delivery to 90.2 frames/second and raised p99 to 17.165 ms,
+so the measured 8 ms Wayland wake strategy was retained. A current-revision native rerun
+is required before the result is promoted from baseline to exit evidence.
 
 ## Native checks still required
 
