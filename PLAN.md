@@ -81,6 +81,15 @@ Do not mark a milestone complete until its exit criteria pass.
   200 ms, and transport lag was zero. The belt needed one supervised retry after an
   initial command timeout, then completed setup and streamed normally. Longer comparison,
   power-cycle, client-restart, and eight-hour dual-device tests remain.
+- Breath Kasina slice, 2026-08-13: the client now opens on a dedicated breath-visualization
+  tab driven directly by respiration force, without depending on the legacy analysis.
+  An incremental, self-calibrating force envelope maps rising force to expansion and
+  falling force to contraction, with short time-based smoothing between 10 Hz device
+  samples. A retained wgpu shader draws the animated circular mandala as one analytic
+  full-screen instance with the existing fixed 32-byte uniform upload. Focused normalizer,
+  animation, uniform-layout, and shader-parse tests pass; a release client connected to
+  the live Go Direct service without transport lag. Visual tuning remains intentionally
+  open to hands-on feedback.
 
 ## 1. Objective
 

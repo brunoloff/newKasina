@@ -95,10 +95,13 @@ struct VisualUniforms {
     time_seconds: f32,
     respiration: f32,
     instance_count: u32,
-    _padding: u32,
+    style: u32,
     viewport_points: [f32; 2],
     _padding_2: [f32; 2],
 }
+
+const PARTICLE_STYLE: u32 = 0;
+const BREATH_KASINA_STYLE: u32 = 1;
 
 /// CPU-side input prepared for one biofeedback draw.
 ///
@@ -123,7 +126,22 @@ impl PreparedVisualFrame {
                 time_seconds,
                 respiration: respiration.clamp(0.0, 1.0),
                 instance_count: instance_count.max(1),
-                _padding: 0,
+                style: PARTICLE_STYLE,
+                viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
+                _padding_2: [0.0; 2],
+            },
+        }
+    }
+
+    /// Prepare the constant-cost analytic breath mandala.
+    #[must_use]
+    pub fn breath_kasina(time_seconds: f32, respiration: f32, viewport_points: [f32; 2]) -> Self {
+        Self {
+            uniforms: VisualUniforms {
+                time_seconds,
+                respiration: respiration.clamp(0.0, 1.0),
+                instance_count: 1,
+                style: BREATH_KASINA_STYLE,
                 viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
                 _padding_2: [0.0; 2],
             },
@@ -222,7 +240,7 @@ impl BiofeedbackRenderer {
             time_seconds: 0.0,
             respiration: 0.5,
             instance_count: 1,
-            _padding: 0,
+            style: PARTICLE_STYLE,
             viewport_points: [1.0, 1.0],
             _padding_2: [0.0; 2],
         };
@@ -267,6 +285,30 @@ impl BiofeedbackRenderer {
             time_seconds,
             respiration,
             stress_instances,
+            [rect.width(), rect.height()],
+        );
+        ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+            rect,
+            BiofeedbackCallback {
+                uniforms: prepared.uniforms,
+                prepare_stats: Arc::clone(&self.prepare_stats),
+            },
+        ));
+        response
+    }
+
+    /// Add the analytic, force-driven breath kasina to the available egui region.
+    pub fn paint_breath_kasina(
+        &self,
+        ui: &mut egui::Ui,
+        desired_size: egui::Vec2,
+        time_seconds: f32,
+        respiration: f32,
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+        let prepared = PreparedVisualFrame::breath_kasina(
+            time_seconds,
+            respiration,
             [rect.width(), rect.height()],
         );
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -371,5 +413,15 @@ mod tests {
         assert_eq!(high.uniforms.instance_count, 100_000);
         assert_eq!(low.upload_bytes().len(), 32);
         assert_eq!(high.upload_bytes().len(), low.upload_bytes().len());
+    }
+
+    #[test]
+    fn breath_kasina_uses_one_full_screen_instance() {
+        let frame = PreparedVisualFrame::breath_kasina(3.0, 1.5, [900.0, 600.0]);
+
+        assert_eq!(frame.uniforms.respiration, 1.0);
+        assert_eq!(frame.uniforms.style, BREATH_KASINA_STYLE);
+        assert_eq!(frame.instance_count(), 1);
+        assert_eq!(frame.upload_bytes().len(), 32);
     }
 }

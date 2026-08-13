@@ -27,6 +27,8 @@ use tracing_subscriber::EnvFilter;
 const HISTORY_CAPACITY_PER_STREAM: usize = 6_000;
 const UI_EVENT_CAPACITY: usize = 256;
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(8);
+const BREATH_ENVELOPE_RELAXATION: f64 = 0.0025;
+const MINIMUM_FORCE_SPAN: f64 = 0.01;
 #[derive(Debug, Parser)]
 #[command(about = "newKasina biofeedback desktop client")]
 struct Args {
@@ -179,12 +181,14 @@ enum ClientEvent {
 enum View {
     Dashboard,
     Raw,
+    BreathKasina,
     Visualizer,
     Diagnostics,
 }
 
 fn animation_repaint_interval(view: View, viewport_visible: Option<bool>) -> Option<Duration> {
-    (view == View::Visualizer && viewport_visible != Some(false)).then_some(ANIMATION_INTERVAL)
+    (matches!(view, View::BreathKasina | View::Visualizer) && viewport_visible != Some(false))
+        .then_some(ANIMATION_INTERVAL)
 }
 
 #[derive(Debug)]
@@ -361,6 +365,108 @@ impl ClientModel {
     }
 }
 
+#[derive(Debug)]
+struct BreathKasinaState {
+    raw_force: Option<f64>,
+    low_force: f64,
+    high_force: f64,
+    target_expansion: f32,
+    displayed_expansion: f32,
+    trend: f64,
+    samples_seen: u64,
+    last_animation: Instant,
+}
+
+impl BreathKasinaState {
+    fn new(now: Instant) -> Self {
+        Self {
+            raw_force: None,
+            low_force: 0.0,
+            high_force: 0.0,
+            target_expansion: 0.5,
+            displayed_expansion: 0.5,
+            trend: 0.0,
+            samples_seen: 0,
+            last_animation: now,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.raw_force = None;
+        self.low_force = 0.0;
+        self.high_force = 0.0;
+        self.target_expansion = 0.5;
+        self.displayed_expansion = 0.5;
+        self.trend = 0.0;
+        self.samples_seen = 0;
+    }
+
+    fn observe(&mut self, force: f64) {
+        if !force.is_finite() {
+            return;
+        }
+        self.samples_seen = self.samples_seen.saturating_add(1);
+        let Some(previous_force) = self.raw_force else {
+            self.raw_force = Some(force);
+            self.low_force = force - MINIMUM_FORCE_SPAN * 0.5;
+            self.high_force = force + MINIMUM_FORCE_SPAN * 0.5;
+            return;
+        };
+
+        let previous_span = (self.high_force - self.low_force).max(MINIMUM_FORCE_SPAN);
+        let normalized_change = ((force - previous_force) / previous_span).clamp(-1.0, 1.0);
+        self.trend = self.trend.mul_add(0.72, normalized_change * 0.28);
+
+        if force < self.low_force {
+            self.low_force = force;
+        } else {
+            self.low_force += (force - self.low_force) * BREATH_ENVELOPE_RELAXATION;
+        }
+        if force > self.high_force {
+            self.high_force = force;
+        } else {
+            self.high_force += (force - self.high_force) * BREATH_ENVELOPE_RELAXATION;
+        }
+
+        let scale_floor = (force.abs() * 0.0005).max(MINIMUM_FORCE_SPAN);
+        let span = self.high_force - self.low_force;
+        if span < scale_floor {
+            let center = (self.high_force + self.low_force) * 0.5;
+            self.low_force = center - scale_floor * 0.5;
+            self.high_force = center + scale_floor * 0.5;
+        }
+        let normalized =
+            ((force - self.low_force) / (self.high_force - self.low_force)).clamp(0.0, 1.0);
+        self.target_expansion = (0.08 + normalized * 0.84) as f32;
+        self.raw_force = Some(force);
+    }
+
+    fn advance(&mut self, elapsed: Duration) -> f32 {
+        let elapsed_seconds = elapsed.as_secs_f32().min(0.25);
+        let smoothing = 1.0 - (-elapsed_seconds / 0.16).exp();
+        self.displayed_expansion += (self.target_expansion - self.displayed_expansion) * smoothing;
+        self.displayed_expansion
+    }
+
+    fn animated_expansion(&mut self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.last_animation);
+        self.last_animation = now;
+        self.advance(elapsed)
+    }
+
+    fn motion_label(&self) -> &'static str {
+        if self.samples_seen < 12 {
+            "Calibrating"
+        } else if self.trend > 0.012 {
+            "Inhaling · expanding"
+        } else if self.trend < -0.012 {
+            "Exhaling · contracting"
+        } else {
+            "Resting"
+        }
+    }
+}
+
 struct KasinaApp {
     endpoint: String,
     view: View,
@@ -369,6 +475,7 @@ struct KasinaApp {
     network_thread: Option<JoinHandle<()>>,
     ui_dropped_batches: Arc<AtomicU64>,
     model: ClientModel,
+    breath_kasina: BreathKasinaState,
     renderer: Option<BiofeedbackRenderer>,
     renderer_name: String,
     renderer_backend: String,
@@ -480,13 +587,14 @@ impl KasinaApp {
             view: if benchmark.is_some() {
                 View::Visualizer
             } else {
-                View::Dashboard
+                View::BreathKasina
             },
             events,
             cancellation,
             network_thread,
             ui_dropped_batches,
             model: ClientModel::default(),
+            breath_kasina: BreathKasinaState::new(now),
             renderer,
             renderer_name,
             renderer_backend,
@@ -517,7 +625,14 @@ impl KasinaApp {
                 ClientEvent::Connection(connection) => self.model.connection = connection,
                 ClientEvent::ServiceInfo(info) => self.model.service_info = Some(info),
                 ClientEvent::Status(status) => self.model.status = Some(status),
-                ClientEvent::Samples(batch) => self.model.apply_batch(batch),
+                ClientEvent::Samples(batch) => {
+                    for sample in &batch.samples {
+                        if sample.stream == StreamKind::RespirationForce as i32 {
+                            self.breath_kasina.observe(sample.value);
+                        }
+                    }
+                    self.model.apply_batch(batch);
+                }
             }
         }
     }
@@ -550,7 +665,8 @@ impl KasinaApp {
                 for (view, label) in [
                     (View::Dashboard, "Dashboard"),
                     (View::Raw, "Raw signals"),
-                    (View::Visualizer, "GPU visualizer"),
+                    (View::BreathKasina, "Breath kasina"),
+                    (View::Visualizer, "GPU stress test"),
                     (View::Diagnostics, "Diagnostics"),
                 ] {
                     if ui.selectable_label(self.view == view, label).clicked() {
@@ -626,6 +742,53 @@ impl KasinaApp {
             egui::Color32::from_rgb(210, 160, 90),
             160.0,
         );
+    }
+
+    fn breath_kasina(&mut self, ui: &mut egui::Ui) {
+        let expansion = self.breath_kasina.animated_expansion(Instant::now());
+        ui.horizontal(|ui| {
+            ui.heading("Breath Kasina");
+            ui.separator();
+            ui.colored_label(
+                egui::Color32::from_rgb(112, 214, 224),
+                self.breath_kasina.motion_label(),
+            );
+            if let Some(force) = self.breath_kasina.raw_force {
+                ui.separator();
+                ui.label(format!("Force {force:.2}"));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Reset breathing range").clicked() {
+                    self.breath_kasina.reset();
+                }
+            });
+        });
+        ui.label("The mandala follows the respiration belt directly: rising force expands it.");
+        ui.add_space(6.0);
+        let size = egui::vec2(ui.available_width(), ui.available_height().max(180.0));
+        if let Some(renderer) = &self.renderer {
+            renderer.paint_breath_kasina(ui, size, self.started.elapsed().as_secs_f32(), expansion);
+        } else {
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 8.0, egui::Color32::from_rgb(3, 6, 20));
+            let radius = rect.width().min(rect.height()) * (0.16 + expansion * 0.24);
+            for ring in 1..=6 {
+                let fraction = ring as f32 / 6.0;
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    radius * fraction,
+                    egui::Stroke::new(
+                        1.0 + (1.0 - fraction) * 2.0,
+                        egui::Color32::from_rgb(
+                            (80.0 + fraction * 120.0) as u8,
+                            (80.0 + (1.0 - fraction) * 130.0) as u8,
+                            220,
+                        ),
+                    ),
+                );
+            }
+        }
     }
 
     fn visualizer(&mut self, ui: &mut egui::Ui) {
@@ -977,6 +1140,7 @@ impl eframe::App for KasinaApp {
         egui::CentralPanel::default().show(ui, |ui| match self.view {
             View::Dashboard => self.dashboard(ui),
             View::Raw => self.raw_signals(ui),
+            View::BreathKasina => self.breath_kasina(ui),
             View::Visualizer => self.visualizer(ui),
             View::Diagnostics => self.diagnostics(ui),
         });
@@ -1366,7 +1530,11 @@ mod tests {
     }
 
     #[test]
-    fn continuous_animation_requires_a_visible_visualizer() {
+    fn continuous_animation_requires_a_visible_animated_view() {
+        assert_eq!(
+            animation_repaint_interval(View::BreathKasina, Some(true)),
+            Some(ANIMATION_INTERVAL)
+        );
         assert_eq!(
             animation_repaint_interval(View::Visualizer, Some(true)),
             Some(ANIMATION_INTERVAL)
@@ -1383,6 +1551,35 @@ mod tests {
             animation_repaint_interval(View::Dashboard, Some(true)),
             None
         );
+    }
+
+    #[test]
+    fn breath_kasina_tracks_rising_and_falling_force_without_fixed_bounds() {
+        let mut state = BreathKasinaState::new(Instant::now());
+        state.observe(42.0);
+        state.observe(44.0);
+        let expanded_target = state.target_expansion;
+        state.observe(40.0);
+        let contracted_target = state.target_expansion;
+
+        assert!(expanded_target > 0.85);
+        assert!(contracted_target < 0.15);
+        assert!(state.high_force > state.low_force);
+        assert_eq!(state.samples_seen, 3);
+    }
+
+    #[test]
+    fn breath_kasina_smooths_animation_and_ignores_invalid_samples() {
+        let mut state = BreathKasinaState::new(Instant::now());
+        state.observe(10.0);
+        state.observe(f64::NAN);
+        state.observe(11.0);
+        let before = state.displayed_expansion;
+        let after = state.advance(Duration::from_millis(80));
+
+        assert_eq!(state.samples_seen, 2);
+        assert!(after > before);
+        assert!(after < state.target_expansion);
     }
 
     #[test]
