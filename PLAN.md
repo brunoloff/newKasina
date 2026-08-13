@@ -60,6 +60,15 @@ Do not mark a milestone complete until its exit criteria pass.
   unavailable sensor and produced seven snapshots including a clean final disconnected
   state. The 36-test workspace and release build pass. Physical comparison, power-cycle
   recovery, and the real eight-hour soak remain required.
+- Milestone 3 physical Go Direct smoke, 2026-08-13: the native driver discovered and
+  connected to a powered GDX-RB through BlueZ, completed initialization and every metadata
+  query, selected channel 1 (`Force`, `N`) at 100 ms, and streamed 1,198 sequential samples
+  across 119.683 seconds (effectively 10.0 Hz). Diagnostics showed connected state, 49 ms
+  sample age, no reconnect, no retention loss, and no transport lag. The physical
+  initialization response proved that command payload byte zero is command-specific
+  rather than a generic status; the
+  driver was corrected to match both official Vernier implementations. Python side-by-
+  side comparison, power-cycle recovery, and the eight-hour dual-device soak remain.
 
 ## 1. Objective
 

@@ -638,7 +638,7 @@ impl GoDirectDriver {
             let mut assembler = PacketAssembler::default();
             let mut encoder = CommandEncoder::default();
 
-            send_checked_command(
+            send_command(
                 peripheral,
                 &command,
                 &response,
@@ -752,7 +752,7 @@ impl GoDirectDriver {
                 "Go Direct metadata loaded"
             );
 
-            send_checked_command(
+            send_command(
                 peripheral,
                 &command,
                 &response,
@@ -764,7 +764,7 @@ impl GoDirectDriver {
                 cancellation,
             )
             .await?;
-            send_checked_command(
+            send_command(
                 peripheral,
                 &command,
                 &response,
@@ -1023,38 +1023,6 @@ where
     .await
     .context("Go Direct command timed out")??;
     Ok(response.get(6..).ok_or(ProtocolError::Truncated)?.to_vec())
-}
-
-async fn send_checked_command<S>(
-    peripheral: &Peripheral,
-    command_characteristic: &Characteristic,
-    response_characteristic: &Characteristic,
-    notifications: &mut S,
-    assembler: &mut PacketAssembler,
-    packet: &[u8],
-    cancellation: &CancellationToken,
-) -> Result<Vec<u8>>
-where
-    S: Stream<Item = ValueNotification> + Unpin,
-{
-    let command = *packet.get(4).ok_or(ProtocolError::Truncated)?;
-    let payload = send_command(
-        peripheral,
-        command_characteristic,
-        response_characteristic,
-        notifications,
-        assembler,
-        packet,
-        cancellation,
-    )
-    .await?;
-    if payload.first().is_some_and(|status| *status != 0) {
-        bail!(
-            "Go Direct command {command:#04x} returned status {:#04x}",
-            payload[0]
-        );
-    }
-    Ok(payload)
 }
 
 #[cfg(test)]

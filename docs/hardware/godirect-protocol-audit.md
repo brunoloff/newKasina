@@ -9,8 +9,24 @@ bridge only as an explicit troubleshooting fallback; the audited protocol is com
 enough that a permanent Python runtime dependency is not justified.
 
 This is a feasibility decision, not a completed hardware validation. The native codec
-and transport compile and have specification-derived tests, but must still be compared
-against a physical belt before Milestone 3 can be marked complete.
+and transport now connect to and stream from a physical belt, but values must still be
+compared side-by-side with the Python implementation before Milestone 3 can be complete.
+
+## Physical smoke — 2026-08-13
+
+A GDX-RB was discovered through BlueZ and completed the entire native BLE setup sequence.
+It reported main firmware 5.3.0, BLE firmware 10.4.0, 75% battery, default channel mask
+`0x00000006`, and available mask `0x00000036`. Channel 1 reported description `Force` and
+unit `N`; the service selected it at the pyKasina-compatible 100 ms period. After 17.683
+seconds, diagnostics retained 178 sequential respiration samples; after 119.683 seconds,
+that had grown to 1,198 samples (effectively 10.0 Hz). Newest-sample age was 49 ms, with
+zero reconnects, zero retention loss, and zero transport lag.
+
+The first physical initialization response carried payload byte `0x55`. Treating that as
+a generic error status caused an immediate reconnect loop; removing the invented status
+interpretation matched `godirect-js`/`godirect-py` and allowed all metadata queries and
+streaming to complete. The device serial and platform identifier are deliberately omitted
+from this tracked report.
 
 ## Sources audited
 
@@ -61,8 +77,10 @@ On a fresh connection the implemented sequence, matching the official libraries,
 8. send `0x19` and protocol disconnect `0x54` before transport disconnect.
 
 Command responses echo the subcommand at byte 4 and rolling counter at byte 5. Only one
-command may be outstanding at a time. Notifications can be fragmented, so the declared
-length at byte 1 drives reassembly.
+command may be outstanding at a time. Response payloads are command-specific: the
+official libraries do not define a generic leading status byte, and a physical GDX-RB
+initialization response began with payload byte `0x55`. Notifications can be fragmented,
+so the declared length at byte 1 drives reassembly.
 
 ## Measurement layouts implemented
 
@@ -88,8 +106,6 @@ the complete 148-byte channel metadata structure.
 
 ## Remaining physical validation
 
-- Record the belt's advertised name, platform ID, firmware, channel-1 description, and
-  unit.
 - Capture consent-safe request/response/measurement bytes and add them as fixtures.
 - Compare native and Python values sample-for-sample for at least 30 minutes at 100 ms.
 - Power-cycle the belt, disable/enable the adapter, and verify automatic reconnection.
