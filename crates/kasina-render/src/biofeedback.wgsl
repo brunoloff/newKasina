@@ -4,7 +4,7 @@ struct VisualUniforms {
     instance_count: u32,
     style: u32,
     viewport_points: vec2<f32>,
-    padding_2: vec2<f32>,
+    radius_range: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -69,11 +69,11 @@ fn breath_mandala(local: vec2<f32>) -> vec4<f32> {
     let point = local * vec2<f32>(aspect, 1.0);
     let screen_radius = length(point);
     let breath = smoothstep(0.0, 1.0, visual.respiration);
-    let mandala_radius = mix(0.40, 0.82, breath);
+    let mandala_radius = mix(visual.radius_range.x, visual.radius_range.y, breath);
     let p = point / mandala_radius;
     let radius = length(p);
     let angle = atan2(p.y, p.x);
-    let rotation = visual.time_seconds * 0.055;
+    let rotation = visual.time_seconds;
 
     let deep_navy = vec3<f32>(0.004, 0.008, 0.028);
     let background_halo = exp(-screen_radius * 2.25) * (0.10 + breath * 0.08);

@@ -1,3 +1,5 @@
+mod settings;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
@@ -17,6 +19,7 @@ use kasina_protocol::v1::{
 use kasina_protocol::{AUTH_HEADER, client_hello};
 use kasina_render::{BiofeedbackRenderer, FrameStats};
 use serde::Serialize;
+use settings::{AppSettings, KasinaVisualPreset, SettingsWriter};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
@@ -169,6 +172,12 @@ fn default_token_path() -> Result<PathBuf> {
     Ok(project.config_dir().join("service-token"))
 }
 
+fn default_settings_path() -> Result<PathBuf> {
+    let project = directories::ProjectDirs::from("org", "newkasina", "newKasina")
+        .context("operating system did not provide a user configuration directory")?;
+    Ok(project.config_dir().join("app-settings.json"))
+}
+
 #[derive(Debug)]
 enum ClientEvent {
     Connection(String),
@@ -184,6 +193,7 @@ enum View {
     BreathKasina,
     Visualizer,
     Diagnostics,
+    Settings,
 }
 
 fn animation_repaint_interval(view: View, viewport_visible: Option<bool>) -> Option<Duration> {
@@ -476,6 +486,13 @@ struct KasinaApp {
     ui_dropped_batches: Arc<AtomicU64>,
     model: ClientModel,
     breath_kasina: BreathKasinaState,
+    settings: AppSettings,
+    settings_path: PathBuf,
+    settings_writer: SettingsWriter,
+    settings_dirty: bool,
+    settings_save_deadline: Option<Instant>,
+    settings_notice: Option<String>,
+    editing_preset_id: u64,
     renderer: Option<BiofeedbackRenderer>,
     renderer_name: String,
     renderer_backend: String,
@@ -506,6 +523,19 @@ impl KasinaApp {
         surface_health: Arc<SurfaceHealth>,
     ) -> Result<Self> {
         let token_path = args.token_path.clone().unwrap_or(default_token_path()?);
+        let settings_path = default_settings_path()?;
+        let (settings, settings_notice) = match AppSettings::load(&settings_path) {
+            Ok(settings) => (settings, None),
+            Err(error) => {
+                warn!(%error, path = %settings_path.display(), "using default app settings");
+                (
+                    AppSettings::default(),
+                    Some(format!("Could not load saved settings: {error}")),
+                )
+            }
+        };
+        let editing_preset_id = settings.active_preset_id;
+        let settings_writer = SettingsWriter::spawn(settings_path.clone())?;
         let renderer = creation_context
             .wgpu_render_state
             .as_ref()
@@ -586,8 +616,10 @@ impl KasinaApp {
             endpoint: args.endpoint,
             view: if benchmark.is_some() {
                 View::Visualizer
-            } else {
+            } else if settings.visible_tabs.breath_kasina {
                 View::BreathKasina
+            } else {
+                View::Settings
             },
             events,
             cancellation,
@@ -595,6 +627,13 @@ impl KasinaApp {
             ui_dropped_batches,
             model: ClientModel::default(),
             breath_kasina: BreathKasinaState::new(now),
+            settings,
+            settings_path,
+            settings_writer,
+            settings_dirty: false,
+            settings_save_deadline: None,
+            settings_notice,
+            editing_preset_id,
             renderer,
             renderer_name,
             renderer_backend,
@@ -662,13 +701,25 @@ impl KasinaApp {
             .default_size(135.0)
             .show(ui, |ui| {
                 ui.add_space(8.0);
-                for (view, label) in [
-                    (View::Dashboard, "Dashboard"),
-                    (View::Raw, "Raw signals"),
-                    (View::BreathKasina, "Breath kasina"),
-                    (View::Visualizer, "GPU stress test"),
-                    (View::Diagnostics, "Diagnostics"),
-                ] {
+                let visibility = &self.settings.visible_tabs;
+                let mut tabs = Vec::with_capacity(6);
+                if visibility.dashboard {
+                    tabs.push((View::Dashboard, "Dashboard"));
+                }
+                if visibility.raw_signals {
+                    tabs.push((View::Raw, "Raw signals"));
+                }
+                if visibility.breath_kasina {
+                    tabs.push((View::BreathKasina, "Breath kasina"));
+                }
+                if visibility.gpu_stress_test {
+                    tabs.push((View::Visualizer, "GPU stress test"));
+                }
+                if visibility.diagnostics {
+                    tabs.push((View::Diagnostics, "Diagnostics"));
+                }
+                tabs.push((View::Settings, "Settings"));
+                for (view, label) in tabs {
                     if ui.selectable_label(self.view == view, label).clicked() {
                         self.view = view;
                     }
@@ -746,6 +797,13 @@ impl KasinaApp {
 
     fn breath_kasina(&mut self, ui: &mut egui::Ui) {
         let expansion = self.breath_kasina.animated_expansion(Instant::now());
+        let preset_names: Vec<_> = self
+            .settings
+            .presets
+            .iter()
+            .map(|preset| (preset.id, preset.name.clone()))
+            .collect();
+        let mut selected_preset = self.settings.active_preset_id;
         ui.horizontal(|ui| {
             ui.heading("Breath Kasina");
             ui.separator();
@@ -757,22 +815,48 @@ impl KasinaApp {
                 ui.separator();
                 ui.label(format!("Force {force:.2}"));
             }
+            ui.separator();
+            egui::ComboBox::from_id_salt("active_kasina_preset")
+                .selected_text(&self.settings.active_preset().name)
+                .show_ui(ui, |ui| {
+                    for (id, name) in &preset_names {
+                        ui.selectable_value(&mut selected_preset, *id, name);
+                    }
+                });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Reset breathing range").clicked() {
                     self.breath_kasina.reset();
                 }
             });
         });
+        if selected_preset != self.settings.active_preset_id {
+            self.settings.active_preset_id = selected_preset;
+            self.editing_preset_id = selected_preset;
+            self.mark_settings_changed(ui.ctx());
+        }
         ui.label("The mandala follows the respiration belt directly: rising force expands it.");
         ui.add_space(6.0);
         let size = egui::vec2(ui.available_width(), ui.available_height().max(180.0));
         if let Some(renderer) = &self.renderer {
-            renderer.paint_breath_kasina(ui, size, self.started.elapsed().as_secs_f32(), expansion);
+            renderer.paint_breath_kasina(
+                ui,
+                size,
+                self.settings.active_preset().visual.as_visual(),
+                self.started.elapsed().as_secs_f32(),
+                expansion,
+            );
         } else {
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 8.0, egui::Color32::from_rgb(3, 6, 20));
-            let radius = rect.width().min(rect.height()) * (0.16 + expansion * 0.24);
+            let (minimum_radius, maximum_radius) = match &self.settings.active_preset().visual {
+                KasinaVisualPreset::LuminousMandala(options) => {
+                    (options.minimum_radius, options.maximum_radius)
+                }
+            };
+            let radius = rect.width().min(rect.height())
+                * (minimum_radius + (maximum_radius - minimum_radius) * expansion)
+                * 0.5;
             for ring in 1..=6 {
                 let fraction = ring as f32 / 6.0;
                 ui.painter().circle_stroke(
@@ -788,6 +872,206 @@ impl KasinaApp {
                     ),
                 );
             }
+        }
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        if let Some(notice) = &self.settings_notice {
+            ui.colored_label(egui::Color32::YELLOW, notice);
+        }
+        ui.label(format!("Saved to {}", self.settings_path.display()));
+        ui.add_space(12.0);
+
+        let mut changed = false;
+        ui.heading("Visible tabs");
+        ui.label("Choose the tools that appear in the left tab bar.");
+        egui::Grid::new("visible_tabs_settings")
+            .num_columns(2)
+            .spacing([20.0, 6.0])
+            .show(ui, |ui| {
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.visible_tabs.breath_kasina,
+                        "Breath kasina",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.settings.visible_tabs.dashboard, "Dashboard")
+                    .changed();
+                ui.end_row();
+                changed |= ui
+                    .checkbox(&mut self.settings.visible_tabs.raw_signals, "Raw signals")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.settings.visible_tabs.diagnostics, "Diagnostics")
+                    .changed();
+                ui.end_row();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.visible_tabs.gpu_stress_test,
+                        "GPU stress test",
+                    )
+                    .changed();
+                let mut settings_visible = true;
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut settings_visible, "Settings (always visible)"),
+                );
+                ui.end_row();
+            });
+
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(12.0);
+        ui.heading("Kasina presets");
+        ui.label(
+            "A preset chooses a visual implementation and its implementation-specific options.",
+        );
+
+        let preset_names: Vec<_> = self
+            .settings
+            .presets
+            .iter()
+            .map(|preset| (preset.id, preset.name.clone()))
+            .collect();
+        if self.settings.preset(self.editing_preset_id).is_none() {
+            self.editing_preset_id = self.settings.active_preset_id;
+        }
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("preset_to_edit")
+                .selected_text(
+                    self.settings
+                        .preset(self.editing_preset_id)
+                        .map_or("Select preset", |preset| preset.name.as_str()),
+                )
+                .show_ui(ui, |ui| {
+                    for (id, name) in &preset_names {
+                        ui.selectable_value(&mut self.editing_preset_id, *id, name);
+                    }
+                });
+            if ui.button("Add preset").clicked() {
+                self.editing_preset_id = self.settings.add_preset(self.editing_preset_id);
+                changed = true;
+            }
+            if ui
+                .add_enabled(self.settings.presets.len() > 1, egui::Button::new("Remove"))
+                .clicked()
+            {
+                changed |= self.settings.remove_preset(self.editing_preset_id);
+                self.editing_preset_id = self.settings.active_preset_id;
+            }
+            if ui.button("Restore default presets").clicked() {
+                let defaults = AppSettings::default();
+                self.settings.presets = defaults.presets;
+                self.settings.active_preset_id = defaults.active_preset_id;
+                self.settings.next_preset_id = defaults.next_preset_id;
+                self.editing_preset_id = self.settings.active_preset_id;
+                changed = true;
+            }
+        });
+
+        let mut make_active = false;
+        if let Some(preset) = self.settings.preset_mut(self.editing_preset_id) {
+            egui::Grid::new("kasina_preset_editor")
+                .num_columns(2)
+                .spacing([18.0, 8.0])
+                .show(ui, |ui| {
+                    ui.strong("Preset name");
+                    let name_response = ui.text_edit_singleline(&mut preset.name);
+                    changed |= name_response.changed();
+                    if name_response.lost_focus() && preset.name.trim().is_empty() {
+                        preset.name = "Untitled preset".to_owned();
+                        changed = true;
+                    }
+                    if preset.name.chars().count() > 80 {
+                        preset.name = preset.name.chars().take(80).collect();
+                        changed = true;
+                    }
+                    ui.end_row();
+                    ui.strong("Implementation");
+                    egui::ComboBox::from_id_salt("kasina_implementation")
+                        .selected_text(preset.visual.implementation_name())
+                        .show_ui(ui, |ui| {
+                            let _implementation = ui.selectable_label(true, "Luminous mandala");
+                        });
+                    ui.end_row();
+
+                    match &mut preset.visual {
+                        KasinaVisualPreset::LuminousMandala(options) => {
+                            ui.strong("Minimum radius");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.minimum_radius, 0.12..=0.80)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Maximum radius");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.maximum_radius, 0.20..=1.00)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Rotation");
+                            changed |= ui
+                                .checkbox(&mut options.rotation_enabled, "Enabled")
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Rotation speed");
+                            changed |= ui
+                                .add_enabled(
+                                    options.rotation_enabled,
+                                    egui::Slider::new(&mut options.rotation_speed, 0.0..=0.30)
+                                        .fixed_decimals(3)
+                                        .suffix(" rad/s"),
+                                )
+                                .changed();
+                            ui.end_row();
+                            *options = options.sanitized();
+                        }
+                    }
+                    ui.strong("Preview");
+                    make_active = ui.button("Use this preset").clicked();
+                    ui.end_row();
+                });
+        }
+        if make_active && self.settings.active_preset_id != self.editing_preset_id {
+            self.settings.active_preset_id = self.editing_preset_id;
+            changed = true;
+        }
+        if changed {
+            self.settings_notice = None;
+            self.mark_settings_changed(ui.ctx());
+        }
+    }
+
+    fn mark_settings_changed(&mut self, context: &egui::Context) {
+        self.settings_dirty = true;
+        self.settings_save_deadline = Some(Instant::now() + Duration::from_millis(300));
+        context.request_repaint_after(Duration::from_millis(300));
+    }
+
+    fn persist_settings_if_due(&mut self, context: &egui::Context, now: Instant) {
+        if !self.settings_dirty {
+            return;
+        }
+        let deadline = self.settings_save_deadline.unwrap_or(now);
+        if now < deadline {
+            context.request_repaint_after(deadline.duration_since(now));
+            return;
+        }
+        if self
+            .settings_writer
+            .try_queue(self.settings.clone().sanitized())
+        {
+            self.settings_dirty = false;
+            self.settings_save_deadline = None;
+        } else {
+            self.settings_save_deadline = Some(now + Duration::from_millis(100));
+            context.request_repaint_after(Duration::from_millis(100));
         }
     }
 
@@ -1127,6 +1411,7 @@ impl eframe::App for KasinaApp {
             context.request_repaint_after(interval);
         }
         self.poll_benchmark_writer(context);
+        self.persist_settings_if_due(context, Instant::now());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1143,6 +1428,7 @@ impl eframe::App for KasinaApp {
             View::BreathKasina => self.breath_kasina(ui),
             View::Visualizer => self.visualizer(ui),
             View::Diagnostics => self.diagnostics(ui),
+            View::Settings => self.settings(ui),
         });
         let ui_cpu_time = ui_started.elapsed();
         self.ui_cpu_stats.record(ui_cpu_time, 0);
@@ -1154,6 +1440,11 @@ impl Drop for KasinaApp {
     fn drop(&mut self) {
         self.cancellation.cancel();
         let _detached = self.network_thread.take();
+        let final_settings = self
+            .settings_notice
+            .is_none()
+            .then(|| self.settings.clone().sanitized());
+        self.settings_writer.finish(final_settings);
     }
 }
 

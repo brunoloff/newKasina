@@ -10,6 +10,7 @@ use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 use egui_wgpu::wgpu::util::DeviceExt as _;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 /// Rolling CPU frame and upload instrumentation.
 #[derive(Debug, Clone)]
@@ -97,7 +98,7 @@ struct VisualUniforms {
     instance_count: u32,
     style: u32,
     viewport_points: [f32; 2],
-    _padding_2: [f32; 2],
+    radius_range: [f32; 2],
 }
 
 const PARTICLE_STYLE: u32 = 0;
@@ -128,22 +129,25 @@ impl PreparedVisualFrame {
                 instance_count: instance_count.max(1),
                 style: PARTICLE_STYLE,
                 viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
-                _padding_2: [0.0; 2],
+                radius_range: [0.0; 2],
             },
         }
     }
 
-    /// Prepare the constant-cost analytic breath mandala.
-    #[must_use]
-    pub fn breath_kasina(time_seconds: f32, respiration: f32, viewport_points: [f32; 2]) -> Self {
+    fn breath_kasina(
+        rotation_phase: f32,
+        respiration: f32,
+        viewport_points: [f32; 2],
+        radius_range: [f32; 2],
+    ) -> Self {
         Self {
             uniforms: VisualUniforms {
-                time_seconds,
+                time_seconds: rotation_phase,
                 respiration: respiration.clamp(0.0, 1.0),
                 instance_count: 1,
                 style: BREATH_KASINA_STYLE,
                 viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
-                _padding_2: [0.0; 2],
+                radius_range,
             },
         }
     }
@@ -158,6 +162,96 @@ impl PreparedVisualFrame {
     #[must_use]
     pub const fn instance_count(&self) -> u32 {
         self.uniforms.instance_count
+    }
+}
+
+/// Inputs common to every breath-driven kasina implementation.
+#[derive(Debug, Clone, Copy)]
+pub struct KasinaFrameInput {
+    /// Seconds since the application started.
+    pub elapsed_seconds: f32,
+    /// Smoothed expansion in the inclusive range zero to one.
+    pub respiration: f32,
+    /// Available logical viewport size.
+    pub viewport_points: [f32; 2],
+}
+
+/// A renderable kasina implementation.
+///
+/// Implementations own their typed options and reduce them to the retained renderer's
+/// small per-frame uniform payload. Presets select implementations separately from this
+/// rendering interface so future shapes do not leak into the application state model.
+pub trait KasinaVisual: std::fmt::Debug + Send + Sync {
+    /// Stable identifier stored by presets.
+    fn implementation_id(&self) -> &'static str;
+    /// User-facing implementation name.
+    fn display_name(&self) -> &'static str;
+    /// Prepare one constant-size GPU update.
+    fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame;
+}
+
+/// Options for the original luminous circular mandala.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LuminousMandala {
+    /// Radius at the bottom of the calibrated breathing range.
+    pub minimum_radius: f32,
+    /// Radius at the top of the calibrated breathing range.
+    pub maximum_radius: f32,
+    /// Whether the lace pattern rotates.
+    pub rotation_enabled: bool,
+    /// Rotation speed in radians per second.
+    pub rotation_speed: f32,
+}
+
+impl LuminousMandala {
+    /// Clamp settings loaded from disk or edited by a user to safe visual bounds.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.minimum_radius = self.minimum_radius.clamp(0.12, 0.80);
+        self.maximum_radius = self.maximum_radius.clamp(0.20, 1.00);
+        if self.maximum_radius < self.minimum_radius + 0.05 {
+            self.maximum_radius = (self.minimum_radius + 0.05).min(1.00);
+            self.minimum_radius = self.minimum_radius.min(self.maximum_radius - 0.05);
+        }
+        self.rotation_speed = self.rotation_speed.clamp(0.0, 0.30);
+        self
+    }
+}
+
+impl Default for LuminousMandala {
+    fn default() -> Self {
+        Self {
+            minimum_radius: 0.40,
+            maximum_radius: 0.82,
+            rotation_enabled: true,
+            rotation_speed: 0.055,
+        }
+    }
+}
+
+impl KasinaVisual for LuminousMandala {
+    fn implementation_id(&self) -> &'static str {
+        "luminous-mandala"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Luminous mandala"
+    }
+
+    fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame {
+        let options = self.sanitized();
+        let rotation_phase = if options.rotation_enabled {
+            input.elapsed_seconds * options.rotation_speed
+        } else {
+            0.0
+        };
+        PreparedVisualFrame::breath_kasina(
+            rotation_phase,
+            input.respiration,
+            input.viewport_points,
+            [options.minimum_radius, options.maximum_radius],
+        )
     }
 }
 
@@ -242,7 +336,7 @@ impl BiofeedbackRenderer {
             instance_count: 1,
             style: PARTICLE_STYLE,
             viewport_points: [1.0, 1.0],
-            _padding_2: [0.0; 2],
+            radius_range: [0.0; 2],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("newKasina biofeedback uniforms"),
@@ -302,15 +396,16 @@ impl BiofeedbackRenderer {
         &self,
         ui: &mut egui::Ui,
         desired_size: egui::Vec2,
-        time_seconds: f32,
+        visual: &dyn KasinaVisual,
+        elapsed_seconds: f32,
         respiration: f32,
     ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
-        let prepared = PreparedVisualFrame::breath_kasina(
-            time_seconds,
+        let prepared = visual.prepare_frame(KasinaFrameInput {
+            elapsed_seconds,
             respiration,
-            [rect.width(), rect.height()],
-        );
+            viewport_points: [rect.width(), rect.height()],
+        });
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             BiofeedbackCallback {
@@ -417,11 +512,36 @@ mod tests {
 
     #[test]
     fn breath_kasina_uses_one_full_screen_instance() {
-        let frame = PreparedVisualFrame::breath_kasina(3.0, 1.5, [900.0, 600.0]);
+        let frame = LuminousMandala::default().prepare_frame(KasinaFrameInput {
+            elapsed_seconds: 3.0,
+            respiration: 1.5,
+            viewport_points: [900.0, 600.0],
+        });
 
         assert_eq!(frame.uniforms.respiration, 1.0);
         assert_eq!(frame.uniforms.style, BREATH_KASINA_STYLE);
+        assert_eq!(frame.uniforms.radius_range, [0.40, 0.82]);
         assert_eq!(frame.instance_count(), 1);
         assert_eq!(frame.upload_bytes().len(), 32);
+    }
+
+    #[test]
+    fn luminous_mandala_sanitizes_options_and_can_disable_rotation() {
+        let visual = LuminousMandala {
+            minimum_radius: 2.0,
+            maximum_radius: -1.0,
+            rotation_enabled: false,
+            rotation_speed: 4.0,
+        };
+        let sanitized = visual.sanitized();
+        let frame = visual.prepare_frame(KasinaFrameInput {
+            elapsed_seconds: 100.0,
+            respiration: 0.5,
+            viewport_points: [100.0, 100.0],
+        });
+
+        assert!(sanitized.minimum_radius < sanitized.maximum_radius);
+        assert_eq!(sanitized.rotation_speed, 0.30);
+        assert_eq!(frame.uniforms.time_seconds, 0.0);
     }
 }

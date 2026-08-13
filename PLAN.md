@@ -90,6 +90,13 @@ Do not mark a milestone complete until its exit criteria pass.
   animation, uniform-layout, and shader-parse tests pass; a release client connected to
   the live Go Direct service without transport lag. Visual tuning remains intentionally
   open to hands-on feedback.
+- Configurable kasina framework, 2026-08-13: `KasinaVisual` now defines the implementation
+  boundary, and the original shape is a `LuminousMandala` implementation with typed,
+  sanitized radius and rotation options. Versioned application settings retain dynamic
+  tab visibility, the active preset, and editable implementation-specific preset data;
+  writes are coalesced on a background thread and replace the settings file safely. The
+  default interface exposes only Breath kasina and the unhideable Settings tab. Three
+  editable presets ship by default, and users can add, rename, select, and remove presets.
 
 ## 1. Objective
 
@@ -304,7 +311,9 @@ marker. It must never silently pretend that a sequence is continuous.
 ### 5.6 Configuration and observability
 
 - Use platform user config/data directories through the `directories` crate.
-- Store human-editable configuration as versioned TOML.
+- Store human-editable configuration in a versioned serde format. The first settings
+  schema uses JSON because the tagged per-implementation preset representation is explicit
+  and the application already depends on `serde_json` for diagnostics and benchmarks.
 - Use `tracing` for structured logs in both processes, with rotating log files.
 - Surface connection state, reconnect attempts, sample rate, last sample age, sequence
   gaps, dropped messages, ring-buffer duration, renderer backend/adapter, FPS, average,
