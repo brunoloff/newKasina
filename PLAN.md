@@ -73,6 +73,14 @@ Do not mark a milestone complete until its exit criteria pass.
   one supervised reconnect, rediscovered and fully configured the same belt, and resumed
   at 10 Hz about 12 seconds after the last pre-cycle sample. The service sequence advanced
   from 14,361 to 14,366 rather than resetting, with no transport lag.
+- Milestone 3 physical dual-device smoke, 2026-08-13: hardware mode discovered a worn
+  Polar H10 and the saved Go Direct belt concurrently. The H10 connected on its first
+  attempt, subscribed to Heart Rate Measurement, and produced both heart-rate and RR-
+  interval streams. At 44 seconds the service had retained 24 samples from each Polar
+  stream and 239 respiration samples; both devices were connected, sample ages were below
+  200 ms, and transport lag was zero. The belt needed one supervised retry after an
+  initial command timeout, then completed setup and streamed normally. Longer comparison,
+  power-cycle, client-restart, and eight-hour dual-device tests remain.
 
 ## 1. Objective
 
