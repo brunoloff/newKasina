@@ -28,6 +28,12 @@ interpretation matched `godirect-js`/`godirect-py` and allowed all metadata quer
 streaming to complete. The device serial and platform identifier are deliberately omitted
 from this tracked report.
 
+A physical power-cycle later stopped notifications, triggered the five-second silence
+timeout, and incremented the supervised reconnect count once. The driver rediscovered the
+same saved peripheral, completed setup again, and resumed streaming about 12 seconds after
+the final pre-cycle sample. Service-assigned sequence advanced from 14,361 to 14,366 and
+continued at 10 Hz without a service restart or transport lag.
+
 ## Sources audited
 
 - Vernier's BSD-3-Clause [`godirect-js`](https://github.com/VernierST/godirect-js),
@@ -108,5 +114,5 @@ the complete 148-byte channel metadata structure.
 
 - Capture consent-safe request/response/measurement bytes and add them as fixtures.
 - Compare native and Python values sample-for-sample for at least 30 minutes at 100 ms.
-- Power-cycle the belt, disable/enable the adapter, and verify automatic reconnection.
+- Disable/enable the Bluetooth adapter and verify automatic reconnection.
 - Run `scripts/run-hardware-soak 8h` with both devices and retain its private JSONL report.

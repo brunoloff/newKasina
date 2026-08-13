@@ -68,7 +68,11 @@ Do not mark a milestone complete until its exit criteria pass.
   initialization response proved that command payload byte zero is command-specific
   rather than a generic status; the
   driver was corrected to match both official Vernier implementations. Python side-by-
-  side comparison, power-cycle recovery, and the eight-hour dual-device soak remain.
+  side comparison and the eight-hour dual-device soak remain. A subsequent physical
+  power-cycle stopped notifications, triggered the five-second silence detector, entered
+  one supervised reconnect, rediscovered and fully configured the same belt, and resumed
+  at 10 Hz about 12 seconds after the last pre-cycle sample. The service sequence advanced
+  from 14,361 to 14,366 rather than resetting, with no transport lag.
 
 ## 1. Objective
 
