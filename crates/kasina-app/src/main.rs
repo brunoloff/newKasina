@@ -26,8 +26,6 @@ use tracing_subscriber::EnvFilter;
 
 const HISTORY_CAPACITY_PER_STREAM: usize = 6_000;
 const UI_EVENT_CAPACITY: usize = 256;
-const ANIMATION_INTERVAL: Duration = Duration::from_millis(8);
-
 #[derive(Debug, Parser)]
 #[command(about = "newKasina biofeedback desktop client")]
 struct Args {
@@ -52,6 +50,9 @@ struct Args {
     /// Externally confirmed display refresh rate for evaluating the frame-pacing budget.
     #[arg(long, value_parser = refresh_rate_hz)]
     display_refresh_hz: Option<f64>,
+    /// Required application update rate; defaults to the declared display refresh rate.
+    #[arg(long, value_parser = refresh_rate_hz)]
+    performance_target_hz: Option<f64>,
 }
 
 fn finite_number(value: &str) -> std::result::Result<f64, String> {
@@ -181,8 +182,8 @@ enum View {
     Diagnostics,
 }
 
-fn animation_repaint_interval(view: View, viewport_visible: Option<bool>) -> Option<Duration> {
-    (view == View::Visualizer && viewport_visible != Some(false)).then_some(ANIMATION_INTERVAL)
+fn should_animate(view: View, viewport_visible: Option<bool>) -> bool {
+    view == View::Visualizer && viewport_visible != Some(false)
 }
 
 #[derive(Debug)]
@@ -236,18 +237,22 @@ struct RenderBenchmarkReport {
     driver: String,
     driver_info: String,
     hardware_accelerated: bool,
+    present_mode: String,
+    desired_maximum_frame_latency: Option<u32>,
     logical_viewport_points: Option<[f32; 2]>,
     physical_viewport_pixels: Option<[u32; 2]>,
     native_pixels_per_point: Option<f32>,
     fullscreen: Option<bool>,
     stress_instances: u32,
     declared_display_refresh_hz: Option<f64>,
+    performance_target_hz: Option<f64>,
     target_frame_interval_ms: Option<f64>,
     sample_count_sufficient: Option<bool>,
     target_met: Option<bool>,
     warmup_seconds: f64,
     measured_seconds: f64,
     measured_frames: usize,
+    achieved_frames_per_second: f64,
     frame_interval_average_ms: f64,
     frame_interval_p95_ms: f64,
     frame_interval_p99_ms: f64,
@@ -272,17 +277,17 @@ fn milliseconds(duration: Duration) -> f64 {
 
 fn frame_target_result(
     hardware_accelerated: bool,
-    refresh_hz: Option<f64>,
+    target_hz: Option<f64>,
     measured_duration: Duration,
     measured_frames: usize,
     p99_ms: f64,
 ) -> (Option<f64>, Option<bool>, Option<bool>) {
-    let Some(refresh_hz) = refresh_hz else {
+    let Some(target_hz) = target_hz else {
         return (None, None, None);
     };
-    let target_ms = 1_000.0 / refresh_hz;
+    let target_ms = 1_000.0 / target_hz;
     let enough_samples =
-        measured_frames as f64 >= measured_duration.as_secs_f64() * refresh_hz * 0.5;
+        measured_frames as f64 >= measured_duration.as_secs_f64() * target_hz * 0.5;
     (
         Some(target_ms),
         Some(enough_samples),
@@ -370,10 +375,13 @@ struct KasinaApp {
     renderer_driver: String,
     renderer_driver_info: String,
     renderer_hardware_accelerated: bool,
+    present_mode: String,
+    desired_maximum_frame_latency: Option<u32>,
     surface_health: Arc<SurfaceHealth>,
     device_lost: Arc<parking_lot::Mutex<Option<String>>>,
     stress_instances: u32,
     display_refresh_hz: Option<f64>,
+    performance_target_hz: Option<f64>,
     fullscreen: bool,
     started: Instant,
     last_frame: Instant,
@@ -421,6 +429,16 @@ impl KasinaApp {
                 eframe::wgpu::DeviceType::IntegratedGpu | eframe::wgpu::DeviceType::DiscreteGpu
             )
         });
+        let surface_config = creation_context
+            .wgpu_render_state
+            .as_ref()
+            .map(|state| state.surface_config);
+        let present_mode = surface_config.map_or_else(
+            || "unavailable".to_owned(),
+            |config| format!("{:?}", config.present_mode),
+        );
+        let desired_maximum_frame_latency =
+            surface_config.and_then(|config| config.desired_maximum_frame_latency);
         let device_lost = Arc::new(parking_lot::Mutex::new(None));
         if let Some(render_state) = &creation_context.wgpu_render_state {
             let device_lost_state = Arc::clone(&device_lost);
@@ -475,10 +493,13 @@ impl KasinaApp {
             renderer_driver,
             renderer_driver_info,
             renderer_hardware_accelerated,
+            present_mode,
+            desired_maximum_frame_latency,
             surface_health,
             device_lost,
             stress_instances: args.stress_instances,
             display_refresh_hz: args.display_refresh_hz,
+            performance_target_hz: args.performance_target_hz,
             fullscreen: false,
             started: now,
             last_frame: now,
@@ -815,9 +836,10 @@ impl KasinaApp {
         benchmark.submitted = true;
         let viewport = context.input(|input| input.viewport().clone());
         let pixels_per_point = context.pixels_per_point();
-        let logical_viewport_points = viewport
+        let logical_size = viewport
             .inner_rect
-            .map(|rect| [rect.width(), rect.height()]);
+            .map_or_else(|| context.viewport_rect().size(), |rect| rect.size());
+        let logical_viewport_points = Some([logical_size.x, logical_size.y]);
         let physical_viewport_pixels = logical_viewport_points.map(|size| {
             [
                 (size[0] * pixels_per_point).round().max(0.0) as u32,
@@ -830,15 +852,16 @@ impl KasinaApp {
             .map(BiofeedbackRenderer::prepare_stats)
             .unwrap_or_default();
         let p99_ms = milliseconds(benchmark.frame_intervals.percentile(0.99));
+        let target_hz = self.performance_target_hz.or(self.display_refresh_hz);
         let (target_frame_interval_ms, sample_count_sufficient, target_met) = frame_target_result(
             self.renderer_hardware_accelerated,
-            self.display_refresh_hz,
+            target_hz,
             benchmark.duration,
             benchmark.frame_intervals.len(),
             p99_ms,
         );
         let report = RenderBenchmarkReport {
-            schema_version: 1,
+            schema_version: 2,
             package_version: env!("CARGO_PKG_VERSION"),
             source_revision: option_env!("KASINA_BUILD_REVISION").unwrap_or("unknown"),
             operating_system: std::env::consts::OS,
@@ -849,18 +872,23 @@ impl KasinaApp {
             driver: self.renderer_driver.clone(),
             driver_info: self.renderer_driver_info.clone(),
             hardware_accelerated: self.renderer_hardware_accelerated,
+            present_mode: self.present_mode.clone(),
+            desired_maximum_frame_latency: self.desired_maximum_frame_latency,
             logical_viewport_points,
             physical_viewport_pixels,
             native_pixels_per_point: viewport.native_pixels_per_point,
-            fullscreen: viewport.fullscreen,
+            fullscreen: viewport.fullscreen.or(Some(self.fullscreen)),
             stress_instances: self.stress_instances,
             declared_display_refresh_hz: self.display_refresh_hz,
+            performance_target_hz: target_hz,
             target_frame_interval_ms,
             sample_count_sufficient,
             target_met,
             warmup_seconds: benchmark.warmup.as_secs_f64(),
             measured_seconds: benchmark.duration.as_secs_f64(),
             measured_frames: benchmark.frame_intervals.len(),
+            achieved_frames_per_second: benchmark.frame_intervals.len() as f64
+                / benchmark.duration.as_secs_f64(),
             frame_interval_average_ms: milliseconds(benchmark.frame_intervals.average()),
             frame_interval_p95_ms: milliseconds(benchmark.frame_intervals.percentile(0.95)),
             frame_interval_p99_ms: p99_ms,
@@ -931,8 +959,8 @@ impl eframe::App for KasinaApp {
             context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
         let viewport_visible = context.input(|input| input.viewport().visible());
-        if let Some(interval) = animation_repaint_interval(self.view, viewport_visible) {
-            context.request_repaint_after(interval);
+        if should_animate(self.view, viewport_visible) {
+            context.request_repaint();
         }
         self.poll_benchmark_writer(context);
     }
@@ -1338,22 +1366,10 @@ mod tests {
 
     #[test]
     fn continuous_animation_requires_a_visible_visualizer() {
-        assert_eq!(
-            animation_repaint_interval(View::Visualizer, Some(true)),
-            Some(ANIMATION_INTERVAL)
-        );
-        assert_eq!(
-            animation_repaint_interval(View::Visualizer, None),
-            Some(ANIMATION_INTERVAL)
-        );
-        assert_eq!(
-            animation_repaint_interval(View::Visualizer, Some(false)),
-            None
-        );
-        assert_eq!(
-            animation_repaint_interval(View::Dashboard, Some(true)),
-            None
-        );
+        assert!(should_animate(View::Visualizer, Some(true)));
+        assert!(should_animate(View::Visualizer, None));
+        assert!(!should_animate(View::Visualizer, Some(false)));
+        assert!(!should_animate(View::Dashboard, Some(true)));
     }
 
     #[test]
@@ -1402,6 +1418,7 @@ mod tests {
         assert_eq!(args.render_benchmark_seconds, Some(10.0));
         assert_eq!(args.stress_instances, 100_000);
         assert!(Args::try_parse_from(["kasina-app", "--display-refresh-hz", "1001"]).is_err());
+        assert!(Args::try_parse_from(["kasina-app", "--performance-target-hz", "0"]).is_err());
     }
 
     #[test]

@@ -84,16 +84,18 @@ from a normal graphical desktop session and inspect the Diagnostics panel for th
 wgpu backend, adapter, frame-time percentiles, and upload counters.
 
 For a repeatable release-mode measurement, this command warms up for two seconds, records
-30 seconds of the 8,000-instance visualizer, writes `render-benchmark.json`, and exits:
+30 seconds of the 8,000-instance visualizer, writes JSON, and exits. The fourth argument
+is the display's actual active refresh rate; the optional fifth argument is the required
+application performance target:
 
 ```sh
-scripts/run-render-benchmark 30 render-benchmark-60hz.json 8000 60
-scripts/run-render-benchmark 30 render-benchmark-120hz.json 8000 120
+scripts/run-render-benchmark 30 render-benchmark-60hz.json 8000 60 60
+scripts/run-render-benchmark 30 render-benchmark-120-display.json 8000 120 60
 ```
 
 The JSON records the source revision, OS/architecture, selected adapter/backend, viewport,
-scale factor, instance count, declared display refresh rate, frame-interval and UI-CPU
-percentiles, wgpu callback timing, uniform upload size, and whether the p99 budget passed.
-Use the display's externally confirmed active refresh rate as the fourth argument. A
-software adapter result is always marked as ineligible to pass the native-GPU target.
-Surface recovery counters and any full-device-loss diagnostic are included in the report.
+scale factor, presentation mode/latency, instance count, actual display refresh, selected
+performance target, achieved FPS, frame-interval and UI-CPU percentiles, wgpu callback
+timing, uniform upload size, and whether the p99 budget passed. A software adapter result
+is always ineligible to pass the native-GPU target. Surface recovery counters and any
+full-device-loss diagnostic are included in the report.

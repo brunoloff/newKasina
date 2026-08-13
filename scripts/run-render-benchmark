@@ -5,6 +5,7 @@ duration_seconds=${1:-30}
 output_path=${2:-render-benchmark.json}
 instance_count=${3:-8000}
 display_refresh_hz=${4:-}
+performance_target_hz=${5:-}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(dirname -- "$script_dir")
 cd "$project_dir"
@@ -23,7 +24,22 @@ else
     revision=unknown
 fi
 
-if [ -n "$display_refresh_hz" ]; then
+if [ -n "$performance_target_hz" ] && [ -z "$display_refresh_hz" ]; then
+    printf 'a performance target requires the actual display refresh as argument four\n' >&2
+    exit 1
+fi
+
+if [ -n "$performance_target_hz" ]; then
+    KASINA_BUILD_REVISION="$revision" "$script_dir/cargo-local" run \
+        --release \
+        -p kasina-app \
+        -- \
+        --render-benchmark-seconds "$duration_seconds" \
+        --benchmark-output "$temporary_output" \
+        --stress-instances "$instance_count" \
+        --display-refresh-hz "$display_refresh_hz" \
+        --performance-target-hz "$performance_target_hz"
+elif [ -n "$display_refresh_hz" ]; then
     KASINA_BUILD_REVISION="$revision" "$script_dir/cargo-local" run \
         --release \
         -p kasina-app \

@@ -111,6 +111,27 @@ remained null. The harness then atomically installed its JSON output and exited 
 intervention. This proves report generation and conservative result classification, not
 the 60 Hz performance target.
 
+## Native Intel GPU baseline — 2026-08-13
+
+A normal KDE Wayland terminal ran the original 30-second benchmark at the panel's active
+2880×1800 at 120 Hz mode and 160% scale. The retained raw report is
+[`render-benchmark-120hz-initial-2026-08-13.json`](render-benchmark-120hz-initial-2026-08-13.json).
+It selected the physical Intel Meteor Lake Arc integrated GPU through Vulkan and Mesa
+26.1.6. Across 3,594 frames it measured 8.346 ms average, 9.130 ms p95, and 9.583 ms p99
+frame intervals (119.8 frames/second). UI CPU p99 was 0.213 ms, callback preparation p99
+was 0.0105 ms, the upload remained 32 bytes, and all surface/device-loss counters were
+zero.
+
+The original report correctly failed its 8.333 ms stretch target because it treated the
+active 120 Hz display rate as the required performance target. It nevertheless already
+clears the subsequently selected 60 Hz requirement of 16.667 ms. It also revealed that
+Wayland intentionally omits native window-position rectangles, leaving the recorded
+viewport dimensions null. Schema 2 therefore separates actual display refresh from the
+required application target, falls back to egui's viewport rectangle for dimensions,
+records presentation configuration and achieved FPS, and requests the next visible
+visualizer frame directly instead of waking from an 8 ms timer. A current-revision native
+rerun is required before the result is promoted from baseline to exit evidence.
+
 ## Native checks still required
 
 From the normal desktop session, run the automated release benchmark at each externally
@@ -118,11 +139,13 @@ confirmed active display refresh rate:
 
 ```sh
 scripts/run-render-benchmark 30 render-benchmark-60hz.json 8000 60
-scripts/run-render-benchmark 30 render-benchmark-120hz.json 8000 120
+scripts/run-render-benchmark 30 render-benchmark-120-display.json 8000 120 60
 ```
 
-Confirm that `hardware_accelerated` and `target_met` are both true. Also run the service
-and app interactively, exercise controls while the visualizer runs, press F11, resize,
+The fourth argument is the actual display refresh and the optional fifth argument is the
+required application target. Confirm that `hardware_accelerated` and `target_met` are both
+true. Also run the service and app interactively, exercise controls while the visualizer
+runs, press F11, resize,
 minimize/restore, move between mixed-DPI monitors, and confirm that the Diagnostics view
 remains free of wgpu validation/surface errors. Device-loss recovery requires a platform-
 appropriate forced reset or suspend/resume test; record the procedure with the report.

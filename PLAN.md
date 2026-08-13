@@ -1,6 +1,6 @@
 # newKasina implementation plan
 
-Last updated: 2026-08-12
+Last updated: 2026-08-13
 
 ## Progress
 
@@ -16,7 +16,7 @@ Last updated: 2026-08-12
 Update this ledger and add brief dated evidence beneath a milestone as work is completed.
 Do not mark a milestone complete until its exit criteria pass.
 
-### Evidence — 2026-08-12
+### Evidence — 2026-08-12 to 2026-08-13
 
 - Milestone 0: the workspace passes `cargo fmt --all --check`, warning-free Clippy,
   all-feature workspace tests, and an optimized release build. CI contains Linux,
@@ -30,8 +30,15 @@ Do not mark a milestone complete until its exit criteria pass.
   `egui_wgpu::CallbackTrait`; shader parsing, 32-byte uniform uploads, resize, unmap/map,
   and F11 handling were exercised without validation errors. The sandbox exposes no
   `/dev/dri`, so native GPU 60/120 Hz measurements, real-window-manager fullscreen, and
-  mixed-DPI validation remain exit blockers. Software llvmpipe timing is recorded only
-  as a functional smoke result and is not treated as performance evidence. The app now
+  mixed-DPI validation were initially unavailable inside Codex. Software llvmpipe timing
+  is recorded only as a functional smoke result. A subsequent normal KDE Wayland run on
+  the physical Intel Meteor Lake Arc GPU delivered 3,594 frames in 30 seconds at the
+  panel's active 120 Hz mode: 8.346 ms average, 9.130 ms p95, and 9.583 ms p99, with
+  0.213 ms UI-CPU p99, 0.0105 ms callback p99, a 32-byte upload, and no surface/device
+  errors. This misses the optional 8.333 ms 120 Hz stretch threshold but clears the user-
+  selected 16.667 ms 60 Hz requirement. The run exposed missing Wayland viewport fields;
+  schema 2 fixes that and separates display rate from performance target, so a current-
+  revision native rerun plus real-window-manager interaction checks remain. The app now
   has a self-terminating release benchmark that records source revision, adapter/backend,
   viewport/DPI, declared refresh, frame-interval/UI-CPU/callback percentiles, upload size,
   and a conservative hardware-only target result. Continuous animation is explicitly
@@ -63,7 +70,8 @@ The system must:
 
 - acquire Polar H10 heart-rate/RR data and Vernier Go Direct respiration-belt data;
 - keep device connections alive when the graphical client restarts;
-- render fluid, GPU-accelerated feedback at 60 Hz and 120 Hz where supported;
+- render fluid, GPU-accelerated feedback at a required 60 Hz, while retaining 120 Hz as
+  a measured stretch target on displays that support it;
 - preserve and then improve the useful analysis and training behavior in `pyKasina`;
 - be testable without physical hardware through simulation and replay;
 - expose connection health, dropped samples, timing, and rendering performance instead
@@ -542,7 +550,8 @@ Exit criteria:
 - Bluetooth adapter disable/enable.
 - suspend/resume and login/logout behavior.
 - audio device loss and default-device change.
-- fullscreen, high DPI, multiple monitors, and 60/120 Hz displays.
+- fullscreen, high DPI, multiple monitors, and 60 Hz displays; measure 120 Hz as a stretch
+  target where supported.
 
 ### Required validation order for changes
 
@@ -557,8 +566,9 @@ Exit criteria:
 
 These are engineering targets, not claims about sensor accuracy:
 
-- 60 Hz: p99 application frame time below 16.67 ms.
-- 120 Hz: p99 application frame time below 8.33 ms on supported hardware.
+- Required 60 Hz target: p99 application frame interval below 16.67 ms.
+- Stretch 120 Hz target: p99 application frame interval below 8.33 ms; failure does not
+  block the initial desktop release when the required 60 Hz target passes.
 - No full-history copy, filter, extrema scan, or GPU rebuild on each frame.
 - UI thread performs no blocking I/O.
 - New service samples become visible within 50 ms p99 after service receipt under normal
