@@ -15,8 +15,9 @@ use kasina_devices::simulated_values;
 use kasina_domain::quality;
 use kasina_protocol::v1::kasina_client::KasinaClient;
 use kasina_protocol::v1::{
-    Sample, SampleBatch, SamplesSinceRequest, ServiceInfo, StatusSnapshot, StreamCursor,
-    StreamKind, SubscribeRequest,
+    RecordingState, RecordingStatus, Sample, SampleBatch, SamplesSinceRequest, ServiceInfo,
+    StartRecordingRequest, StatusSnapshot, StopRecordingRequest, StreamCursor, StreamKind,
+    SubscribeRequest,
 };
 use kasina_protocol::{AUTH_HEADER, client_hello};
 use kasina_render::{BiofeedbackRenderer, FrameStats};
@@ -188,6 +189,14 @@ enum ClientEvent {
     ServiceInfo(ServiceInfo),
     Status(StatusSnapshot),
     Samples(SampleBatch),
+    Recording(RecordingStatus),
+    RecordingError(String),
+}
+
+#[derive(Debug)]
+enum NetworkCommand {
+    StartRecording { label: String, notes: String },
+    StopRecording,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +344,7 @@ struct ClientModel {
     explicit_gap_samples: u64,
     inferred_gap_samples: u64,
     duplicate_samples: u64,
+    recording: Option<RecordingStatus>,
 }
 
 impl Default for ClientModel {
@@ -348,6 +358,7 @@ impl Default for ClientModel {
             explicit_gap_samples: 0,
             inferred_gap_samples: 0,
             duplicate_samples: 0,
+            recording: None,
         }
     }
 }
@@ -607,6 +618,7 @@ struct KasinaApp {
     endpoint: String,
     view: View,
     events: Receiver<ClientEvent>,
+    network_commands: tokio::sync::mpsc::UnboundedSender<NetworkCommand>,
     cancellation: CancellationToken,
     network_thread: Option<JoinHandle<()>>,
     ui_dropped_batches: Arc<AtomicU64>,
@@ -620,6 +632,10 @@ struct KasinaApp {
     settings_save_deadline: Option<Instant>,
     settings_notice: Option<String>,
     editing_preset_id: u64,
+    recording_label: String,
+    recording_notes: String,
+    recording_command_pending: bool,
+    recording_notice: Option<String>,
     renderer: Option<BiofeedbackRenderer>,
     renderer_name: String,
     renderer_backend: String,
@@ -718,6 +734,7 @@ impl KasinaApp {
                 });
         }
         let (sender, events) = std::sync::mpsc::sync_channel(UI_EVENT_CAPACITY);
+        let (network_commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let ui_dropped_batches = Arc::new(AtomicU64::new(0));
         let network_thread = Some(spawn_network_thread(
@@ -727,6 +744,7 @@ impl KasinaApp {
             cancellation.clone(),
             Arc::clone(&ui_dropped_batches),
             creation_context.egui_ctx.clone(),
+            command_receiver,
         ));
         let now = Instant::now();
         let benchmark = args.render_benchmark_seconds.map(|duration| {
@@ -749,6 +767,7 @@ impl KasinaApp {
                 View::Settings
             },
             events,
+            network_commands,
             cancellation,
             network_thread,
             ui_dropped_batches,
@@ -762,6 +781,10 @@ impl KasinaApp {
             settings_save_deadline: None,
             settings_notice,
             editing_preset_id,
+            recording_label: "Biofeedback session".to_owned(),
+            recording_notes: String::new(),
+            recording_command_pending: false,
+            recording_notice: None,
             renderer,
             renderer_name,
             renderer_backend,
@@ -791,7 +814,12 @@ impl KasinaApp {
             match event {
                 ClientEvent::Connection(connection) => self.model.connection = connection,
                 ClientEvent::ServiceInfo(info) => self.model.service_info = Some(info),
-                ClientEvent::Status(status) => self.model.status = Some(status),
+                ClientEvent::Status(status) => {
+                    if let Some(recording) = status.recording.clone() {
+                        self.model.recording = Some(recording);
+                    }
+                    self.model.status = Some(status);
+                }
                 ClientEvent::Samples(batch) => {
                     if !self.settings.simulation_mode {
                         for sample in &batch.samples {
@@ -801,6 +829,15 @@ impl KasinaApp {
                         }
                     }
                     self.model.apply_batch(batch);
+                }
+                ClientEvent::Recording(recording) => {
+                    self.recording_command_pending = false;
+                    self.recording_notice = Some(recording.detail.clone());
+                    self.model.recording = Some(recording);
+                }
+                ClientEvent::RecordingError(error) => {
+                    self.recording_command_pending = false;
+                    self.recording_notice = Some(error);
                 }
             }
         }
@@ -850,6 +887,9 @@ impl KasinaApp {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let model = self.active_model();
+        let recording_active = self.model.recording.as_ref().is_some_and(|recording| {
+            RecordingState::try_from(recording.state) == Ok(RecordingState::Recording)
+        });
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("newKasina");
@@ -871,6 +911,10 @@ impl KasinaApp {
                     model.latest(StreamKind::RespirationForce),
                     1.0,
                 );
+                if recording_active {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(240, 65, 75), "● REC");
+                }
             });
         });
     }
@@ -1085,6 +1129,108 @@ impl KasinaApp {
         ui.label(
             "Generates a regular 10-second breathing wave at 10 Hz, plus heart rate and RR intervals at 1 Hz. The measurement service keeps running unchanged.",
         );
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(12.0);
+
+        ui.heading("Session recording");
+        let recording_status = self.model.recording.clone();
+        let recording = recording_status.clone().unwrap_or_default();
+        let recording_state = RecordingState::try_from(recording.state).unwrap_or_default();
+        let recording_active = recording_state == RecordingState::Recording;
+        let recording_available = recording_status.is_some()
+            && !matches!(
+                recording_state,
+                RecordingState::Unspecified | RecordingState::Unavailable
+            );
+        egui::Grid::new("session_recording_controls")
+            .num_columns(2)
+            .spacing([18.0, 8.0])
+            .show(ui, |ui| {
+                ui.strong("Session label");
+                ui.add_enabled(
+                    !recording_active,
+                    egui::TextEdit::singleline(&mut self.recording_label)
+                        .char_limit(100)
+                        .desired_width(320.0),
+                );
+                ui.end_row();
+                ui.strong("Notes");
+                ui.add_enabled(
+                    !recording_active,
+                    egui::TextEdit::multiline(&mut self.recording_notes)
+                        .char_limit(4_000)
+                        .desired_rows(2)
+                        .desired_width(420.0),
+                );
+                ui.end_row();
+                ui.strong("Status");
+                ui.label(format!(
+                    "{} · {} samples · {} dropped",
+                    recording_state_label(recording_state),
+                    recording.sample_count,
+                    recording.dropped_samples
+                ));
+                ui.end_row();
+                if !recording.directory.is_empty() {
+                    ui.strong("Directory");
+                    ui.label(&recording.directory);
+                    ui.end_row();
+                }
+            });
+        ui.horizontal(|ui| {
+            let can_start = recording_available
+                && !recording_active
+                && !self.recording_command_pending
+                && !self.recording_label.trim().is_empty();
+            if ui
+                .add_enabled(can_start, egui::Button::new("Start recording"))
+                .clicked()
+            {
+                let command = NetworkCommand::StartRecording {
+                    label: self.recording_label.trim().to_owned(),
+                    notes: self.recording_notes.trim().to_owned(),
+                };
+                if self.network_commands.send(command).is_ok() {
+                    self.recording_command_pending = true;
+                    self.recording_notice = Some("Starting recording…".to_owned());
+                } else {
+                    self.recording_notice = Some("Network task is not running".to_owned());
+                }
+            }
+            if ui
+                .add_enabled(
+                    recording_active && !self.recording_command_pending,
+                    egui::Button::new("Stop recording"),
+                )
+                .clicked()
+            {
+                if self
+                    .network_commands
+                    .send(NetworkCommand::StopRecording)
+                    .is_ok()
+                {
+                    self.recording_command_pending = true;
+                    self.recording_notice = Some("Stopping and syncing recording…".to_owned());
+                } else {
+                    self.recording_notice = Some("Network task is not running".to_owned());
+                }
+            }
+            if self.recording_command_pending {
+                ui.spinner();
+            }
+        });
+        if let Some(notice) = &self.recording_notice {
+            ui.label(notice);
+        } else if !recording.detail.is_empty() {
+            ui.label(&recording.detail);
+        }
+        if self.settings.simulation_mode {
+            ui.colored_label(
+                egui::Color32::from_rgb(245, 190, 70),
+                "In-app simulation is display-only. Server recordings contain the service's own live acquisition streams.",
+            );
+        }
         ui.add_space(18.0);
         ui.separator();
         ui.add_space(12.0);
@@ -1726,6 +1872,7 @@ fn spawn_network_thread(
     cancellation: CancellationToken,
     dropped_batches: Arc<AtomicU64>,
     repaint: egui::Context,
+    commands: tokio::sync::mpsc::UnboundedReceiver<NetworkCommand>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("kasina-ipc".to_owned())
@@ -1750,6 +1897,7 @@ fn spawn_network_thread(
                 cancellation,
                 dropped_batches,
                 repaint,
+                commands,
             ));
         })
         .expect("the operating system should allow the IPC thread")
@@ -1762,6 +1910,7 @@ async fn network_supervisor(
     cancellation: CancellationToken,
     dropped_batches: Arc<AtomicU64>,
     repaint: egui::Context,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<NetworkCommand>,
 ) {
     let mut cursors = BTreeMap::new();
     let mut retry = Duration::from_millis(250);
@@ -1771,6 +1920,10 @@ async fn network_supervisor(
             ClientEvent::Connection("connecting to acquisition service".to_owned()),
             &repaint,
         );
+        let mut session_state = NetworkSessionState {
+            cursors: &mut cursors,
+            commands: &mut commands,
+        };
         let result = connected_session(
             &endpoint,
             &token_path,
@@ -1778,7 +1931,7 @@ async fn network_supervisor(
             &cancellation,
             &dropped_batches,
             &repaint,
-            &mut cursors,
+            &mut session_state,
         )
         .await;
         if cancellation.is_cancelled() {
@@ -1800,6 +1953,11 @@ async fn network_supervisor(
     }
 }
 
+struct NetworkSessionState<'a> {
+    cursors: &'a mut BTreeMap<i32, u64>,
+    commands: &'a mut tokio::sync::mpsc::UnboundedReceiver<NetworkCommand>,
+}
+
 async fn connected_session(
     endpoint: &str,
     token_path: &PathBuf,
@@ -1807,7 +1965,7 @@ async fn connected_session(
     cancellation: &CancellationToken,
     dropped_batches: &AtomicU64,
     repaint: &egui::Context,
-    cursors: &mut BTreeMap<i32, u64>,
+    session: &mut NetworkSessionState<'_>,
 ) -> Result<()> {
     let token = fs::read_to_string(token_path)
         .with_context(|| format!("read service token at {}", token_path.display()))?;
@@ -1852,7 +2010,7 @@ async fn connected_session(
                     .iter()
                     .map(|stream| StreamCursor {
                         stream: *stream,
-                        after_sequence: cursors.get(stream).copied().unwrap_or(0),
+                        after_sequence: session.cursors.get(stream).copied().unwrap_or(0),
                     })
                     .collect(),
             },
@@ -1860,7 +2018,20 @@ async fn connected_session(
         )?)
         .await?
         .into_inner();
-    publish_batch(history, sender, dropped_batches, repaint, cursors)?;
+    publish_batch(history, sender, dropped_batches, repaint, session.cursors)?;
+    if let Ok(recording) = client
+        .get_recording_status(authenticated_request(
+            client_hello("kasina-app", env!("CARGO_PKG_VERSION")),
+            token,
+        )?)
+        .await
+    {
+        send_event(
+            sender,
+            ClientEvent::Recording(recording.into_inner()),
+            repaint,
+        );
+    }
     let mut status_client = client.clone();
     let mut status_tick = tokio::time::interval(Duration::from_millis(500));
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1876,7 +2047,7 @@ async fn connected_session(
                 let Some(batch) = message? else {
                     bail!("sample stream closed");
                 };
-                publish_batch(batch, sender, dropped_batches, repaint, cursors)?;
+                publish_batch(batch, sender, dropped_batches, repaint, session.cursors)?;
             }
             _ = status_tick.tick() => {
                 match status_client.get_status(authenticated_request(
@@ -1887,7 +2058,67 @@ async fn connected_session(
                     Err(error) => warn!(%error, "status refresh failed"),
                 }
             }
+            Some(command) = session.commands.recv(), if !session.commands.is_closed() => {
+                handle_network_command(&mut client, command, token, sender, repaint).await;
+            }
         }
+    }
+}
+
+fn recording_state_label(state: RecordingState) -> &'static str {
+    match state {
+        RecordingState::Unspecified => "Waiting for service",
+        RecordingState::Unavailable => "Unavailable",
+        RecordingState::Idle => "Ready",
+        RecordingState::Recording => "Recording",
+        RecordingState::Completed => "Completed",
+        RecordingState::Interrupted => "Interrupted",
+        RecordingState::Error => "Error",
+    }
+}
+
+async fn handle_network_command(
+    client: &mut KasinaClient<tonic::transport::Channel>,
+    command: NetworkCommand,
+    token: &str,
+    sender: &SyncSender<ClientEvent>,
+    repaint: &egui::Context,
+) {
+    let result = match command {
+        NetworkCommand::StartRecording { label, notes } => client
+            .start_recording(
+                authenticated_request(
+                    StartRecordingRequest {
+                        client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
+                        label,
+                        notes,
+                    },
+                    token,
+                )
+                .expect("validated service token remains valid metadata"),
+            )
+            .await
+            .map(tonic::Response::into_inner),
+        NetworkCommand::StopRecording => client
+            .stop_recording(
+                authenticated_request(
+                    StopRecordingRequest {
+                        client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
+                    },
+                    token,
+                )
+                .expect("validated service token remains valid metadata"),
+            )
+            .await
+            .map(tonic::Response::into_inner),
+    };
+    match result {
+        Ok(recording) => send_event(sender, ClientEvent::Recording(recording), repaint),
+        Err(error) => send_event(
+            sender,
+            ClientEvent::RecordingError(format!("recording command failed: {error}")),
+            repaint,
+        ),
     }
 }
 

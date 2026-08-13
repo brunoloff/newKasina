@@ -1,5 +1,7 @@
 //! Persistent acquisition state and authenticated streaming RPC implementation.
 
+mod recording;
+
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -21,7 +23,8 @@ use kasina_domain::{Sample, ServiceBuffers, StreamKind};
 use kasina_protocol::v1::kasina_server::{Kasina, KasinaServer};
 use kasina_protocol::v1::{
     ClientHello, ConnectionState, DeviceCommand, DeviceInfo, DeviceList, DeviceStatus,
-    PreferredDeviceCommand, SampleBatch, SamplesSinceRequest, ServiceInfo, StatusSnapshot,
+    PreferredDeviceCommand, RecordingList, RecordingState, RecordingStatus, SampleBatch,
+    SamplesSinceRequest, ServiceInfo, StartRecordingRequest, StatusSnapshot, StopRecordingRequest,
     StreamDiagnostics, StreamGap, SubscribeRequest,
 };
 use kasina_protocol::{AUTH_HEADER, PROTOCOL_MAJOR, PROTOCOL_MINOR};
@@ -34,6 +37,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
+
+use recording::{RecordingManager, RecordingSnapshot, SessionState};
 
 /// Default local service port, retained from the Python implementation.
 pub const DEFAULT_PORT: u16 = 18_861;
@@ -105,6 +110,8 @@ pub struct ServicePaths {
     pub token: PathBuf,
     /// Single-instance lock file.
     pub lock: PathBuf,
+    /// Private, analysis-ready raw session recordings.
+    pub recordings: PathBuf,
 }
 
 impl ServicePaths {
@@ -116,6 +123,7 @@ impl ServicePaths {
         Ok(Self {
             token: config.join("service-token"),
             lock: config.join("service.lock"),
+            recordings: project.data_local_dir().join("sessions"),
         })
     }
 }
@@ -218,6 +226,7 @@ pub struct ServiceState {
     connected_clients: AtomicU64,
     transport_lagged_samples: AtomicU64,
     service_batch_sequence: AtomicU64,
+    recording: RecordingManager,
 }
 
 impl ServiceState {
@@ -232,6 +241,27 @@ impl ServiceState {
     pub fn new_multi(
         retention: Duration,
         devices: impl IntoIterator<Item = DeviceDescriptor>,
+    ) -> Arc<Self> {
+        Self::build(retention, devices, RecordingManager::unavailable())
+    }
+
+    /// Create service state with private persistent recording storage.
+    pub fn new_multi_with_recordings(
+        retention: Duration,
+        devices: impl IntoIterator<Item = DeviceDescriptor>,
+        recordings: PathBuf,
+    ) -> Result<Arc<Self>> {
+        Ok(Self::build(
+            retention,
+            devices,
+            RecordingManager::new(recordings)?,
+        ))
+    }
+
+    fn build(
+        retention: Duration,
+        devices: impl IntoIterator<Item = DeviceDescriptor>,
+        recording: RecordingManager,
     ) -> Arc<Self> {
         let (sample_sender, _) = broadcast::channel(SAMPLE_BROADCAST_CAPACITY);
         let devices = devices
@@ -260,6 +290,7 @@ impl ServiceState {
             connected_clients: AtomicU64::new(0),
             transport_lagged_samples: AtomicU64::new(0),
             service_batch_sequence: AtomicU64::new(0),
+            recording,
         })
     }
 
@@ -306,6 +337,7 @@ impl ServiceState {
                         .write()
                         .push(sample.clone())
                         .context("service buffer rejected driver sample")?;
+                    self.recording.record(sample.clone());
                     let _ = self.sample_sender.send(sample);
                 }
                 DriverEvent::Status {
@@ -371,6 +403,7 @@ impl ServiceState {
             streams,
             connected_clients: self.connected_clients.load(Ordering::Relaxed),
             transport_lagged_samples: self.transport_lagged_samples.load(Ordering::Relaxed),
+            recording: Some(proto_recording(self.recording.snapshot())),
         }
     }
 
@@ -558,6 +591,27 @@ fn proto_sample(sample: Sample) -> kasina_protocol::v1::Sample {
         value: sample.value,
         unit: sample.unit,
         quality_flags: sample.quality_flags,
+    }
+}
+
+fn proto_recording(snapshot: RecordingSnapshot) -> RecordingStatus {
+    RecordingStatus {
+        state: match snapshot.state {
+            SessionState::Unavailable => RecordingState::Unavailable,
+            SessionState::Idle => RecordingState::Idle,
+            SessionState::Recording => RecordingState::Recording,
+            SessionState::Completed => RecordingState::Completed,
+            SessionState::Interrupted => RecordingState::Interrupted,
+            SessionState::Error => RecordingState::Error,
+        } as i32,
+        session_id: snapshot.session_id,
+        label: snapshot.label,
+        directory: snapshot.directory,
+        started_wall_time_unix_ns: snapshot.started_wall_time_unix_ns,
+        stopped_wall_time_unix_ns: snapshot.stopped_wall_time_unix_ns,
+        sample_count: snapshot.sample_count,
+        dropped_samples: snapshot.dropped_samples,
+        detail: snapshot.detail,
     }
 }
 
@@ -838,6 +892,81 @@ impl Kasina for KasinaRpc {
             }
         };
         Ok(Response::new(Box::pin(output)))
+    }
+
+    async fn start_recording(
+        &self,
+        request: Request<StartRecordingRequest>,
+    ) -> Result<Response<RecordingStatus>, Status> {
+        self.authorize(&request)?;
+        Self::check_hello(request.get_ref().client.as_ref())?;
+        let command = request.into_inner();
+        if command.label.trim().is_empty() {
+            return Err(Status::invalid_argument("recording label cannot be empty"));
+        }
+        let devices = self
+            .state
+            .devices
+            .read()
+            .values()
+            .map(|runtime| runtime.descriptor.clone())
+            .collect();
+        let snapshot = self
+            .state
+            .recording
+            .start(
+                command.label,
+                command.notes,
+                self.state.instance_id.clone(),
+                devices,
+            )
+            .await
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(proto_recording(snapshot)))
+    }
+
+    async fn stop_recording(
+        &self,
+        request: Request<StopRecordingRequest>,
+    ) -> Result<Response<RecordingStatus>, Status> {
+        self.authorize(&request)?;
+        Self::check_hello(request.get_ref().client.as_ref())?;
+        let snapshot = self
+            .state
+            .recording
+            .stop()
+            .await
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(proto_recording(snapshot)))
+    }
+
+    async fn get_recording_status(
+        &self,
+        request: Request<ClientHello>,
+    ) -> Result<Response<RecordingStatus>, Status> {
+        self.authorize(&request)?;
+        Self::check_hello(Some(request.get_ref()))?;
+        Ok(Response::new(proto_recording(
+            self.state.recording.snapshot(),
+        )))
+    }
+
+    async fn list_recordings(
+        &self,
+        request: Request<ClientHello>,
+    ) -> Result<Response<RecordingList>, Status> {
+        self.authorize(&request)?;
+        Self::check_hello(Some(request.get_ref()))?;
+        let sessions = self
+            .state
+            .recording
+            .list()
+            .await
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(proto_recording)
+            .collect();
+        Ok(Response::new(RecordingList { sessions }))
     }
 }
 

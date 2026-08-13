@@ -105,6 +105,18 @@ Do not mark a milestone complete until its exit criteria pass.
   The top bar and data views label simulated input explicitly; switching back recalibrates
   the breath kasina from retained live force samples. Hidden windows remain event-driven,
   and non-animated views repaint only at the simulation sample cadence.
+- Milestone 5 recording slice, 2026-08-13: authenticated start, stop, status, and listing
+  RPCs now control a service-owned background recorder, so UI restarts do not end an
+  active session. Private date-partitioned directories contain atomic versioned metadata
+  and append-only JSONL raw samples with stream/source identity, service sequence, integer
+  timestamps, units, values, and quality flags. Clean stops sync data before marking a
+  session complete; startup recovery marks abandoned sessions interrupted, reconstructs
+  stream summaries from complete lines, and ignores a truncated tail. The Settings view
+  provides labels, notes, controls, counts, drop visibility, and a persistent red recording
+  indicator. Unit tests cover path safety, raw fidelity, live status, and interrupted-tail
+  recovery; an authenticated tonic loopback test records real simulated acquisition and
+  verifies respiration, heart-rate, and RR data on disk. Replay through the future analysis
+  pipeline, settings snapshots, gap events, browsing/export UI, and audio remain.
 
 ## 1. Objective
 
@@ -256,7 +268,7 @@ Minimum RPC surface:
 - `GetDeviceStatus` and `SubscribeStatus`;
 - `GetSamplesSince(stream, sequence)`;
 - `SubscribeSamples(streams)`;
-- `StartRecording`, `StopRecording`, and `GetRecordingStatus`;
+- `StartRecording`, `StopRecording`, `GetRecordingStatus`, and `ListRecordings`;
 - `Shutdown`, guarded and disabled by default so closing the UI cannot stop acquisition.
 
 The app networking task runs off the UI thread and publishes immutable snapshots or
@@ -307,9 +319,12 @@ marker. It must never silently pretend that a sequence is continuous.
 ### 5.5 Storage and recordings
 
 - Keep live buffering in memory.
-- Add optional raw-session recording after the acquisition vertical slice works.
-- Start with SQLite in WAL mode or another crash-tolerant append-oriented store. The
-  modest sensor rates do not justify a bespoke binary format.
+- Raw-session recording is owned by the persistent service, not the restartable UI.
+- Use private, date-partitioned session directories with atomic JSON metadata and
+  append-only JSON Lines raw samples. The human-readable schema makes early breath-phase
+  and HRV exploration easy while retaining crash tolerance at these modest sensor rates.
+- Track an explicit completed, interrupted, or error state. On startup, reconstruct an
+  interrupted session's summaries from complete sample lines and ignore a truncated tail.
 - Store raw samples, device metadata, calibration/settings snapshots, stream gaps, app
   and service versions, and session annotations.
 - Derived metrics should generally be recomputable from raw data. Persist them only as

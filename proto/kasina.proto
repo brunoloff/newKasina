@@ -11,6 +11,10 @@ service Kasina {
   rpc SubscribeStatus(ClientHello) returns (stream StatusSnapshot);
   rpc GetSamplesSince(SamplesSinceRequest) returns (SampleBatch);
   rpc SubscribeSamples(SubscribeRequest) returns (stream SampleBatch);
+  rpc StartRecording(StartRecordingRequest) returns (RecordingStatus);
+  rpc StopRecording(StopRecordingRequest) returns (RecordingStatus);
+  rpc GetRecordingStatus(ClientHello) returns (RecordingStatus);
+  rpc ListRecordings(ClientHello) returns (RecordingList);
 }
 
 message ClientHello {
@@ -141,5 +145,41 @@ message StatusSnapshot {
   repeated StreamDiagnostics streams = 3;
   uint64 connected_clients = 4;
   uint64 transport_lagged_samples = 5;
+  RecordingStatus recording = 6;
 }
 
+enum RecordingState {
+  RECORDING_STATE_UNSPECIFIED = 0;
+  RECORDING_STATE_UNAVAILABLE = 1;
+  RECORDING_STATE_IDLE = 2;
+  RECORDING_STATE_RECORDING = 3;
+  RECORDING_STATE_COMPLETED = 4;
+  RECORDING_STATE_INTERRUPTED = 5;
+  RECORDING_STATE_ERROR = 6;
+}
+
+message StartRecordingRequest {
+  ClientHello client = 1;
+  string label = 2;
+  string notes = 3;
+}
+
+message StopRecordingRequest {
+  ClientHello client = 1;
+}
+
+message RecordingStatus {
+  RecordingState state = 1;
+  string session_id = 2;
+  string label = 3;
+  string directory = 4;
+  uint64 started_wall_time_unix_ns = 5;
+  optional uint64 stopped_wall_time_unix_ns = 6;
+  uint64 sample_count = 7;
+  uint64 dropped_samples = 8;
+  string detail = 9;
+}
+
+message RecordingList {
+  repeated RecordingStatus sessions = 1;
+}

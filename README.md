@@ -49,6 +49,34 @@ enable **Simulation mode**. The app then displays locally generated respiration 
 and matching heart-rate/RR samples at 1 Hz. The persistent service is left untouched, and
 disabling simulation returns the UI to live device data immediately.
 
+## Record a session
+
+Open **Settings**, enter a label and optional notes under **Session recording**, then use
+**Start recording** and **Stop recording**. A red `REC` indicator remains visible while
+the persistent service records every raw sample, so closing or restarting the app does
+not interrupt an active session. If the service or computer stops unexpectedly, the next
+service start marks the session as interrupted and recovers every complete sample line.
+
+Recordings use the operating system's private per-user data directory. On Linux the
+default root is `~/.local/share/newkasina/sessions`; the Settings view displays the exact
+session directory after recording starts. For isolated testing or a portable dataset,
+override the root when starting the service:
+
+```sh
+cargo run --release -p kasina-service -- \
+  --recordings-dir ./sessions
+```
+
+Each dated session directory contains human-readable `metadata.json` and append-only
+`samples.jsonl` files. Raw respiration force, heart rate, and RR intervals retain source,
+sequence, integer timestamps, unit, and quality flags for later breath-phase and HRV
+research. See [docs/recordings.md](docs/recordings.md) for the layout, schema, recovery
+rules, and analysis examples.
+
+In-app simulation is intentionally display-only. To create a synthetic recording, run
+the service with its default `--source simulated` mode and leave the app's simulation
+toggle off while recording.
+
 The service binds only to `127.0.0.1:18861`. Its per-user authentication token is created
 in the operating system's standard configuration directory.
 

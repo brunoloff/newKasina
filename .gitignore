@@ -5,6 +5,7 @@
 /render-benchmark.json
 /render-benchmark-*.json
 /hardware-soak-*.jsonl
+/sessions/
 *.log
 *.profraw
 *.sqlite-shm

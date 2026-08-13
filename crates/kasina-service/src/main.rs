@@ -30,6 +30,9 @@ struct Args {
     /// Override the standard singleton lock path.
     #[arg(long)]
     lock_path: Option<PathBuf>,
+    /// Override the standard private session-recordings directory.
+    #[arg(long)]
+    recordings_dir: Option<PathBuf>,
     /// Acquisition source. `hardware` supervises Polar and Go Direct concurrently.
     #[arg(long, value_enum, default_value_t = Source::Simulated)]
     source: Source,
@@ -74,6 +77,7 @@ async fn main() -> Result<()> {
     let defaults = ServicePaths::for_user()?;
     let token_path = args.token_path.unwrap_or(defaults.token);
     let lock_path = args.lock_path.unwrap_or(defaults.lock);
+    let recordings_dir = args.recordings_dir.unwrap_or(defaults.recordings);
     let _lock = ServiceLock::acquire(&lock_path)?;
     let token = load_or_create_token(&token_path)?;
 
@@ -90,7 +94,11 @@ async fn main() -> Result<()> {
         .iter()
         .map(|driver| driver.descriptor())
         .collect::<Vec<_>>();
-    let state = ServiceState::new_multi(Duration::from_secs(args.retention_seconds), descriptors);
+    let state = ServiceState::new_multi_with_recordings(
+        Duration::from_secs(args.retention_seconds),
+        descriptors,
+        recordings_dir.clone(),
+    )?;
     let cancellation = CancellationToken::new();
     let acquisitions = drivers
         .into_iter()
@@ -117,6 +125,7 @@ async fn main() -> Result<()> {
     info!(
         address = %listener.local_addr()?,
         token_path = %token_path.display(),
+        recordings_dir = %recordings_dir.display(),
         "kasina-service ready"
     );
 

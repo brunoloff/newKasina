@@ -1,10 +1,15 @@
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use kasina_devices::{SensorDriver, SimulatedDriver};
 use kasina_protocol::client_hello;
 use kasina_protocol::v1::kasina_client::KasinaClient;
-use kasina_protocol::v1::{ClientHello, SamplesSinceRequest, StreamCursor, StreamKind};
+use kasina_protocol::v1::{
+    ClientHello, RecordingState, SamplesSinceRequest, StartRecordingRequest, StopRecordingRequest,
+    StreamCursor, StreamKind,
+};
 use kasina_service::{KasinaRpc, ServiceState, authenticated_request, serve};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -139,5 +144,134 @@ async fn server_rejects_bad_tokens_and_incompatible_protocol_versions() {
     assert_eq!(version_error.code(), Code::FailedPrecondition);
 
     cancellation.cancel();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn recording_rpcs_capture_live_samples_and_publish_an_analysis_ready_session() {
+    let token = "integration-test-token";
+    let temporary = tempfile::tempdir().unwrap();
+    let recordings = temporary.path().join("sessions");
+    let driver: Box<dyn SensorDriver> =
+        Box::new(SimulatedDriver::with_period(Duration::from_millis(10)));
+    let descriptor = driver.descriptor();
+    let state = ServiceState::new_multi_with_recordings(
+        Duration::from_secs(30),
+        vec![descriptor],
+        recordings.clone(),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let acquisition =
+        tokio::spawn(Arc::clone(&state).run_driver(driver, cancellation.child_token()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        KasinaRpc::new(Arc::clone(&state), token),
+        cancellation.child_token(),
+    ));
+    let mut client = KasinaClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+
+    let unauthenticated = client
+        .start_recording(
+            authenticated_request(
+                StartRecordingRequest {
+                    client: Some(client_hello("integration-test", "0")),
+                    label: "Must not start".to_owned(),
+                    notes: String::new(),
+                },
+                "wrong-token",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unauthenticated.code(), Code::Unauthenticated);
+
+    let active = client
+        .start_recording(
+            authenticated_request(
+                StartRecordingRequest {
+                    client: Some(client_hello("integration-test", "0")),
+                    label: "Loopback integration".to_owned(),
+                    notes: "synthetic fixture".to_owned(),
+                },
+                token,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(active.state, RecordingState::Recording as i32);
+    let session_id = active.session_id.clone();
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let mut client = KasinaClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let resumed_status = client
+        .get_recording_status(
+            authenticated_request(client_hello("integration-test-restart", "0"), token).unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resumed_status.state, RecordingState::Recording as i32);
+    assert_eq!(resumed_status.session_id, session_id);
+    assert!(resumed_status.sample_count > 0);
+    let listed_while_active = client
+        .list_recordings(
+            authenticated_request(client_hello("integration-test-restart", "0"), token).unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed_while_active.sessions.len(), 1);
+    assert!(listed_while_active.sessions[0].sample_count >= resumed_status.sample_count);
+    let completed = client
+        .stop_recording(
+            authenticated_request(
+                StopRecordingRequest {
+                    client: Some(client_hello("integration-test", "0")),
+                },
+                token,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(completed.state, RecordingState::Completed as i32);
+    assert!(completed.sample_count > 0);
+    assert_eq!(completed.dropped_samples, 0);
+
+    let listed = client
+        .list_recordings(
+            authenticated_request(client_hello("integration-test", "0"), token).unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.sessions.len(), 1);
+    assert_eq!(listed.sessions[0].session_id, completed.session_id);
+    let session_directory = Path::new(&completed.directory);
+    assert!(session_directory.starts_with(&recordings));
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(session_directory.join("metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(metadata["state"], "completed");
+    assert_eq!(metadata["notes"], "synthetic fixture");
+    let samples = fs::read_to_string(session_directory.join("samples.jsonl")).unwrap();
+    assert_eq!(samples.lines().count() as u64, completed.sample_count);
+    assert!(samples.contains("respiration_force"));
+    assert!(samples.contains("heart_rate"));
+    assert!(samples.contains("rr_interval"));
+
+    cancellation.cancel();
+    acquisition.await.unwrap().unwrap();
     server.await.unwrap().unwrap();
 }
