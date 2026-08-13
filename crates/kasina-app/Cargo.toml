@@ -12,6 +12,7 @@ directories.workspace = true
 eframe.workspace = true
 egui.workspace = true
 kasina-domain = { path = "../kasina-domain" }
+kasina-devices = { path = "../kasina-devices" }
 kasina-protocol = { path = "../kasina-protocol" }
 kasina-render = { path = "../kasina-render" }
 parking_lot.workspace = true

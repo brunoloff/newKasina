@@ -7,10 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::Parser;
+use kasina_devices::simulated_values;
+use kasina_domain::quality;
 use kasina_protocol::v1::kasina_client::KasinaClient;
 use kasina_protocol::v1::{
     Sample, SampleBatch, SamplesSinceRequest, ServiceInfo, StatusSnapshot, StreamCursor,
@@ -30,6 +32,8 @@ use tracing_subscriber::EnvFilter;
 const HISTORY_CAPACITY_PER_STREAM: usize = 6_000;
 const UI_EVENT_CAPACITY: usize = 256;
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(8);
+const SIMULATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const SIMULATION_CATCH_UP_SAMPLES: u64 = 600;
 const BREATH_ENVELOPE_RELAXATION: f64 = 0.0025;
 const MINIMUM_FORCE_SPAN: f64 = 0.01;
 #[derive(Debug, Parser)]
@@ -196,9 +200,20 @@ enum View {
     Settings,
 }
 
-fn animation_repaint_interval(view: View, viewport_visible: Option<bool>) -> Option<Duration> {
-    (matches!(view, View::BreathKasina | View::Visualizer) && viewport_visible != Some(false))
-        .then_some(ANIMATION_INTERVAL)
+fn repaint_interval(
+    view: View,
+    viewport_visible: Option<bool>,
+    simulation_mode: bool,
+) -> Option<Duration> {
+    if viewport_visible == Some(false) {
+        None
+    } else if matches!(view, View::BreathKasina | View::Visualizer) {
+        Some(ANIMATION_INTERVAL)
+    } else if simulation_mode {
+        Some(SIMULATION_SAMPLE_INTERVAL)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -376,6 +391,117 @@ impl ClientModel {
 }
 
 #[derive(Debug)]
+struct SimulationState {
+    model: ClientModel,
+    started: Instant,
+    wall_time_epoch_ns: u64,
+    next_tick: u64,
+}
+
+impl SimulationState {
+    fn new(now: Instant) -> Self {
+        Self {
+            model: ClientModel {
+                connection: "simulation mode · no sensors required".to_owned(),
+                ..ClientModel::default()
+            },
+            started: now,
+            wall_time_epoch_ns: unix_time_ns(),
+            next_tick: 0,
+        }
+    }
+
+    fn restart(&mut self, now: Instant) {
+        *self = Self::new(now);
+    }
+
+    fn update(&mut self, now: Instant) -> Option<f64> {
+        let elapsed_tick =
+            now.duration_since(self.started).as_nanos() / SIMULATION_SAMPLE_INTERVAL.as_nanos();
+        let elapsed_tick = elapsed_tick.min(u128::from(u64::MAX)) as u64;
+        if self.next_tick > elapsed_tick {
+            return None;
+        }
+
+        let first_tick = self
+            .next_tick
+            .max(elapsed_tick.saturating_sub(SIMULATION_CATCH_UP_SAMPLES - 1));
+        let mut latest_force = None;
+        for tick in first_tick..=elapsed_tick {
+            let monotonic_time_ns = tick.saturating_mul(100_000_000);
+            let seconds = monotonic_time_ns as f64 / 1_000_000_000.0;
+            let values = simulated_values(seconds);
+            let mut samples = vec![simulated_sample(
+                StreamKind::RespirationForce,
+                tick.saturating_add(1),
+                monotonic_time_ns,
+                self.wall_time_epoch_ns,
+                values.respiration_force,
+                "device",
+            )];
+            latest_force = Some(values.respiration_force);
+            if tick.is_multiple_of(10) {
+                let heart_sequence = tick / 10 + 1;
+                samples.extend([
+                    simulated_sample(
+                        StreamKind::HeartRate,
+                        heart_sequence,
+                        monotonic_time_ns,
+                        self.wall_time_epoch_ns,
+                        values.heart_rate_bpm,
+                        "bpm",
+                    ),
+                    simulated_sample(
+                        StreamKind::RrInterval,
+                        heart_sequence,
+                        monotonic_time_ns,
+                        self.wall_time_epoch_ns,
+                        values.rr_interval_us,
+                        "us",
+                    ),
+                ]);
+            }
+            self.model.apply_batch(SampleBatch {
+                samples,
+                gaps: Vec::new(),
+                service_batch_sequence: tick.saturating_add(1),
+            });
+        }
+        self.next_tick = elapsed_tick.saturating_add(1);
+        latest_force
+    }
+}
+
+fn simulated_sample(
+    stream: StreamKind,
+    sequence: u64,
+    monotonic_time_ns: u64,
+    wall_time_epoch_ns: u64,
+    value: f64,
+    unit: &str,
+) -> Sample {
+    Sample {
+        stream: stream as i32,
+        source_id: "simulated:in-app".to_owned(),
+        sequence,
+        monotonic_time_ns,
+        wall_time_unix_ns: wall_time_epoch_ns.saturating_add(monotonic_time_ns),
+        device_time_ns: None,
+        value,
+        unit: unit.to_owned(),
+        quality_flags: quality::SIMULATED,
+    }
+}
+
+fn unix_time_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug)]
 struct BreathKasinaState {
     raw_force: Option<f64>,
     low_force: f64,
@@ -485,6 +611,7 @@ struct KasinaApp {
     network_thread: Option<JoinHandle<()>>,
     ui_dropped_batches: Arc<AtomicU64>,
     model: ClientModel,
+    simulation: SimulationState,
     breath_kasina: BreathKasinaState,
     settings: AppSettings,
     settings_path: PathBuf,
@@ -626,6 +753,7 @@ impl KasinaApp {
             network_thread,
             ui_dropped_batches,
             model: ClientModel::default(),
+            simulation: SimulationState::new(now),
             breath_kasina: BreathKasinaState::new(now),
             settings,
             settings_path,
@@ -665,9 +793,11 @@ impl KasinaApp {
                 ClientEvent::ServiceInfo(info) => self.model.service_info = Some(info),
                 ClientEvent::Status(status) => self.model.status = Some(status),
                 ClientEvent::Samples(batch) => {
-                    for sample in &batch.samples {
-                        if sample.stream == StreamKind::RespirationForce as i32 {
-                            self.breath_kasina.observe(sample.value);
+                    if !self.settings.simulation_mode {
+                        for sample in &batch.samples {
+                            if sample.stream == StreamKind::RespirationForce as i32 {
+                                self.breath_kasina.observe(sample.value);
+                            }
                         }
                     }
                     self.model.apply_batch(batch);
@@ -676,19 +806,69 @@ impl KasinaApp {
         }
     }
 
+    fn active_model(&self) -> &ClientModel {
+        if self.settings.simulation_mode {
+            &self.simulation.model
+        } else {
+            &self.model
+        }
+    }
+
+    fn update_simulation(&mut self, now: Instant) {
+        if self.settings.simulation_mode
+            && let Some(force) = self.simulation.update(now)
+        {
+            self.breath_kasina.observe(force);
+        }
+    }
+
+    fn set_simulation_mode(&mut self, enabled: bool, now: Instant) {
+        if self.settings.simulation_mode == enabled {
+            return;
+        }
+        self.settings.simulation_mode = enabled;
+        self.breath_kasina.reset();
+        if enabled {
+            self.simulation.restart(now);
+            self.update_simulation(now);
+        } else {
+            let recent_force: Vec<_> = self
+                .model
+                .samples
+                .get(&(StreamKind::RespirationForce as i32))
+                .into_iter()
+                .flatten()
+                .rev()
+                .take(120)
+                .map(|sample| sample.value)
+                .collect();
+            for force in recent_force.into_iter().rev() {
+                self.breath_kasina.observe(force);
+            }
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let model = self.active_model();
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("newKasina");
                 ui.separator();
-                ui.label(&self.model.connection);
+                if self.settings.simulation_mode {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(245, 190, 70),
+                        "SIMULATION · no sensors required",
+                    );
+                } else {
+                    ui.label(&model.connection);
+                }
                 ui.separator();
-                metric_label(ui, "HR", self.model.latest(StreamKind::HeartRate), 1.0);
-                metric_label(ui, "RR", self.model.latest(StreamKind::RrInterval), 0.001);
+                metric_label(ui, "HR", model.latest(StreamKind::HeartRate), 1.0);
+                metric_label(ui, "RR", model.latest(StreamKind::RrInterval), 0.001);
                 metric_label(
                     ui,
                     "Breath",
-                    self.model.latest(StreamKind::RespirationForce),
+                    model.latest(StreamKind::RespirationForce),
                     1.0,
                 );
             });
@@ -728,8 +908,13 @@ impl KasinaApp {
     }
 
     fn dashboard(&self, ui: &mut egui::Ui) {
+        let model = self.active_model();
         ui.heading("Live biofeedback");
-        ui.label("Sensor acquisition stays in kasina-service when this window closes.");
+        ui.label(if self.settings.simulation_mode {
+            "Displaying deterministic synthetic signals generated inside the app."
+        } else {
+            "Sensor acquisition stays in kasina-service when this window closes."
+        });
         ui.add_space(12.0);
         egui::Grid::new("summary_grid")
             .striped(true)
@@ -739,7 +924,7 @@ impl KasinaApp {
                 ui.end_row();
                 ui.strong("Service instance");
                 ui.label(
-                    self.model
+                    model
                         .service_info
                         .as_ref()
                         .map_or("—", |info| info.instance_id.as_str()),
@@ -747,7 +932,7 @@ impl KasinaApp {
                 ui.end_row();
                 ui.strong("Retained UI samples");
                 ui.label(
-                    self.model
+                    model
                         .samples
                         .values()
                         .map(VecDeque::len)
@@ -760,36 +945,37 @@ impl KasinaApp {
         draw_signal(
             ui,
             "Respiration force",
-            self.model
-                .samples
-                .get(&(StreamKind::RespirationForce as i32)),
+            model.samples.get(&(StreamKind::RespirationForce as i32)),
             egui::Color32::from_rgb(80, 190, 220),
             220.0,
         );
     }
 
     fn raw_signals(&self, ui: &mut egui::Ui) {
-        ui.heading("Raw service streams");
+        let model = self.active_model();
+        ui.heading(if self.settings.simulation_mode {
+            "Simulated streams"
+        } else {
+            "Raw service streams"
+        });
         draw_signal(
             ui,
             "Respiration force",
-            self.model
-                .samples
-                .get(&(StreamKind::RespirationForce as i32)),
+            model.samples.get(&(StreamKind::RespirationForce as i32)),
             egui::Color32::from_rgb(80, 190, 220),
             210.0,
         );
         draw_signal(
             ui,
             "Heart rate",
-            self.model.samples.get(&(StreamKind::HeartRate as i32)),
+            model.samples.get(&(StreamKind::HeartRate as i32)),
             egui::Color32::from_rgb(230, 92, 116),
             160.0,
         );
         draw_signal(
             ui,
             "RR interval",
-            self.model.samples.get(&(StreamKind::RrInterval as i32)),
+            model.samples.get(&(StreamKind::RrInterval as i32)),
             egui::Color32::from_rgb(210, 160, 90),
             160.0,
         );
@@ -884,6 +1070,25 @@ impl KasinaApp {
         ui.add_space(12.0);
 
         let mut changed = false;
+        ui.heading("Data source");
+        let mut simulation_mode = self.settings.simulation_mode;
+        if ui
+            .checkbox(
+                &mut simulation_mode,
+                "Simulation mode (no wearable devices required)",
+            )
+            .changed()
+        {
+            self.set_simulation_mode(simulation_mode, Instant::now());
+            changed = true;
+        }
+        ui.label(
+            "Generates a regular 10-second breathing wave at 10 Hz, plus heart rate and RR intervals at 1 Hz. The measurement service keeps running unchanged.",
+        );
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(12.0);
+
         ui.heading("Visible tabs");
         ui.label("Choose the tools that appear in the left tab bar.");
         egui::Grid::new("visible_tabs_settings")
@@ -1085,7 +1290,7 @@ impl KasinaApp {
             );
         });
         let respiration = self
-            .model
+            .active_model()
             .latest(StreamKind::RespirationForce)
             .map_or(0.5, |sample| {
                 ((sample.value - 25.0) / 50.0).clamp(0.0, 1.0) as f32
@@ -1150,6 +1355,15 @@ impl KasinaApp {
             .striped(true)
             .num_columns(2)
             .show(ui, |ui| {
+                diagnostic_row(
+                    ui,
+                    "Displayed data source",
+                    if self.settings.simulation_mode {
+                        "in-app simulation"
+                    } else {
+                        "measurement service"
+                    },
+                );
                 diagnostic_row(ui, "Connection", &self.model.connection);
                 diagnostic_row(
                     ui,
@@ -1402,12 +1616,15 @@ impl KasinaApp {
 impl eframe::App for KasinaApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.update_simulation(Instant::now());
         if context.input(|input| input.key_pressed(egui::Key::F11)) {
             self.fullscreen = !self.fullscreen;
             context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
         let viewport_visible = context.input(|input| input.viewport().visible());
-        if let Some(interval) = animation_repaint_interval(self.view, viewport_visible) {
+        if let Some(interval) =
+            repaint_interval(self.view, viewport_visible, self.settings.simulation_mode)
+        {
             context.request_repaint_after(interval);
         }
         self.poll_benchmark_writer(context);
@@ -1821,27 +2038,61 @@ mod tests {
     }
 
     #[test]
-    fn continuous_animation_requires_a_visible_animated_view() {
+    fn repaint_cadence_tracks_animation_simulation_and_visibility() {
         assert_eq!(
-            animation_repaint_interval(View::BreathKasina, Some(true)),
+            repaint_interval(View::BreathKasina, Some(true), false),
             Some(ANIMATION_INTERVAL)
         );
         assert_eq!(
-            animation_repaint_interval(View::Visualizer, Some(true)),
+            repaint_interval(View::Visualizer, Some(true), true),
             Some(ANIMATION_INTERVAL)
         );
         assert_eq!(
-            animation_repaint_interval(View::Visualizer, None),
+            repaint_interval(View::Visualizer, None, false),
             Some(ANIMATION_INTERVAL)
         );
+        assert_eq!(repaint_interval(View::Visualizer, Some(false), true), None);
+        assert_eq!(repaint_interval(View::Dashboard, Some(true), false), None);
         assert_eq!(
-            animation_repaint_interval(View::Visualizer, Some(false)),
-            None
+            repaint_interval(View::Dashboard, Some(true), true),
+            Some(SIMULATION_SAMPLE_INTERVAL)
         );
+    }
+
+    #[test]
+    fn in_app_simulation_generates_sequenced_breath_heart_and_rr_streams() {
+        let started = Instant::now();
+        let mut simulation = SimulationState::new(started);
+        simulation.update(started).unwrap();
+        simulation
+            .update(started + Duration::from_millis(1_000))
+            .unwrap();
+
+        let respiration = simulation
+            .model
+            .samples
+            .get(&(StreamKind::RespirationForce as i32))
+            .unwrap();
+        let heart_rate = simulation
+            .model
+            .samples
+            .get(&(StreamKind::HeartRate as i32))
+            .unwrap();
+        let rr = simulation
+            .model
+            .samples
+            .get(&(StreamKind::RrInterval as i32))
+            .unwrap();
+        assert_eq!(respiration.len(), 11);
+        assert_eq!(heart_rate.len(), 2);
+        assert_eq!(rr.len(), 2);
+        assert_eq!(respiration.back().unwrap().sequence, 11);
+        assert_eq!(heart_rate.back().unwrap().sequence, 2);
         assert_eq!(
-            animation_repaint_interval(View::Dashboard, Some(true)),
-            None
+            respiration.back().unwrap().quality_flags,
+            quality::SIMULATED
         );
+        assert_eq!(respiration.back().unwrap().source_id, "simulated:in-app");
     }
 
     #[test]

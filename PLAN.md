@@ -97,6 +97,14 @@ Do not mark a milestone complete until its exit criteria pass.
   writes are coalesced on a background thread and replace the settings file safely. The
   default interface exposes only Breath kasina and the unhideable Settings tab. Three
   editable presets ship by default, and users can add, rename, select, and remove presets.
+- In-app simulation mode, 2026-08-13: a persistent Settings toggle switches displayed
+  input between the live service and a separate local synthetic model without restarting
+  or reconfiguring acquisition. The shared deterministic generator produces a harmonic
+  ten-second respiration cycle at 10 Hz and respiration-modulated heart-rate/RR values at
+  1 Hz, with simulated quality flags, independent sequences, and timestamped histories.
+  The top bar and data views label simulated input explicitly; switching back recalibrates
+  the breath kasina from retained live force samples. Hidden windows remain event-driven,
+  and non-animated views repaint only at the simulation sample cadence.
 
 ## 1. Objective
 

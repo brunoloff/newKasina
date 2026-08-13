@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, bail};
 use kasina_render::{KasinaVisual, LuminousMandala};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 1;
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -76,6 +76,7 @@ pub(crate) struct KasinaPreset {
 #[serde(default)]
 pub(crate) struct AppSettings {
     pub schema_version: u32,
+    pub simulation_mode: bool,
     pub visible_tabs: TabVisibility,
     pub active_preset_id: u64,
     pub next_preset_id: u64,
@@ -180,6 +181,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             schema_version: SETTINGS_SCHEMA_VERSION,
+            simulation_mode: false,
             visible_tabs: TabVisibility::default(),
             active_preset_id: 1,
             next_preset_id: 4,
@@ -327,6 +329,7 @@ mod tests {
     fn defaults_show_only_breath_and_have_three_presets() {
         let settings = AppSettings::default();
         assert!(settings.visible_tabs.breath_kasina);
+        assert!(!settings.simulation_mode);
         assert!(!settings.visible_tabs.dashboard);
         assert!(!settings.visible_tabs.raw_signals);
         assert_eq!(settings.presets.len(), 3);
@@ -387,5 +390,18 @@ mod tests {
         let loaded = AppSettings::load(&path).unwrap();
         assert!(loaded.visible_tabs.diagnostics);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schema_one_settings_migrate_with_simulation_disabled() {
+        let encoded = serde_json::to_value(AppSettings::default()).unwrap();
+        let mut object = encoded.as_object().unwrap().clone();
+        object.insert("schema_version".to_owned(), serde_json::json!(1));
+        object.remove("simulation_mode");
+        let old_settings: AppSettings = serde_json::from_value(object.into()).unwrap();
+        let migrated = old_settings.sanitized();
+
+        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert!(!migrated.simulation_mode);
     }
 }

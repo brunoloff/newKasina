@@ -44,6 +44,11 @@ Then start the client:
 cargo run --release -p kasina-app
 ```
 
+To test the interface without wearing or powering either device, open **Settings** and
+enable **Simulation mode**. The app then displays locally generated respiration at 10 Hz
+and matching heart-rate/RR samples at 1 Hz. The persistent service is left untouched, and
+disabling simulation returns the UI to live device data immediately.
+
 The service binds only to `127.0.0.1:18861`. Its per-user authentication token is created
 in the operating system's standard configuration directory.
 

@@ -186,6 +186,34 @@ pub struct SimulatedDriver {
     sample_period: Duration,
 }
 
+/// One deterministic set of synthetic biofeedback values at a point in time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimulatedValues {
+    /// Respiration-belt force in device-like units.
+    pub respiration_force: f64,
+    /// Heart rate in beats per minute.
+    pub heart_rate_bpm: f64,
+    /// RR interval in microseconds.
+    pub rr_interval_us: f64,
+}
+
+/// Generate regular, physiologically plausible test input without any sensor hardware.
+///
+/// The small harmonics prevent plots from looking mathematically perfect while keeping
+/// the output deterministic and repeatable in tests.
+#[must_use]
+pub fn simulated_values(seconds: f64) -> SimulatedValues {
+    let breath_phase = seconds * std::f64::consts::TAU / 10.0;
+    let respiration_force = 50.0 + breath_phase.sin() * 22.0 + (breath_phase * 3.0).sin() * 1.5;
+    let heart_rate_bpm =
+        66.0 + breath_phase.sin() * 5.5 + (seconds * std::f64::consts::TAU / 37.0).sin() * 0.8;
+    SimulatedValues {
+        respiration_force,
+        heart_rate_bpm,
+        rr_interval_us: 60_000_000.0 / heart_rate_bpm,
+    }
+}
+
 impl Default for SimulatedDriver {
     fn default() -> Self {
         Self {
@@ -246,25 +274,21 @@ impl SensorDriver for SimulatedDriver {
                 () = cancellation.cancelled() => break,
                 _ = ticker.tick() => {
                     let seconds = started.elapsed().as_secs_f64();
-                    let breath_phase = seconds * std::f64::consts::TAU / 10.0;
-                    let respiratory_force = 50.0 + breath_phase.sin() * 22.0
-                        + (breath_phase * 3.0).sin() * 1.5;
+                    let values = simulated_values(seconds);
                     if !send_driver_event(&sender, &cancellation, DriverEvent::Measurement {
                         stream: StreamKind::RespirationForce,
                         source_id: source_id.clone(),
                         device_time_ns: None,
-                        value: respiratory_force,
+                        value: values.respiration_force,
                         quality_flags: quality::SIMULATED,
                     }).await? {
                         break 'simulation;
                     }
 
                     if tick.is_multiple_of(10) {
-                        let bpm = 66.0 + breath_phase.sin() * 5.5;
-                        let rr_us = 60_000_000.0 / bpm;
                         for (stream, value) in [
-                            (StreamKind::HeartRate, bpm),
-                            (StreamKind::RrInterval, rr_us),
+                            (StreamKind::HeartRate, values.heart_rate_bpm),
+                            (StreamKind::RrInterval, values.rr_interval_us),
                         ] {
                             if !send_driver_event(&sender, &cancellation, DriverEvent::Measurement {
                                 stream,
@@ -375,6 +399,20 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn simulated_values_are_regular_bounded_and_rr_consistent() {
+        let start = simulated_values(0.0);
+        let inhale_peak = simulated_values(2.5);
+        let full_cycle = simulated_values(10.0);
+
+        assert!(inhale_peak.respiration_force > start.respiration_force + 20.0);
+        assert!((full_cycle.respiration_force - start.respiration_force).abs() < 0.001);
+        for values in [start, inhale_peak, full_cycle] {
+            assert!((55.0..=78.0).contains(&values.heart_rate_bpm));
+            assert!((values.rr_interval_us - 60_000_000.0 / values.heart_rate_bpm).abs() < 0.001);
+        }
+    }
 
     #[test]
     fn parses_json_lines_fixture() {
