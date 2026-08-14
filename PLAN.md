@@ -117,6 +117,19 @@ Do not mark a milestone complete until its exit criteria pass.
   recovery; an authenticated tonic loopback test records real simulated acquisition and
   verifies respiration, heart-rate, and RR data on disk. Replay through the future analysis
   pipeline, settings snapshots, gap events, browsing/export UI, and audio remain.
+- Desktop service tray, 2026-08-14: `kasina-service` now defaults to a native system-tray
+  host while preserving `--headless` for soak tests, SSH, and service managers. A compact
+  generated icon places independent traffic lights beside heart and breath glyphs; live
+  device state maps connected to green, discovery/reconnect to amber, disconnected/error
+  to red, and an absent service/device to gray. The dynamic menu reports service uptime,
+  clients, device detail/sample age/retries, recording state/counts/drops, and the latest
+  action. It can start/stop and durably finalize a recording, start/stop the measurement
+  runtime without closing the tray, launch the client, open recordings, or cleanly quit.
+  Pure icon/status tests and warning-free Linux/Windows-target builds pass. A native KDE
+  Wayland smoke registered a StatusNotifierItem, verified the full D-Bus menu, recorded
+  and finalized 274 simulated respiration/HR/RR samples with zero drops, restarted the
+  server from the menu, then removed both listener and tray cleanly. Packaging/autostart
+  installation and native Windows/macOS interaction remain Milestone 6 work.
 
 ## 1. Objective
 

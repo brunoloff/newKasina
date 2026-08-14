@@ -1,3 +1,5 @@
+mod tray;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,9 +17,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(about = "Persistent newKasina sensor acquisition service")]
 struct Args {
+    /// Run without a system tray (for servers, tests, and soak scripts).
+    #[arg(long)]
+    headless: bool,
     /// Loopback TCP port.
     #[arg(long, default_value_t = DEFAULT_PORT)]
     port: u16,
@@ -66,14 +71,37 @@ fn go_direct_driver(target_id: Option<&str>) -> GoDirectDriver {
     target_id.map_or_else(GoDirectDriver::default, GoDirectDriver::with_target_id)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
     let args = Args::parse();
+    if args.headless {
+        run_service_thread(args, CancellationToken::new(), None)
+    } else {
+        tray::run(args)
+    }
+}
+
+pub(crate) fn run_service_thread(
+    args: Args,
+    cancellation: CancellationToken,
+    bridge: Option<tray::ServiceBridge>,
+) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create service Tokio runtime")?;
+    runtime.block_on(run_service(args, cancellation, bridge))
+}
+
+async fn run_service(
+    args: Args,
+    cancellation: CancellationToken,
+    bridge: Option<tray::ServiceBridge>,
+) -> Result<()> {
     let defaults = ServicePaths::for_user()?;
     let token_path = args.token_path.unwrap_or(defaults.token);
     let lock_path = args.lock_path.unwrap_or(defaults.lock);
@@ -99,29 +127,14 @@ async fn main() -> Result<()> {
         descriptors,
         recordings_dir.clone(),
     )?;
-    let cancellation = CancellationToken::new();
-    let acquisitions = drivers
-        .into_iter()
-        .map(|driver| {
-            tokio::spawn(Arc::clone(&state).run_driver(driver, cancellation.child_token()))
-        })
-        .collect::<Vec<_>>();
-    let diagnostics_cancellation = CancellationToken::new();
-    let diagnostics = args.diagnostics_jsonl.map(|path| {
-        let diagnostics_state = Arc::clone(&state);
-        let diagnostics_cancel = diagnostics_cancellation.child_token();
-        let interval = Duration::from_secs(args.diagnostics_interval_seconds);
-        tokio::spawn(async move {
-            let result =
-                write_diagnostics_jsonl(diagnostics_state, path, interval, diagnostics_cancel)
-                    .await;
-            if let Err(error) = &result {
-                error!(%error, "diagnostics writer stopped");
-            }
-            result
-        })
-    });
     let listener = bind_loopback(args.port).await?;
+    if let Some(bridge) = &bridge {
+        bridge.install(
+            Arc::clone(&state),
+            tokio::runtime::Handle::current(),
+            recordings_dir.clone(),
+        );
+    }
     info!(
         address = %listener.local_addr()?,
         token_path = %token_path.display(),
@@ -129,36 +142,70 @@ async fn main() -> Result<()> {
         "kasina-service ready"
     );
 
-    let shutdown = cancellation.clone();
-    tokio::spawn(async move {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            error!(%error, "failed to install Ctrl+C handler");
-        }
-        shutdown.cancel();
-    });
+    let service_result = async {
+        let acquisitions = drivers
+            .into_iter()
+            .map(|driver| {
+                tokio::spawn(Arc::clone(&state).run_driver(driver, cancellation.child_token()))
+            })
+            .collect::<Vec<_>>();
+        let diagnostics_cancellation = CancellationToken::new();
+        let diagnostics = args.diagnostics_jsonl.map(|path| {
+            let diagnostics_state = Arc::clone(&state);
+            let diagnostics_cancel = diagnostics_cancellation.child_token();
+            let interval = Duration::from_secs(args.diagnostics_interval_seconds);
+            tokio::spawn(async move {
+                let result =
+                    write_diagnostics_jsonl(diagnostics_state, path, interval, diagnostics_cancel)
+                        .await;
+                if let Err(error) = &result {
+                    error!(%error, "diagnostics writer stopped");
+                }
+                result
+            })
+        });
 
-    let server_result = serve(listener, KasinaRpc::new(state, token), cancellation.clone()).await;
-    cancellation.cancel();
-    let mut acquisition_result = Ok(());
-    for acquisition in acquisitions {
-        let result = acquisition
-            .await
-            .context("acquisition task panicked")
-            .and_then(|result| result);
-        if acquisition_result.is_ok() {
-            acquisition_result = result;
+        let shutdown = cancellation.clone();
+        tokio::spawn(async move {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                error!(%error, "failed to install Ctrl+C handler");
+            }
+            shutdown.cancel();
+        });
+
+        let server_result = serve(
+            listener,
+            KasinaRpc::new(Arc::clone(&state), token),
+            cancellation.clone(),
+        )
+        .await;
+        cancellation.cancel();
+        let mut acquisition_result = Ok(());
+        for acquisition in acquisitions {
+            let result = acquisition
+                .await
+                .context("acquisition task panicked")
+                .and_then(|result| result);
+            if acquisition_result.is_ok() {
+                acquisition_result = result;
+            }
         }
+        diagnostics_cancellation.cancel();
+        let diagnostics_result = if let Some(diagnostics) = diagnostics {
+            diagnostics
+                .await
+                .context("diagnostics task panicked")
+                .and_then(|result| result)
+        } else {
+            Ok(())
+        };
+        acquisition_result?;
+        diagnostics_result?;
+        server_result
     }
-    diagnostics_cancellation.cancel();
-    let diagnostics_result = if let Some(diagnostics) = diagnostics {
-        diagnostics
-            .await
-            .context("diagnostics task panicked")
-            .and_then(|result| result)
-    } else {
-        Ok(())
-    };
-    acquisition_result?;
-    diagnostics_result?;
-    server_result
+    .await;
+    if let Some(bridge) = &bridge {
+        bridge.clear(&state);
+    }
+    service_result
 }

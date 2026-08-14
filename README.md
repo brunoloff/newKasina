@@ -10,8 +10,9 @@ architecture, milestones, exit criteria, and current evidence.
 ## Development prerequisites
 
 The Linux build needs a current stable Rust toolchain, pkg-config, D-Bus/BlueZ development
-files, Wayland/X11 development files, ALSA, and a working Vulkan or OpenGL driver. Windows
-uses the MSVC Rust target and Windows SDK. macOS uses the Xcode command-line tools.
+files, Wayland/X11 development files, GTK 3 plus AppIndicator development files, ALSA,
+and a working Vulkan or OpenGL driver. Windows uses the MSVC Rust target and Windows SDK.
+macOS uses the Xcode command-line tools.
 
 No physical sensors are required for development: the service defaults to deterministic
 simulated Polar and respiration data.
@@ -32,11 +33,24 @@ Plain `cargo` works normally if a shared Cargo cache is preferred.
 
 ## Run
 
-Start the persistent service in one terminal:
+Start the persistent service and its system-tray host in one terminal:
 
 ```sh
 cargo run --release -p kasina-service
 ```
+
+For both physical devices, use:
+
+```sh
+cargo run --release -p kasina-service -- --source hardware
+```
+
+The tray icon has a heart and breath glyph with independent connection lights: green is
+connected, amber is connecting/reconnecting, red is disconnected/error, and gray means
+the device or service is off. Its menu shows live details and recording status, and can
+start/stop recording, start/stop the measurement runtime, launch the client, open the
+recordings directory, or cleanly quit. On Linux panels the AppIndicator backend may open
+the same menu from either mouse button. See [docs/system-tray.md](docs/system-tray.md).
 
 Then start the client:
 
@@ -80,16 +94,38 @@ toggle off while recording.
 The service binds only to `127.0.0.1:18861`. Its per-user authentication token is created
 in the operating system's standard configuration directory.
 
-The default is a deterministic dual-stream simulator. When both physical devices are
-available, select the independently reconnecting hardware drivers with:
+The default is a deterministic dual-stream simulator. For SSH, systemd, tests, or another
+environment without a graphical desktop, retain the old terminal-only behavior with
+`--headless`:
 
 ```sh
-cargo run --release -p kasina-service -- --source hardware
+cargo run --release -p kasina-service -- --headless --source hardware
 ```
 
 `--source polar` and `--source go-direct` run one hardware driver for focused testing.
 After the first discovery, `--polar-id ID` and `--go-direct-id ID` prefer saved platform
 peripheral identifiers while retaining advertised-name/service fallback discovery.
+
+After a release build, run the tray directly with:
+
+```sh
+./target/release/kasina-service --source hardware
+```
+
+To expose that build as a system command, `/usr/local/bin` is the conventional location:
+
+```sh
+sudo ln -sfn /home/bruno/Crapbox/Repositories/newKasina/target/release/kasina-service \
+  /usr/local/bin/kasina-service
+kasina-service --source hardware
+```
+
+If `/usr/bin` is specifically required, use the same link there instead:
+
+```sh
+sudo ln -sfn /home/bruno/Crapbox/Repositories/newKasina/target/release/kasina-service \
+  /usr/bin/kasina-service
+```
 
 For an eight-hour dual-device Linux soak with append-only diagnostics every ten seconds:
 

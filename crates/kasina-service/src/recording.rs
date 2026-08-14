@@ -917,6 +917,41 @@ mod tests {
         assert_eq!(listed[0].session_id, stopped.session_id);
     }
 
+    #[tokio::test]
+    async fn clean_manager_shutdown_finalizes_an_active_recording() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manager = RecordingManager::new(temporary.path().join("sessions")).unwrap();
+        let active = manager
+            .start(
+                "Shutdown test".to_owned(),
+                String::new(),
+                "service-instance".to_owned(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        manager.record(Sample::new(
+            StreamKind::HeartRate,
+            "simulated:test",
+            1,
+            100,
+            1_000,
+            64.0,
+        ));
+        drop(manager);
+
+        let metadata: SessionMetadata = serde_json::from_reader(
+            File::open(Path::new(&active.directory).join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata.state, SessionState::Completed);
+        assert_eq!(metadata.sample_count, 1);
+        assert_eq!(
+            metadata.detail,
+            "recording stopped during clean service shutdown"
+        );
+    }
+
     #[test]
     fn interrupted_recording_recovers_complete_lines_and_ignores_truncated_tail() {
         let temporary = tempfile::tempdir().unwrap();

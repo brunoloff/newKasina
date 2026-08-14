@@ -23,6 +23,7 @@ timeout \
     --kill-after=30s \
     "$duration" \
     target/release/kasina-service \
+    --headless \
     --source hardware \
     --diagnostics-jsonl "$output_path" \
     --diagnostics-interval-seconds "$interval_seconds" \

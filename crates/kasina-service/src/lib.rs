@@ -370,7 +370,9 @@ impl ServiceState {
         driver_result
     }
 
-    fn status_snapshot(&self) -> StatusSnapshot {
+    /// Return the current device, stream, client, and recording status.
+    #[must_use]
+    pub fn status_snapshot(&self) -> StatusSnapshot {
         let uptime = self.started.elapsed();
         let now_ns = uptime.as_nanos().min(u128::from(u64::MAX)) as u64;
         let buffers = self.buffers.read();
@@ -405,6 +407,35 @@ impl ServiceState {
             transport_lagged_samples: self.transport_lagged_samples.load(Ordering::Relaxed),
             recording: Some(proto_recording(self.recording.snapshot())),
         }
+    }
+
+    /// Start a service-owned recording without going through the RPC transport.
+    ///
+    /// This is used by the system-tray host running in the same process. Remote callers
+    /// still pass through the authenticated RPC implementation.
+    pub async fn start_recording(
+        &self,
+        label: String,
+        notes: String,
+    ) -> std::result::Result<RecordingStatus, String> {
+        if label.trim().is_empty() {
+            return Err("recording label cannot be empty".to_owned());
+        }
+        let devices = self
+            .devices
+            .read()
+            .values()
+            .map(|runtime| runtime.descriptor.clone())
+            .collect();
+        self.recording
+            .start(label, notes, self.instance_id.clone(), devices)
+            .await
+            .map(proto_recording)
+    }
+
+    /// Stop and durably finalize the active service-owned recording.
+    pub async fn stop_recording(&self) -> std::result::Result<RecordingStatus, String> {
+        self.recording.stop().await.map(proto_recording)
     }
 
     /// Produce a stable serializable health snapshot for soak-test logging.
@@ -901,28 +932,18 @@ impl Kasina for KasinaRpc {
         self.authorize(&request)?;
         Self::check_hello(request.get_ref().client.as_ref())?;
         let command = request.into_inner();
-        if command.label.trim().is_empty() {
-            return Err(Status::invalid_argument("recording label cannot be empty"));
-        }
-        let devices = self
-            .state
-            .devices
-            .read()
-            .values()
-            .map(|runtime| runtime.descriptor.clone())
-            .collect();
         let snapshot = self
             .state
-            .recording
-            .start(
-                command.label,
-                command.notes,
-                self.state.instance_id.clone(),
-                devices,
-            )
+            .start_recording(command.label, command.notes)
             .await
-            .map_err(Status::failed_precondition)?;
-        Ok(Response::new(proto_recording(snapshot)))
+            .map_err(|error| {
+                if error == "recording label cannot be empty" {
+                    Status::invalid_argument(error)
+                } else {
+                    Status::failed_precondition(error)
+                }
+            })?;
+        Ok(Response::new(snapshot))
     }
 
     async fn stop_recording(
@@ -933,11 +954,10 @@ impl Kasina for KasinaRpc {
         Self::check_hello(request.get_ref().client.as_ref())?;
         let snapshot = self
             .state
-            .recording
-            .stop()
+            .stop_recording()
             .await
             .map_err(Status::failed_precondition)?;
-        Ok(Response::new(proto_recording(snapshot)))
+        Ok(Response::new(snapshot))
     }
 
     async fn get_recording_status(
