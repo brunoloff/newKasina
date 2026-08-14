@@ -128,8 +128,10 @@ Do not mark a milestone complete until its exit criteria pass.
   Pure icon/status tests and warning-free Linux/Windows-target builds pass. A native KDE
   Wayland smoke registered a StatusNotifierItem, verified the full D-Bus menu, recorded
   and finalized 274 simulated respiration/HR/RR samples with zero drops, restarted the
-  server from the menu, then removed both listener and tray cleanly. Packaging/autostart
-  installation and native Windows/macOS interaction remain Milestone 6 work.
+  server from the menu, then removed both listener and tray cleanly. Per-user KDE desktop
+  entries and scalable app/service icons now install through a validated, idempotent
+  helper and point directly at the release binaries. Distributable packages, autostart
+  integration, and native Windows/macOS interaction remain Milestone 6 work.
 
 ## 1. Objective
 

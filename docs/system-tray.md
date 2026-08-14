@@ -67,6 +67,22 @@ Use headless mode when no desktop session is present:
 
 The hardware-soak helper automatically selects headless mode.
 
+## KDE application launcher
+
+Build the release binaries, then register both the tray service and desktop client in the
+current user's application menu:
+
+```sh
+scripts/cargo-local build --workspace --release
+scripts/install-desktop-launchers
+```
+
+No root access is required. The installer puts desktop entries in
+`~/.local/share/applications`, scalable icons in the user's hicolor icon theme, refreshes
+the available desktop/icon caches, and points the entries directly at this checkout's
+release binaries. **newKasina Sensor Service** starts `--source hardware`; **newKasina**
+starts the client. Rerun the installer after moving the checkout.
+
 ## Command link
 
 The standard location for locally built administrator-installed commands is

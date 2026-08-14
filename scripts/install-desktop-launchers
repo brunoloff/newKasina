@@ -1,0 +1,74 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+project_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
+data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
+applications_dir="$data_home/applications"
+icons_dir="$data_home/icons/hicolor/scalable/apps"
+packaging_dir="$project_dir/packaging/linux"
+app_binary="$project_dir/target/release/kasina-app"
+service_binary="$project_dir/target/release/kasina-service"
+
+if [ ! -x "$app_binary" ] || [ ! -x "$service_binary" ]; then
+    printf '%s\n' "Release binaries are missing. Build them first with:" >&2
+    printf '  %s\n' "scripts/cargo-local build --workspace --release" >&2
+    exit 1
+fi
+
+case "$project_dir" in
+    *[[:space:]]*|*'|'*|*'&'*|*'"'*)
+        printf '%s\n' "The project path contains a character unsupported by this installer." >&2
+        exit 1
+        ;;
+esac
+
+install -d -m 0755 "$applications_dir" "$icons_dir"
+
+install_desktop_file() {
+    source_file=$1
+    destination_file=$2
+    executable_name=$3
+    executable_path=$4
+    temporary_file=$(mktemp --suffix=.desktop "$applications_dir/.newkasina-launcher.XXXXXX")
+    trap 'rm -f "$temporary_file"' EXIT HUP INT TERM
+    sed \
+        -e "s|^Exec=$executable_name\(.*\)$|Exec=$executable_path\\1|" \
+        -e "s|^TryExec=$executable_name$|TryExec=$executable_path|" \
+        "$source_file" > "$temporary_file"
+    desktop-file-validate "$temporary_file"
+    install -m 0644 "$temporary_file" "$destination_file"
+    rm -f "$temporary_file"
+    trap - EXIT HUP INT TERM
+}
+
+install_desktop_file \
+    "$packaging_dir/org.newkasina.NewKasina.desktop" \
+    "$applications_dir/org.newkasina.NewKasina.desktop" \
+    kasina-app \
+    "$app_binary"
+install_desktop_file \
+    "$packaging_dir/org.newkasina.NewKasina.Service.desktop" \
+    "$applications_dir/org.newkasina.NewKasina.Service.desktop" \
+    kasina-service \
+    "$service_binary"
+
+install -m 0644 \
+    "$packaging_dir/icons/org.newkasina.NewKasina.svg" \
+    "$icons_dir/org.newkasina.NewKasina.svg"
+install -m 0644 \
+    "$packaging_dir/icons/org.newkasina.NewKasina.Service.svg" \
+    "$icons_dir/org.newkasina.NewKasina.Service.svg"
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$applications_dir"
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "$data_home/icons/hicolor" >/dev/null
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 >/dev/null
+fi
+
+printf '%s\n' "Installed newKasina and newKasina Sensor Service launchers for this user."
+printf '%s\n' "They should now be available in the KDE application launcher."

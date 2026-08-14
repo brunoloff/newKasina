@@ -58,6 +58,20 @@ Then start the client:
 cargo run --release -p kasina-app
 ```
 
+### KDE application launchers
+
+After a release build, install application-menu entries and scalable icons for both the
+client and the hardware sensor service:
+
+```sh
+scripts/install-desktop-launchers
+```
+
+This is a per-user installation under `~/.local/share`; it does not need `sudo`. The
+**newKasina Sensor Service** entry starts the tray-hosted service with both physical
+device drivers, while **newKasina** opens the client. Rerun the installer if this project
+directory is moved. The tracked desktop entries and icons are under `packaging/linux`.
+
 To test the interface without wearing or powering either device, open **Settings** and
 enable **Simulation mode**. The app then displays locally generated respiration at 10 Hz
 and matching heart-rate/RR samples at 1 Hz. The persistent service is left untouched, and

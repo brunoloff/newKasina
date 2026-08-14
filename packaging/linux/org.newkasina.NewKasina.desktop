@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=newKasina
+GenericName=Biofeedback Application
+Comment=Display live respiration and heart-rate biofeedback
+Exec=kasina-app
+TryExec=kasina-app
+Icon=org.newkasina.NewKasina
+Terminal=false
+Categories=Science;
+Keywords=biofeedback;breathing;respiration;heart rate;HRV;kasina;
+StartupNotify=true

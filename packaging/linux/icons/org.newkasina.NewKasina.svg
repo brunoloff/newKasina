@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="newKasina luminous mandala">
+  <defs>
+    <radialGradient id="background" cx="50%" cy="42%" r="68%">
+      <stop offset="0" stop-color="#293b5d"/>
+      <stop offset="0.72" stop-color="#101a2c"/>
+      <stop offset="1" stop-color="#08101d"/>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="42%" r="58%">
+      <stop offset="0" stop-color="#fff5c2"/>
+      <stop offset="0.34" stop-color="#ffd56a"/>
+      <stop offset="0.72" stop-color="#ec739c"/>
+      <stop offset="1" stop-color="#7a4fc5"/>
+    </radialGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="27" fill="url(#background)"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="64" cy="64" r="47" stroke="#6fdcf2" stroke-width="2" opacity=".55"/>
+    <circle cx="64" cy="64" r="38" stroke="#9f85ed" stroke-width="2" opacity=".75"/>
+    <path d="M64 17C73 36 73 48 64 64C55 48 55 36 64 17Z" fill="#72d9ec" fill-opacity=".72" stroke="#b8f3ff"/>
+    <path d="M111 64C92 73 80 73 64 64C80 55 92 55 111 64Z" fill="#ec729d" fill-opacity=".72" stroke="#ffbed0"/>
+    <path d="M64 111C55 92 55 80 64 64C73 80 73 92 64 111Z" fill="#72d9ec" fill-opacity=".72" stroke="#b8f3ff"/>
+    <path d="M17 64C36 55 48 55 64 64C48 73 36 73 17 64Z" fill="#ec729d" fill-opacity=".72" stroke="#ffbed0"/>
+    <path d="M31 31C49 38 57 47 64 64C47 57 38 49 31 31Z" fill="#a285eb" fill-opacity=".7" stroke="#d3c5ff"/>
+    <path d="M97 31C90 49 81 57 64 64C71 47 79 38 97 31Z" fill="#a285eb" fill-opacity=".7" stroke="#d3c5ff"/>
+    <path d="M97 97C79 90 71 81 64 64C81 71 90 79 97 97Z" fill="#a285eb" fill-opacity=".7" stroke="#d3c5ff"/>
+    <path d="M31 97C38 79 47 71 64 64C57 81 49 90 31 97Z" fill="#a285eb" fill-opacity=".7" stroke="#d3c5ff"/>
+  </g>
+  <circle cx="64" cy="64" r="17" fill="url(#core)" stroke="#fff1ba" stroke-width="2"/>
+  <circle cx="59" cy="58" r="5" fill="#fff" opacity=".58"/>
+</svg>
