@@ -1375,9 +1375,14 @@ impl KasinaApp {
                             changed |= ui
                                 .add_enabled(
                                     options.rotation_enabled,
-                                    egui::Slider::new(&mut options.rotation_speed, 0.0..=0.30)
-                                        .fixed_decimals(3)
-                                        .suffix(" rad/s"),
+                                    egui::Slider::new(
+                                        &mut options.rotations_per_second,
+                                        kasina_render::MIN_ROTATIONS_PER_SECOND
+                                            ..=kasina_render::MAX_ROTATIONS_PER_SECOND,
+                                    )
+                                    .logarithmic(true)
+                                    .fixed_decimals(3)
+                                    .suffix(" rot/s"),
                                 )
                                 .changed();
                             ui.end_row();

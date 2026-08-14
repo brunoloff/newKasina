@@ -104,6 +104,11 @@ struct VisualUniforms {
 const PARTICLE_STYLE: u32 = 0;
 const BREATH_KASINA_STYLE: u32 = 1;
 
+/// Slowest selectable mandala rotation rate, in complete rotations per second.
+pub const MIN_ROTATIONS_PER_SECOND: f32 = 0.01;
+/// Fastest selectable mandala rotation rate, in complete rotations per second.
+pub const MAX_ROTATIONS_PER_SECOND: f32 = 10.0;
+
 /// CPU-side input prepared for one biofeedback draw.
 ///
 /// Construction performs all normalization needed before the callback reaches wgpu. The
@@ -200,8 +205,9 @@ pub struct LuminousMandala {
     pub maximum_radius: f32,
     /// Whether the lace pattern rotates.
     pub rotation_enabled: bool,
-    /// Rotation speed in radians per second.
-    pub rotation_speed: f32,
+    /// Rotation speed in complete rotations per second.
+    #[serde(alias = "rotation_speed")]
+    pub rotations_per_second: f32,
 }
 
 impl LuminousMandala {
@@ -214,7 +220,9 @@ impl LuminousMandala {
             self.maximum_radius = (self.minimum_radius + 0.05).min(1.00);
             self.minimum_radius = self.minimum_radius.min(self.maximum_radius - 0.05);
         }
-        self.rotation_speed = self.rotation_speed.clamp(0.0, 0.30);
+        self.rotations_per_second = self
+            .rotations_per_second
+            .clamp(MIN_ROTATIONS_PER_SECOND, MAX_ROTATIONS_PER_SECOND);
         self
     }
 }
@@ -225,7 +233,7 @@ impl Default for LuminousMandala {
             minimum_radius: 0.40,
             maximum_radius: 0.82,
             rotation_enabled: true,
-            rotation_speed: 0.055,
+            rotations_per_second: 0.05,
         }
     }
 }
@@ -241,13 +249,14 @@ impl KasinaVisual for LuminousMandala {
 
     fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame {
         let options = self.sanitized();
-        let rotation_phase = if options.rotation_enabled {
-            input.elapsed_seconds * options.rotation_speed
+        let rotation_phase_radians = if options.rotation_enabled {
+            (input.elapsed_seconds * options.rotations_per_second).rem_euclid(1.0)
+                * std::f32::consts::TAU
         } else {
             0.0
         };
         PreparedVisualFrame::breath_kasina(
-            rotation_phase,
+            rotation_phase_radians,
             input.respiration,
             input.viewport_points,
             [options.minimum_radius, options.maximum_radius],
@@ -497,6 +506,15 @@ mod tests {
     }
 
     #[test]
+    fn mandala_shader_shares_lace_rotation_and_counter_rotates_gold() {
+        let shader = include_str!("biofeedback.wgsl");
+        assert!(shader.contains("cos(lace_angle * 8.0)"));
+        assert!(shader.contains("cos(lace_angle * 12.0)"));
+        assert!(shader.contains("cos(lace_angle * 24.0)"));
+        assert!(shader.contains("sin(gold_angle * 24.0 + radius * 6.0)"));
+    }
+
+    #[test]
     fn prepared_frame_clamps_inputs_and_has_a_fixed_upload() {
         let low = PreparedVisualFrame::new(2.0, -4.0, 0, [0.0, -10.0]);
         let high = PreparedVisualFrame::new(2.0, 4.0, 100_000, [1_920.0, 1_080.0]);
@@ -531,7 +549,7 @@ mod tests {
             minimum_radius: 2.0,
             maximum_radius: -1.0,
             rotation_enabled: false,
-            rotation_speed: 4.0,
+            rotations_per_second: 40.0,
         };
         let sanitized = visual.sanitized();
         let frame = visual.prepare_frame(KasinaFrameInput {
@@ -541,7 +559,31 @@ mod tests {
         });
 
         assert!(sanitized.minimum_radius < sanitized.maximum_radius);
-        assert_eq!(sanitized.rotation_speed, 0.30);
+        assert_eq!(sanitized.rotations_per_second, MAX_ROTATIONS_PER_SECOND);
         assert_eq!(frame.uniforms.time_seconds, 0.0);
+
+        let too_slow = LuminousMandala {
+            rotations_per_second: 0.0,
+            ..LuminousMandala::default()
+        };
+        assert_eq!(
+            too_slow.sanitized().rotations_per_second,
+            MIN_ROTATIONS_PER_SECOND
+        );
+    }
+
+    #[test]
+    fn one_rotation_per_second_produces_a_quarter_turn_after_250_ms() {
+        let visual = LuminousMandala {
+            rotations_per_second: 1.0,
+            ..LuminousMandala::default()
+        };
+        let frame = visual.prepare_frame(KasinaFrameInput {
+            elapsed_seconds: 0.25,
+            respiration: 0.5,
+            viewport_points: [100.0, 100.0],
+        });
+
+        assert!((frame.uniforms.time_seconds - std::f32::consts::FRAC_PI_2).abs() < 1.0e-6);
     }
 }
