@@ -15,7 +15,8 @@ fn main() {
             8_000 + (index % 92_000) as u32,
             [1_920.0, 1_080.0],
         ));
-        checksum ^= u64::from(black_box(prepared.upload_bytes()[index as usize % 32]));
+        let upload = prepared.upload_bytes();
+        checksum ^= u64::from(black_box(upload[index as usize % upload.len()]));
         checksum ^= u64::from(black_box(prepared.instance_count()));
     }
     let elapsed = started.elapsed();
@@ -24,6 +25,11 @@ fn main() {
     println!("iterations: {ITERATIONS}");
     println!("elapsed: {:.3} ms", elapsed.as_secs_f64() * 1_000.0);
     println!("per frame: {nanoseconds_per_frame:.3} ns");
-    println!("uniform upload: 32 bytes");
+    println!(
+        "uniform upload: {} bytes",
+        PreparedVisualFrame::new(0.0, 0.5, 1, [1.0, 1.0])
+            .upload_bytes()
+            .len()
+    );
     println!("checksum: {}", black_box(checksum));
 }

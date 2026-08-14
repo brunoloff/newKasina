@@ -86,7 +86,7 @@ Do not mark a milestone complete until its exit criteria pass.
   An incremental, self-calibrating force envelope maps rising force to expansion and
   falling force to contraction, with short time-based smoothing between 10 Hz device
   samples. A retained wgpu shader draws the animated circular mandala as one analytic
-  full-screen instance with the existing fixed 32-byte uniform upload. Focused normalizer,
+  full-screen instance with the then-fixed 32-byte uniform upload. Focused normalizer,
   animation, uniform-layout, and shader-parse tests pass; a release client connected to
   the live Go Direct service without transport lag. Visual tuning remains intentionally
   open to hands-on feedback.
@@ -97,6 +97,9 @@ Do not mark a milestone complete until its exit criteria pass.
   writes are coalesced on a background thread and replace the settings file safely. The
   default interface exposes only Breath kasina and the unhideable Settings tab. Three
   editable presets ship by default, and users can add, rename, select, and remove presets.
+  Each luminous-mandala preset now carries four independent layer speeds plus a shared
+  full-expansion speed multiplier; continuous CPU-side phase integration avoids angle
+  jumps as breath-driven velocity changes, using a fixed 48-byte GPU uniform.
 - In-app simulation mode, 2026-08-13: a persistent Settings toggle switches displayed
   input between the live service and a separate local synthetic model without restarting
   or reconfiguring acquisition. The shared deterministic generator produces a harmonic

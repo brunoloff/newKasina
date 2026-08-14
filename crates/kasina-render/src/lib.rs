@@ -99,6 +99,7 @@ struct VisualUniforms {
     style: u32,
     viewport_points: [f32; 2],
     radius_range: [f32; 2],
+    layer_rotation_radians: [f32; 4],
 }
 
 const PARTICLE_STYLE: u32 = 0;
@@ -108,11 +109,15 @@ const BREATH_KASINA_STYLE: u32 = 1;
 pub const MIN_ROTATIONS_PER_SECOND: f32 = 0.01;
 /// Fastest selectable mandala rotation rate, in complete rotations per second.
 pub const MAX_ROTATIONS_PER_SECOND: f32 = 10.0;
+/// Smallest selectable full-expansion speed multiplier.
+pub const MIN_EXPANSION_SPEED_MULTIPLIER: f32 = 1.0;
+/// Largest selectable full-expansion speed multiplier.
+pub const MAX_EXPANSION_SPEED_MULTIPLIER: f32 = 10.0;
 
 /// CPU-side input prepared for one biofeedback draw.
 ///
 /// Construction performs all normalization needed before the callback reaches wgpu. The
-/// resulting uniform upload is fixed at 32 bytes regardless of the instance count.
+/// resulting uniform upload is fixed at 48 bytes regardless of the instance count.
 #[derive(Debug, Clone, Copy)]
 pub struct PreparedVisualFrame {
     uniforms: VisualUniforms,
@@ -135,24 +140,26 @@ impl PreparedVisualFrame {
                 style: PARTICLE_STYLE,
                 viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
                 radius_range: [0.0; 2],
+                layer_rotation_radians: [0.0; 4],
             },
         }
     }
 
     fn breath_kasina(
-        rotation_phase: f32,
+        layer_rotation_radians: [f32; 4],
         respiration: f32,
         viewport_points: [f32; 2],
         radius_range: [f32; 2],
     ) -> Self {
         Self {
             uniforms: VisualUniforms {
-                time_seconds: rotation_phase,
+                time_seconds: 0.0,
                 respiration: respiration.clamp(0.0, 1.0),
                 instance_count: 1,
                 style: BREATH_KASINA_STYLE,
                 viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
                 radius_range,
+                layer_rotation_radians,
             },
         }
     }
@@ -173,8 +180,8 @@ impl PreparedVisualFrame {
 /// Inputs common to every breath-driven kasina implementation.
 #[derive(Debug, Clone, Copy)]
 pub struct KasinaFrameInput {
-    /// Seconds since the application started.
-    pub elapsed_seconds: f32,
+    /// Independently integrated layer phases, in complete rotations.
+    pub layer_rotation_phases: [f32; 4],
     /// Smoothed expansion in the inclusive range zero to one.
     pub respiration: f32,
     /// Available logical viewport size.
@@ -205,9 +212,25 @@ pub struct LuminousMandala {
     pub maximum_radius: f32,
     /// Whether the lace pattern rotates.
     pub rotation_enabled: bool,
-    /// Rotation speed in complete rotations per second.
-    #[serde(alias = "rotation_speed")]
-    pub rotations_per_second: f32,
+    /// Contracted rotation speed of the inner flower, in complete rotations per second.
+    pub inner_rotations_per_second: f32,
+    /// Contracted rotation speed of the middle flower, in complete rotations per second.
+    pub middle_rotations_per_second: f32,
+    /// Contracted rotation speed of the third flower, in complete rotations per second.
+    pub third_rotations_per_second: f32,
+    /// Contracted rotation speed of the outer gold ring, in complete rotations per second.
+    pub gold_rotations_per_second: f32,
+    /// Speed multiplier reached at full expansion. One disables breath modulation.
+    pub expansion_speed_multiplier: f32,
+    /// Pre-schema-4 shared rotation speed retained only while loading old settings.
+    #[doc(hidden)]
+    #[serde(
+        rename = "rotations_per_second",
+        alias = "rotation_speed",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_rotations_per_second: Option<f32>,
 }
 
 impl LuminousMandala {
@@ -220,11 +243,52 @@ impl LuminousMandala {
             self.maximum_radius = (self.minimum_radius + 0.05).min(1.00);
             self.minimum_radius = self.minimum_radius.min(self.maximum_radius - 0.05);
         }
-        self.rotations_per_second = self
-            .rotations_per_second
-            .clamp(MIN_ROTATIONS_PER_SECOND, MAX_ROTATIONS_PER_SECOND);
+        self.inner_rotations_per_second = sanitize_rotation_rate(self.inner_rotations_per_second);
+        self.middle_rotations_per_second = sanitize_rotation_rate(self.middle_rotations_per_second);
+        self.third_rotations_per_second = sanitize_rotation_rate(self.third_rotations_per_second);
+        self.gold_rotations_per_second = sanitize_rotation_rate(self.gold_rotations_per_second);
+        self.expansion_speed_multiplier = self.expansion_speed_multiplier.clamp(
+            MIN_EXPANSION_SPEED_MULTIPLIER,
+            MAX_EXPANSION_SPEED_MULTIPLIER,
+        );
+        self.legacy_rotations_per_second = None;
         self
     }
+
+    /// Expand a legacy shared speed into the four independently configurable layers.
+    pub fn migrate_shared_rotation_speed(&mut self, value_was_radians_per_second: bool) {
+        let Some(mut speed) = self.legacy_rotations_per_second.take() else {
+            return;
+        };
+        if value_was_radians_per_second {
+            speed /= std::f32::consts::TAU;
+        }
+        self.inner_rotations_per_second = speed;
+        self.middle_rotations_per_second = speed;
+        self.third_rotations_per_second = speed;
+        self.gold_rotations_per_second = speed;
+    }
+
+    /// Return the four instantaneous speeds for the current breath expansion.
+    #[must_use]
+    pub fn layer_speeds(&self, expansion: f32) -> [f32; 4] {
+        let options = self.sanitized();
+        if !options.rotation_enabled {
+            return [0.0; 4];
+        }
+        let factor = 1.0 + expansion.clamp(0.0, 1.0) * (options.expansion_speed_multiplier - 1.0);
+        [
+            options.inner_rotations_per_second,
+            options.middle_rotations_per_second,
+            options.third_rotations_per_second,
+            options.gold_rotations_per_second,
+        ]
+        .map(|speed| (speed * factor).min(MAX_ROTATIONS_PER_SECOND))
+    }
+}
+
+fn sanitize_rotation_rate(speed: f32) -> f32 {
+    speed.clamp(MIN_ROTATIONS_PER_SECOND, MAX_ROTATIONS_PER_SECOND)
 }
 
 impl Default for LuminousMandala {
@@ -233,7 +297,12 @@ impl Default for LuminousMandala {
             minimum_radius: 0.40,
             maximum_radius: 0.82,
             rotation_enabled: true,
-            rotations_per_second: 0.05,
+            inner_rotations_per_second: 0.05,
+            middle_rotations_per_second: 0.05,
+            third_rotations_per_second: 0.05,
+            gold_rotations_per_second: 0.05,
+            expansion_speed_multiplier: 2.0,
+            legacy_rotations_per_second: None,
         }
     }
 }
@@ -249,14 +318,15 @@ impl KasinaVisual for LuminousMandala {
 
     fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame {
         let options = self.sanitized();
-        let rotation_phase_radians = if options.rotation_enabled {
-            (input.elapsed_seconds * options.rotations_per_second).rem_euclid(1.0)
-                * std::f32::consts::TAU
+        let layer_rotation_radians = if options.rotation_enabled {
+            input
+                .layer_rotation_phases
+                .map(|phase| phase.rem_euclid(1.0) * std::f32::consts::TAU)
         } else {
-            0.0
+            [0.0; 4]
         };
         PreparedVisualFrame::breath_kasina(
-            rotation_phase_radians,
+            layer_rotation_radians,
             input.respiration,
             input.viewport_points,
             [options.minimum_radius, options.maximum_radius],
@@ -346,6 +416,7 @@ impl BiofeedbackRenderer {
             style: PARTICLE_STYLE,
             viewport_points: [1.0, 1.0],
             radius_range: [0.0; 2],
+            layer_rotation_radians: [0.0; 4],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("newKasina biofeedback uniforms"),
@@ -406,12 +477,12 @@ impl BiofeedbackRenderer {
         ui: &mut egui::Ui,
         desired_size: egui::Vec2,
         visual: &dyn KasinaVisual,
-        elapsed_seconds: f32,
+        layer_rotation_phases: [f32; 4],
         respiration: f32,
     ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
         let prepared = visual.prepare_frame(KasinaFrameInput {
-            elapsed_seconds,
+            layer_rotation_phases,
             respiration,
             viewport_points: [rect.width(), rect.height()],
         });
@@ -506,13 +577,15 @@ mod tests {
     }
 
     #[test]
-    fn mandala_shader_alternates_direction_at_one_shared_speed() {
+    fn mandala_shader_alternates_four_independent_rotation_phases() {
         let shader = include_str!("biofeedback.wgsl");
-        assert!(shader.contains("let inner_outer_angle = angle - rotation"));
-        assert!(shader.contains("let middle_angle = angle + rotation"));
-        assert!(shader.contains("cos(inner_outer_angle * 8.0)"));
+        assert!(shader.contains("let inner_angle = angle - rotation.x"));
+        assert!(shader.contains("let middle_angle = angle + rotation.y"));
+        assert!(shader.contains("let third_angle = angle - rotation.z"));
+        assert!(shader.contains("let gold_angle = angle + rotation.w"));
+        assert!(shader.contains("cos(inner_angle * 8.0)"));
         assert!(shader.contains("cos(middle_angle * 12.0)"));
-        assert!(shader.contains("cos(inner_outer_angle * 24.0)"));
+        assert!(shader.contains("cos(third_angle * 24.0)"));
         assert!(shader.contains("sin(gold_angle * 24.0 + radius * 6.0)"));
     }
 
@@ -526,14 +599,14 @@ mod tests {
         assert_eq!(low.uniforms.viewport_points, [1.0, 1.0]);
         assert_eq!(high.uniforms.respiration, 1.0);
         assert_eq!(high.uniforms.instance_count, 100_000);
-        assert_eq!(low.upload_bytes().len(), 32);
+        assert_eq!(low.upload_bytes().len(), 48);
         assert_eq!(high.upload_bytes().len(), low.upload_bytes().len());
     }
 
     #[test]
     fn breath_kasina_uses_one_full_screen_instance() {
         let frame = LuminousMandala::default().prepare_frame(KasinaFrameInput {
-            elapsed_seconds: 3.0,
+            layer_rotation_phases: [0.125, 0.25, 0.375, 0.5],
             respiration: 1.5,
             viewport_points: [900.0, 600.0],
         });
@@ -542,7 +615,16 @@ mod tests {
         assert_eq!(frame.uniforms.style, BREATH_KASINA_STYLE);
         assert_eq!(frame.uniforms.radius_range, [0.40, 0.82]);
         assert_eq!(frame.instance_count(), 1);
-        assert_eq!(frame.upload_bytes().len(), 32);
+        assert_eq!(frame.upload_bytes().len(), 48);
+        assert_eq!(
+            frame.uniforms.layer_rotation_radians,
+            [
+                std::f32::consts::FRAC_PI_4,
+                std::f32::consts::FRAC_PI_2,
+                std::f32::consts::FRAC_PI_4 * 3.0,
+                std::f32::consts::PI,
+            ]
+        );
     }
 
     #[test]
@@ -551,41 +633,63 @@ mod tests {
             minimum_radius: 2.0,
             maximum_radius: -1.0,
             rotation_enabled: false,
-            rotations_per_second: 40.0,
+            inner_rotations_per_second: 40.0,
+            expansion_speed_multiplier: 40.0,
+            ..LuminousMandala::default()
         };
         let sanitized = visual.sanitized();
         let frame = visual.prepare_frame(KasinaFrameInput {
-            elapsed_seconds: 100.0,
+            layer_rotation_phases: [0.25; 4],
             respiration: 0.5,
             viewport_points: [100.0, 100.0],
         });
 
         assert!(sanitized.minimum_radius < sanitized.maximum_radius);
-        assert_eq!(sanitized.rotations_per_second, MAX_ROTATIONS_PER_SECOND);
-        assert_eq!(frame.uniforms.time_seconds, 0.0);
+        assert_eq!(
+            sanitized.inner_rotations_per_second,
+            MAX_ROTATIONS_PER_SECOND
+        );
+        assert_eq!(
+            sanitized.expansion_speed_multiplier,
+            MAX_EXPANSION_SPEED_MULTIPLIER
+        );
+        assert_eq!(frame.uniforms.layer_rotation_radians, [0.0; 4]);
 
         let too_slow = LuminousMandala {
-            rotations_per_second: 0.0,
+            inner_rotations_per_second: 0.0,
             ..LuminousMandala::default()
         };
         assert_eq!(
-            too_slow.sanitized().rotations_per_second,
+            too_slow.sanitized().inner_rotations_per_second,
             MIN_ROTATIONS_PER_SECOND
         );
     }
 
     #[test]
-    fn one_rotation_per_second_produces_a_quarter_turn_after_250_ms() {
+    fn layer_speeds_are_independent_and_follow_breath_expansion() {
         let visual = LuminousMandala {
-            rotations_per_second: 1.0,
+            inner_rotations_per_second: 0.10,
+            middle_rotations_per_second: 0.20,
+            third_rotations_per_second: 0.30,
+            gold_rotations_per_second: 0.40,
+            expansion_speed_multiplier: 3.0,
             ..LuminousMandala::default()
         };
-        let frame = visual.prepare_frame(KasinaFrameInput {
-            elapsed_seconds: 0.25,
-            respiration: 0.5,
-            viewport_points: [100.0, 100.0],
-        });
 
-        assert!((frame.uniforms.time_seconds - std::f32::consts::FRAC_PI_2).abs() < 1.0e-6);
+        assert_array_close(visual.layer_speeds(0.0), [0.10, 0.20, 0.30, 0.40]);
+        assert_array_close(visual.layer_speeds(0.5), [0.20, 0.40, 0.60, 0.80]);
+        assert_array_close(visual.layer_speeds(1.0), [0.30, 0.60, 0.90, 1.20]);
+
+        let disabled = LuminousMandala {
+            rotation_enabled: false,
+            ..visual
+        };
+        assert_eq!(disabled.layer_speeds(1.0), [0.0; 4]);
+    }
+
+    fn assert_array_close(actual: [f32; 4], expected: [f32; 4]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
     }
 }

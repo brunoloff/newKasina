@@ -20,7 +20,7 @@ use kasina_protocol::v1::{
     SubscribeRequest,
 };
 use kasina_protocol::{AUTH_HEADER, client_hello};
-use kasina_render::{BiofeedbackRenderer, FrameStats};
+use kasina_render::{BiofeedbackRenderer, FrameStats, LuminousMandala};
 use serde::Serialize;
 use settings::{AppSettings, KasinaVisualPreset, SettingsWriter};
 use tokio_util::sync::CancellationToken;
@@ -522,6 +522,7 @@ struct BreathKasinaState {
     trend: f64,
     samples_seen: u64,
     last_animation: Instant,
+    layer_rotation_phases: [f32; 4],
 }
 
 impl BreathKasinaState {
@@ -535,6 +536,7 @@ impl BreathKasinaState {
             trend: 0.0,
             samples_seen: 0,
             last_animation: now,
+            layer_rotation_phases: [0.0; 4],
         }
     }
 
@@ -595,10 +597,26 @@ impl BreathKasinaState {
         self.displayed_expansion
     }
 
-    fn animated_expansion(&mut self, now: Instant) -> f32 {
+    fn animated_frame(&mut self, now: Instant, options: LuminousMandala) -> (f32, [f32; 4]) {
         let elapsed = now.saturating_duration_since(self.last_animation);
         self.last_animation = now;
-        self.advance(elapsed)
+        let expansion = self.advance(elapsed);
+        let phases = self.advance_layer_rotations(elapsed, expansion, options);
+        (expansion, phases)
+    }
+
+    fn advance_layer_rotations(
+        &mut self,
+        elapsed: Duration,
+        expansion: f32,
+        options: LuminousMandala,
+    ) -> [f32; 4] {
+        let elapsed_seconds = elapsed.as_secs_f32().min(0.25);
+        let speeds = options.layer_speeds(expansion);
+        for (phase, speed) in self.layer_rotation_phases.iter_mut().zip(speeds) {
+            *phase = (*phase + elapsed_seconds * speed).rem_euclid(1.0);
+        }
+        self.layer_rotation_phases
     }
 
     fn motion_label(&self) -> &'static str {
@@ -612,6 +630,20 @@ impl BreathKasinaState {
             "Resting"
         }
     }
+}
+
+fn layer_rotation_speed_slider(ui: &mut egui::Ui, enabled: bool, speed: &mut f32) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Slider::new(
+            speed,
+            kasina_render::MIN_ROTATIONS_PER_SECOND..=kasina_render::MAX_ROTATIONS_PER_SECOND,
+        )
+        .logarithmic(true)
+        .fixed_decimals(3)
+        .suffix(" rot/s"),
+    )
+    .changed()
 }
 
 struct KasinaApp {
@@ -1026,7 +1058,6 @@ impl KasinaApp {
     }
 
     fn breath_kasina(&mut self, ui: &mut egui::Ui) {
-        let expansion = self.breath_kasina.animated_expansion(Instant::now());
         let preset_names: Vec<_> = self
             .settings
             .presets
@@ -1064,6 +1095,12 @@ impl KasinaApp {
             self.editing_preset_id = selected_preset;
             self.mark_settings_changed(ui.ctx());
         }
+        let active_visual = self.settings.active_preset().visual.clone();
+        let (expansion, layer_rotation_phases) = match &active_visual {
+            KasinaVisualPreset::LuminousMandala(options) => {
+                self.breath_kasina.animated_frame(Instant::now(), *options)
+            }
+        };
         ui.label("The mandala follows the respiration belt directly: rising force expands it.");
         ui.add_space(6.0);
         let size = egui::vec2(ui.available_width(), ui.available_height().max(180.0));
@@ -1071,15 +1108,15 @@ impl KasinaApp {
             renderer.paint_breath_kasina(
                 ui,
                 size,
-                self.settings.active_preset().visual.as_visual(),
-                self.started.elapsed().as_secs_f32(),
+                active_visual.as_visual(),
+                layer_rotation_phases,
                 expansion,
             );
         } else {
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 8.0, egui::Color32::from_rgb(3, 6, 20));
-            let (minimum_radius, maximum_radius) = match &self.settings.active_preset().visual {
+            let (minimum_radius, maximum_radius) = match &active_visual {
                 KasinaVisualPreset::LuminousMandala(options) => {
                     (options.minimum_radius, options.maximum_radius)
                 }
@@ -1106,6 +1143,10 @@ impl KasinaApp {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| self.settings_content(ui));
+    }
+
+    fn settings_content(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         if let Some(notice) = &self.settings_notice {
             ui.colored_label(egui::Color32::YELLOW, notice);
@@ -1371,20 +1412,49 @@ impl KasinaApp {
                                 .checkbox(&mut options.rotation_enabled, "Enabled")
                                 .changed();
                             ui.end_row();
-                            ui.strong("Rotation speed");
-                            changed |= ui
-                                .add_enabled(
-                                    options.rotation_enabled,
-                                    egui::Slider::new(
-                                        &mut options.rotations_per_second,
-                                        kasina_render::MIN_ROTATIONS_PER_SECOND
-                                            ..=kasina_render::MAX_ROTATIONS_PER_SECOND,
-                                    )
-                                    .logarithmic(true)
-                                    .fixed_decimals(3)
-                                    .suffix(" rot/s"),
+                            ui.strong("Inner layer speed");
+                            changed |= layer_rotation_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.inner_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Middle layer speed");
+                            changed |= layer_rotation_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.middle_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Third layer speed");
+                            changed |= layer_rotation_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.third_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Gold layer speed");
+                            changed |= layer_rotation_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.gold_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Full-expansion speed");
+                            let response = ui.add_enabled(
+                                options.rotation_enabled,
+                                egui::Slider::new(
+                                    &mut options.expansion_speed_multiplier,
+                                    kasina_render::MIN_EXPANSION_SPEED_MULTIPLIER
+                                        ..=kasina_render::MAX_EXPANSION_SPEED_MULTIPLIER,
                                 )
-                                .changed();
+                                .fixed_decimals(2)
+                                .suffix("×"),
+                            );
+                            changed |= response.changed();
+                            response.on_hover_text(
+                                "Multiplier applied at full expansion; 1× keeps speed constant",
+                            );
                             ui.end_row();
                             *options = options.sanitized();
                         }
@@ -2358,6 +2428,24 @@ mod tests {
         assert_eq!(state.samples_seen, 2);
         assert!(after > before);
         assert!(after < state.target_expansion);
+    }
+
+    #[test]
+    fn breath_kasina_integrates_independent_breath_modulated_layer_speeds() {
+        let mut state = BreathKasinaState::new(Instant::now());
+        let options = LuminousMandala {
+            inner_rotations_per_second: 0.10,
+            middle_rotations_per_second: 0.20,
+            third_rotations_per_second: 0.30,
+            gold_rotations_per_second: 0.40,
+            expansion_speed_multiplier: 3.0,
+            ..LuminousMandala::default()
+        };
+
+        let phases = state.advance_layer_rotations(Duration::from_millis(250), 0.5, options);
+        assert_eq!(phases, [0.05, 0.10, 0.15, 0.20]);
+        let phases = state.advance_layer_rotations(Duration::from_secs(5), 0.5, options);
+        assert_eq!(phases, [0.10, 0.20, 0.30, 0.40]);
     }
 
     #[test]

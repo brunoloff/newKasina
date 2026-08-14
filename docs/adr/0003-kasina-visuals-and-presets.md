@@ -27,9 +27,13 @@ does not inspect implementation-specific application settings.
 radius, rotation enabled, and rotation speed in complete rotations per second. Its three
 lace shapes apply their alternating rotation directions before their symmetry multipliers,
 so their differing lobe counts do not alter their visible speed. The outer gold ring and
-beads counter-rotate relative to the third lace shape. The selectable speed range is 0.01
-to 10 rotations per second. It sanitizes values loaded from disk before preparing the
-32-byte uniform update.
+beads counter-rotate relative to the third lace shape. Each of the four layers has its own
+contracted speed in the selectable range of 0.01 to 10 rotations per second. A shared
+full-expansion multiplier from 1 to 10 linearly raises every layer's instantaneous speed
+with the smoothed breath expansion; effective speeds saturate at 10 rotations per second.
+The app integrates phase from frame deltas so changing respiration or settings changes
+velocity without jumping angle. It sanitizes values loaded from disk before preparing the
+48-byte uniform update containing four independently integrated layer phases.
 
 The app stores `KasinaPreset` values. Each preset has a stable numeric ID, editable name,
 and a tagged `KasinaVisualPreset` enum containing that implementation's typed options.

@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, bail};
 use kasina_render::{KasinaVisual, LuminousMandala};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 3;
+const SETTINGS_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -104,10 +104,11 @@ impl AppSettings {
 
     #[must_use]
     pub fn sanitized(mut self) -> Self {
-        if self.schema_version < 3 {
+        if self.schema_version < 4 {
+            let value_was_radians_per_second = self.schema_version < 3;
             for preset in &mut self.presets {
                 let KasinaVisualPreset::LuminousMandala(options) = &mut preset.visual;
-                options.rotations_per_second /= std::f32::consts::TAU;
+                options.migrate_shared_rotation_speed(value_was_radians_per_second);
             }
         }
         self.schema_version = SETTINGS_SCHEMA_VERSION;
@@ -204,7 +205,7 @@ impl Default for AppSettings {
                         minimum_radius: 0.32,
                         maximum_radius: 0.68,
                         rotation_enabled: false,
-                        rotations_per_second: 0.05,
+                        ..LuminousMandala::default()
                     }),
                 },
                 KasinaPreset {
@@ -214,7 +215,11 @@ impl Default for AppSettings {
                         minimum_radius: 0.22,
                         maximum_radius: 0.95,
                         rotation_enabled: true,
-                        rotations_per_second: 0.02,
+                        inner_rotations_per_second: 0.02,
+                        middle_rotations_per_second: 0.02,
+                        third_rotations_per_second: 0.02,
+                        gold_rotations_per_second: 0.02,
+                        ..LuminousMandala::default()
                     }),
                 },
             ],
@@ -424,11 +429,32 @@ mod tests {
         let old_settings: AppSettings = serde_json::from_value(encoded).unwrap();
         let migrated = old_settings.sanitized();
         let KasinaVisualPreset::LuminousMandala(options) = &migrated.presets[0].visual;
+        let expected = 0.3 / std::f32::consts::TAU;
 
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
-        assert!((options.rotations_per_second - 0.3 / std::f32::consts::TAU).abs() < 1.0e-6);
+        assert!((options.inner_rotations_per_second - expected).abs() < 1.0e-6);
+        assert!((options.middle_rotations_per_second - expected).abs() < 1.0e-6);
+        assert!((options.third_rotations_per_second - expected).abs() < 1.0e-6);
+        assert!((options.gold_rotations_per_second - expected).abs() < 1.0e-6);
         let rewritten = serde_json::to_string(&migrated).unwrap();
-        assert!(rewritten.contains("rotations_per_second"));
+        assert!(rewritten.contains("inner_rotations_per_second"));
+        assert!(!rewritten.contains("\"rotations_per_second\""));
         assert!(!rewritten.contains("rotation_speed"));
+    }
+
+    #[test]
+    fn schema_three_shared_rotations_migrate_to_each_layer() {
+        let mut encoded = serde_json::to_value(AppSettings::default()).unwrap();
+        encoded["schema_version"] = serde_json::json!(3);
+        let options = encoded["presets"][0]["visual"]["options"]
+            .as_object_mut()
+            .unwrap();
+        options.insert("rotations_per_second".to_owned(), serde_json::json!(0.25));
+
+        let old_settings: AppSettings = serde_json::from_value(encoded).unwrap();
+        let migrated = old_settings.sanitized();
+        let KasinaVisualPreset::LuminousMandala(options) = &migrated.presets[0].visual;
+
+        assert_eq!(options.layer_speeds(0.0), [0.25; 4]);
     }
 }
