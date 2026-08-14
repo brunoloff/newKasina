@@ -75,8 +75,10 @@ fn breath_mandala(local: vec2<f32>) -> vec4<f32> {
     let angle = atan2(p.y, p.x);
     let rotation = visual.time_seconds;
     // Apply rotation before each symmetry multiplier. This keeps every lace shape at
-    // the same physical angular velocity regardless of its number of lobes.
-    let lace_angle = angle - rotation;
+    // the same physical angular velocity regardless of its number of lobes, while the
+    // alternating signs preserve the mandala's counter-rotating layers.
+    let inner_outer_angle = angle - rotation;
+    let middle_angle = angle + rotation;
     // The outer gold ring is a separate counter-rotating layer. Its circular boundary
     // is rotationally invariant, while its beads make the reverse motion visible.
     let gold_angle = angle + rotation;
@@ -85,14 +87,14 @@ fn breath_mandala(local: vec2<f32>) -> vec4<f32> {
     let background_halo = exp(-screen_radius * 2.25) * (0.10 + breath * 0.08);
     var color = deep_navy + vec3<f32>(0.018, 0.035, 0.085) * background_halo;
 
-    let inner_shape = 0.305 + 0.055 * cos(lace_angle * 8.0);
+    let inner_shape = 0.305 + 0.055 * cos(inner_outer_angle * 8.0);
     let inner_lace = line_glow(abs(radius - inner_shape), 0.010, 0.045);
-    let middle_shape = 0.545 + 0.115 * cos(lace_angle * 12.0);
+    let middle_shape = 0.545 + 0.115 * cos(middle_angle * 12.0);
     let middle_lace = line_glow(abs(radius - middle_shape), 0.010, 0.048);
-    let outer_shape = 0.790 + 0.060 * cos(lace_angle * 24.0);
+    let outer_shape = 0.790 + 0.060 * cos(inner_outer_angle * 24.0);
     let outer_lace = line_glow(abs(radius - outer_shape), 0.008, 0.038);
 
-    let spokes = pow(abs(cos(lace_angle * 12.0)), 18.0)
+    let spokes = pow(abs(cos(middle_angle * 12.0)), 18.0)
         * smoothstep(0.16, 0.30, radius)
         * (1.0 - smoothstep(0.72, 0.91, radius));
     let bead_wave = abs(sin(gold_angle * 24.0 + radius * 6.0));
@@ -106,8 +108,8 @@ fn breath_mandala(local: vec2<f32>) -> vec4<f32> {
     let magenta = vec3<f32>(0.94, 0.18, 0.58);
     let gold = vec3<f32>(1.00, 0.66, 0.20);
     color += cyan * inner_lace * 0.86;
-    color += mix(violet, magenta, 0.5 + 0.5 * cos(lace_angle * 6.0)) * middle_lace * 0.92;
-    color += mix(cyan, violet, 0.5 + 0.5 * sin(lace_angle * 8.0)) * outer_lace * 0.82;
+    color += mix(violet, magenta, 0.5 + 0.5 * cos(middle_angle * 6.0)) * middle_lace * 0.92;
+    color += mix(cyan, violet, 0.5 + 0.5 * sin(inner_outer_angle * 8.0)) * outer_lace * 0.82;
     color += magenta * spokes * 0.36;
     color += gold * beads * 0.92;
     color += mix(cyan, gold, breath) * boundary * 0.72;

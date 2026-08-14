@@ -506,11 +506,13 @@ mod tests {
     }
 
     #[test]
-    fn mandala_shader_shares_lace_rotation_and_counter_rotates_gold() {
+    fn mandala_shader_alternates_direction_at_one_shared_speed() {
         let shader = include_str!("biofeedback.wgsl");
-        assert!(shader.contains("cos(lace_angle * 8.0)"));
-        assert!(shader.contains("cos(lace_angle * 12.0)"));
-        assert!(shader.contains("cos(lace_angle * 24.0)"));
+        assert!(shader.contains("let inner_outer_angle = angle - rotation"));
+        assert!(shader.contains("let middle_angle = angle + rotation"));
+        assert!(shader.contains("cos(inner_outer_angle * 8.0)"));
+        assert!(shader.contains("cos(middle_angle * 12.0)"));
+        assert!(shader.contains("cos(inner_outer_angle * 24.0)"));
         assert!(shader.contains("sin(gold_angle * 24.0 + radius * 6.0)"));
     }
 

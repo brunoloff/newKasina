@@ -25,10 +25,11 @@ does not inspect implementation-specific application settings.
 
 `LuminousMandala` is the first implementation. Its options are minimum radius, maximum
 radius, rotation enabled, and rotation speed in complete rotations per second. Its three
-lace shapes share one angular coordinate so their differing symmetry counts do not alter
-their visible speed; the outer gold ring and beads counter-rotate. The selectable speed
-range is 0.01 to 10 rotations per second. It sanitizes values loaded from disk before
-preparing the 32-byte uniform update.
+lace shapes apply their alternating rotation directions before their symmetry multipliers,
+so their differing lobe counts do not alter their visible speed. The outer gold ring and
+beads counter-rotate relative to the third lace shape. The selectable speed range is 0.01
+to 10 rotations per second. It sanitizes values loaded from disk before preparing the
+32-byte uniform update.
 
 The app stores `KasinaPreset` values. Each preset has a stable numeric ID, editable name,
 and a tagged `KasinaVisualPreset` enum containing that implementation's typed options.
