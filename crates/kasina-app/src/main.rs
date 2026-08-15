@@ -20,7 +20,7 @@ use kasina_protocol::v1::{
     SubscribeRequest,
 };
 use kasina_protocol::{AUTH_HEADER, client_hello};
-use kasina_render::{BiofeedbackRenderer, FrameStats, LuminousMandala};
+use kasina_render::{BiofeedbackRenderer, FrameStats, KasinaVisual, LuminousMandala};
 use serde::Serialize;
 use settings::{AppSettings, KasinaVisualPreset, SettingsWriter};
 use tokio_util::sync::CancellationToken;
@@ -597,11 +597,11 @@ impl BreathKasinaState {
         self.displayed_expansion
     }
 
-    fn animated_frame(&mut self, now: Instant, options: LuminousMandala) -> (f32, [f32; 4]) {
+    fn animated_frame(&mut self, now: Instant, visual: &dyn KasinaVisual) -> (f32, [f32; 4]) {
         let elapsed = now.saturating_duration_since(self.last_animation);
         self.last_animation = now;
         let expansion = self.advance(elapsed);
-        let phases = self.advance_layer_rotations(elapsed, expansion, options);
+        let phases = self.advance_layer_rotations(elapsed, expansion, visual);
         (expansion, phases)
     }
 
@@ -609,10 +609,10 @@ impl BreathKasinaState {
         &mut self,
         elapsed: Duration,
         expansion: f32,
-        options: LuminousMandala,
+        visual: &dyn KasinaVisual,
     ) -> [f32; 4] {
         let elapsed_seconds = elapsed.as_secs_f32().min(0.25);
-        let speeds = options.layer_speeds(expansion);
+        let speeds = visual.layer_speeds(expansion);
         for (phase, speed) in self.layer_rotation_phases.iter_mut().zip(speeds) {
             *phase = (*phase + elapsed_seconds * speed).rem_euclid(1.0);
         }
@@ -644,6 +644,22 @@ fn layer_rotation_speed_slider(ui: &mut egui::Ui, enabled: bool, speed: &mut f32
         .suffix(" rot/s"),
     )
     .changed()
+}
+
+fn expansion_speed_slider(ui: &mut egui::Ui, enabled: bool, multiplier: &mut f32) -> bool {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Slider::new(
+            multiplier,
+            kasina_render::MIN_EXPANSION_SPEED_MULTIPLIER
+                ..=kasina_render::MAX_EXPANSION_SPEED_MULTIPLIER,
+        )
+        .fixed_decimals(2)
+        .suffix("×"),
+    );
+    let changed = response.changed();
+    response.on_hover_text("Multiplier applied at full expansion; 1× keeps speed constant");
+    changed
 }
 
 struct KasinaApp {
@@ -1096,12 +1112,10 @@ impl KasinaApp {
             self.mark_settings_changed(ui.ctx());
         }
         let active_visual = self.settings.active_preset().visual.clone();
-        let (expansion, layer_rotation_phases) = match &active_visual {
-            KasinaVisualPreset::LuminousMandala(options) => {
-                self.breath_kasina.animated_frame(Instant::now(), *options)
-            }
-        };
-        ui.label("The mandala follows the respiration belt directly: rising force expands it.");
+        let (expansion, layer_rotation_phases) = self
+            .breath_kasina
+            .animated_frame(Instant::now(), active_visual.as_visual());
+        ui.label("The kasina follows the respiration belt directly: rising force expands it.");
         ui.add_space(6.0);
         let size = egui::vec2(ui.available_width(), ui.available_height().max(180.0));
         if let Some(renderer) = &self.renderer {
@@ -1118,6 +1132,9 @@ impl KasinaApp {
                 .rect_filled(rect, 8.0, egui::Color32::from_rgb(3, 6, 20));
             let (minimum_radius, maximum_radius) = match &active_visual {
                 KasinaVisualPreset::LuminousMandala(options) => {
+                    (options.minimum_radius, options.maximum_radius)
+                }
+                KasinaVisualPreset::AuroraVortex(options) => {
                     (options.minimum_radius, options.maximum_radius)
                 }
             };
@@ -1382,11 +1399,29 @@ impl KasinaApp {
                     }
                     ui.end_row();
                     ui.strong("Implementation");
+                    let current_implementation = match &preset.visual {
+                        KasinaVisualPreset::LuminousMandala(_) => 0,
+                        KasinaVisualPreset::AuroraVortex(_) => 1,
+                    };
+                    let mut selected_implementation = current_implementation;
                     egui::ComboBox::from_id_salt("kasina_implementation")
                         .selected_text(preset.visual.implementation_name())
                         .show_ui(ui, |ui| {
-                            let _implementation = ui.selectable_label(true, "Luminous mandala");
+                            ui.selectable_value(
+                                &mut selected_implementation,
+                                0,
+                                "Luminous mandala",
+                            );
+                            ui.selectable_value(&mut selected_implementation, 1, "Aurora vortex");
                         });
+                    if selected_implementation != current_implementation {
+                        preset.visual = if selected_implementation == 0 {
+                            KasinaVisualPreset::LuminousMandala(LuminousMandala::default())
+                        } else {
+                            KasinaVisualPreset::AuroraVortex(kasina_render::AuroraVortex::default())
+                        };
+                        changed = true;
+                    }
                     ui.end_row();
 
                     match &mut preset.visual {
@@ -1441,19 +1476,98 @@ impl KasinaApp {
                             );
                             ui.end_row();
                             ui.strong("Full-expansion speed");
-                            let response = ui.add_enabled(
+                            changed |= expansion_speed_slider(
+                                ui,
                                 options.rotation_enabled,
-                                egui::Slider::new(
-                                    &mut options.expansion_speed_multiplier,
-                                    kasina_render::MIN_EXPANSION_SPEED_MULTIPLIER
-                                        ..=kasina_render::MAX_EXPANSION_SPEED_MULTIPLIER,
-                                )
-                                .fixed_decimals(2)
-                                .suffix("×"),
+                                &mut options.expansion_speed_multiplier,
                             );
-                            changed |= response.changed();
-                            response.on_hover_text(
-                                "Multiplier applied at full expansion; 1× keeps speed constant",
+                            ui.end_row();
+                            *options = options.sanitized();
+                        }
+                        KasinaVisualPreset::AuroraVortex(options) => {
+                            ui.strong("Minimum radius");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.minimum_radius, 0.12..=0.80)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Maximum radius");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.maximum_radius, 0.20..=1.00)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Spiral arms");
+                            changed |= ui
+                                .add(egui::Slider::new(&mut options.arms, 3..=24))
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Spiral twist");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.twist, 1.0..=14.0)
+                                        .fixed_decimals(1),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Glow");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.glow, 0.35..=2.50)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Spectral hue");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.hue, 0.0..=1.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Rotation");
+                            changed |= ui
+                                .checkbox(&mut options.rotation_enabled, "Enabled")
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Iris speed");
+                            changed |= layer_rotation_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.iris_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Filament speed");
+                            changed |= layer_rotation_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.filament_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Halo speed");
+                            changed |= layer_rotation_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.halo_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Spark speed");
+                            changed |= layer_rotation_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.spark_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Full-expansion speed");
+                            changed |= expansion_speed_slider(
+                                ui,
+                                options.rotation_enabled,
+                                &mut options.expansion_speed_multiplier,
                             );
                             ui.end_row();
                             *options = options.sanitized();
@@ -2442,9 +2556,9 @@ mod tests {
             ..LuminousMandala::default()
         };
 
-        let phases = state.advance_layer_rotations(Duration::from_millis(250), 0.5, options);
+        let phases = state.advance_layer_rotations(Duration::from_millis(250), 0.5, &options);
         assert_eq!(phases, [0.05, 0.10, 0.15, 0.20]);
-        let phases = state.advance_layer_rotations(Duration::from_secs(5), 0.5, options);
+        let phases = state.advance_layer_rotations(Duration::from_secs(5), 0.5, &options);
         assert_eq!(phases, [0.10, 0.20, 0.30, 0.40]);
     }
 

@@ -33,7 +33,14 @@ full-expansion multiplier from 1 to 10 linearly raises every layer's instantaneo
 with the smoothed breath expansion; effective speeds saturate at 10 rotations per second.
 The app integrates phase from frame deltas so changing respiration or settings changes
 velocity without jumping angle. It sanitizes values loaded from disk before preparing the
-48-byte uniform update containing four independently integrated layer phases.
+64-byte uniform update containing four independently integrated layer phases and four
+implementation-specific effect parameters.
+
+`AuroraVortex` is the second implementation. It combines two opposing logarithmic
+filament fields, a breathing iris, an independently rotating halo, and an orbiting spark
+ring. Presets control radius range, four layer speeds, breath-speed multiplication, spiral
+arm count, twist, glow, and spectral hue. The same four-channel phase clock drives both
+implementations without putting transient animation state into persisted presets.
 
 The app stores `KasinaPreset` values. Each preset has a stable numeric ID, editable name,
 and a tagged `KasinaVisualPreset` enum containing that implementation's typed options.

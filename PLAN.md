@@ -99,7 +99,9 @@ Do not mark a milestone complete until its exit criteria pass.
   editable presets ship by default, and users can add, rename, select, and remove presets.
   Each luminous-mandala preset now carries four independent layer speeds plus a shared
   full-expansion speed multiplier; continuous CPU-side phase integration avoids angle
-  jumps as breath-driven velocity changes, using a fixed 48-byte GPU uniform.
+  jumps as breath-driven velocity changes. The second `AuroraVortex` implementation adds
+  counter-rotating logarithmic filaments, a breathing iris, halo, and spark orbit with
+  editable arms, twist, glow, hue, radii, and motion. Both use a fixed 64-byte GPU uniform.
 - In-app simulation mode, 2026-08-13: a persistent Settings toggle switches displayed
   input between the live service and a separate local synthetic model without restarting
   or reconfiguring acquisition. The shared deterministic generator produces a harmonic

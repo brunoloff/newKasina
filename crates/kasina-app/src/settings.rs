@@ -6,10 +6,10 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context as _, Result, bail};
-use kasina_render::{KasinaVisual, LuminousMandala};
+use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 4;
+const SETTINGS_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,24 +37,28 @@ impl Default for TabVisibility {
 #[serde(tag = "implementation", content = "options", rename_all = "kebab-case")]
 pub(crate) enum KasinaVisualPreset {
     LuminousMandala(LuminousMandala),
+    AuroraVortex(AuroraVortex),
 }
 
 impl KasinaVisualPreset {
     pub fn implementation_name(&self) -> &'static str {
         match self {
             Self::LuminousMandala(visual) => visual.display_name(),
+            Self::AuroraVortex(visual) => visual.display_name(),
         }
     }
 
     pub fn as_visual(&self) -> &dyn KasinaVisual {
         match self {
             Self::LuminousMandala(visual) => visual,
+            Self::AuroraVortex(visual) => visual,
         }
     }
 
     pub fn sanitize(&mut self) {
         match self {
             Self::LuminousMandala(options) => *options = options.sanitized(),
+            Self::AuroraVortex(options) => *options = options.sanitized(),
         }
     }
 }
@@ -104,11 +108,13 @@ impl AppSettings {
 
     #[must_use]
     pub fn sanitized(mut self) -> Self {
-        if self.schema_version < 4 {
-            let value_was_radians_per_second = self.schema_version < 3;
+        let source_schema = self.schema_version;
+        if source_schema < 4 {
+            let value_was_radians_per_second = source_schema < 3;
             for preset in &mut self.presets {
-                let KasinaVisualPreset::LuminousMandala(options) = &mut preset.visual;
-                options.migrate_shared_rotation_speed(value_was_radians_per_second);
+                if let KasinaVisualPreset::LuminousMandala(options) = &mut preset.visual {
+                    options.migrate_shared_rotation_speed(value_was_radians_per_second);
+                }
             }
         }
         self.schema_version = SETTINGS_SCHEMA_VERSION;
@@ -120,6 +126,22 @@ impl AppSettings {
         });
         if self.presets.is_empty() {
             return Self::default();
+        }
+        if source_schema < 5
+            && self
+                .presets
+                .iter()
+                .all(|preset| !matches!(&preset.visual, KasinaVisualPreset::AuroraVortex(_)))
+        {
+            let id = (self.next_preset_id.max(1)..=u64::MAX)
+                .find(|candidate| !used_ids.contains(candidate))
+                .unwrap_or_else(|| {
+                    (1..self.next_preset_id)
+                        .find(|candidate| !used_ids.contains(candidate))
+                        .expect("a finite preset list must leave an unused identifier")
+                });
+            self.presets.push(default_aurora_preset(id));
+            used_ids.insert(id);
         }
         if !used_ids.contains(&self.active_preset_id) {
             self.active_preset_id = self.presets[0].id;
@@ -191,7 +213,7 @@ impl Default for AppSettings {
             simulation_mode: false,
             visible_tabs: TabVisibility::default(),
             active_preset_id: 1,
-            next_preset_id: 4,
+            next_preset_id: 5,
             presets: vec![
                 KasinaPreset {
                     id: 1,
@@ -222,8 +244,17 @@ impl Default for AppSettings {
                         ..LuminousMandala::default()
                     }),
                 },
+                default_aurora_preset(4),
             ],
         }
+    }
+}
+
+fn default_aurora_preset(id: u64) -> KasinaPreset {
+    KasinaPreset {
+        id,
+        name: "Aurora tide".to_owned(),
+        visual: KasinaVisualPreset::AuroraVortex(AuroraVortex::default()),
     }
 }
 
@@ -337,14 +368,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn defaults_show_only_breath_and_have_three_presets() {
+    fn defaults_show_only_breath_and_include_both_visual_styles() {
         let settings = AppSettings::default();
         assert!(settings.visible_tabs.breath_kasina);
         assert!(!settings.simulation_mode);
         assert!(!settings.visible_tabs.dashboard);
         assert!(!settings.visible_tabs.raw_signals);
-        assert_eq!(settings.presets.len(), 3);
+        assert_eq!(settings.presets.len(), 4);
         assert_eq!(settings.active_preset().name, "Luminous flow");
+        assert!(
+            settings
+                .presets
+                .iter()
+                .any(|preset| matches!(&preset.visual, KasinaVisualPreset::AuroraVortex(_)))
+        );
     }
 
     #[test]
@@ -352,9 +389,9 @@ mod tests {
         let mut settings = AppSettings::default();
         let custom_id = settings.add_preset(2);
         assert_eq!(settings.active_preset_id, custom_id);
-        assert_eq!(settings.presets.len(), 4);
+        assert_eq!(settings.presets.len(), 5);
         assert!(settings.remove_preset(custom_id));
-        assert_eq!(settings.presets.len(), 3);
+        assert_eq!(settings.presets.len(), 4);
 
         settings.presets.truncate(1);
         assert!(!settings.remove_preset(settings.presets[0].id));
@@ -372,13 +409,17 @@ mod tests {
             active_preset_id: 999,
             ..AppSettings::default()
         };
-        let KasinaVisualPreset::LuminousMandala(options) = &mut settings.presets[0].visual;
+        let KasinaVisualPreset::LuminousMandala(options) = &mut settings.presets[0].visual else {
+            panic!("first default preset should be luminous")
+        };
         options.minimum_radius = 4.0;
         options.maximum_radius = -2.0;
         let settings = settings.sanitized();
 
         assert_eq!(settings.active_preset_id, 1);
-        let KasinaVisualPreset::LuminousMandala(options) = &settings.presets[0].visual;
+        let KasinaVisualPreset::LuminousMandala(options) = &settings.presets[0].visual else {
+            panic!("first default preset should be luminous")
+        };
         assert!(options.minimum_radius < options.maximum_radius);
     }
 
@@ -428,7 +469,9 @@ mod tests {
 
         let old_settings: AppSettings = serde_json::from_value(encoded).unwrap();
         let migrated = old_settings.sanitized();
-        let KasinaVisualPreset::LuminousMandala(options) = &migrated.presets[0].visual;
+        let KasinaVisualPreset::LuminousMandala(options) = &migrated.presets[0].visual else {
+            panic!("first migrated preset should be luminous")
+        };
         let expected = 0.3 / std::f32::consts::TAU;
 
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
@@ -453,8 +496,34 @@ mod tests {
 
         let old_settings: AppSettings = serde_json::from_value(encoded).unwrap();
         let migrated = old_settings.sanitized();
-        let KasinaVisualPreset::LuminousMandala(options) = &migrated.presets[0].visual;
+        let KasinaVisualPreset::LuminousMandala(options) = &migrated.presets[0].visual else {
+            panic!("first migrated preset should be luminous")
+        };
 
         assert_eq!(options.layer_speeds(0.0), [0.25; 4]);
+    }
+
+    #[test]
+    fn schema_four_settings_gain_one_aurora_preset() {
+        let mut settings = AppSettings {
+            schema_version: 4,
+            ..AppSettings::default()
+        };
+        settings
+            .presets
+            .retain(|preset| matches!(&preset.visual, KasinaVisualPreset::LuminousMandala(_)));
+        settings.next_preset_id = 4;
+
+        let migrated = settings.sanitized();
+        let aurora_presets = migrated
+            .presets
+            .iter()
+            .filter(|preset| matches!(&preset.visual, KasinaVisualPreset::AuroraVortex(_)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(aurora_presets.len(), 1);
+        assert_eq!(aurora_presets[0].name, "Aurora tide");
+        assert_eq!(migrated.next_preset_id, 5);
     }
 }

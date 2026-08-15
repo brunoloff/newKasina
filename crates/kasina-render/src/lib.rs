@@ -100,10 +100,12 @@ struct VisualUniforms {
     viewport_points: [f32; 2],
     radius_range: [f32; 2],
     layer_rotation_radians: [f32; 4],
+    effect_params: [f32; 4],
 }
 
 const PARTICLE_STYLE: u32 = 0;
 const BREATH_KASINA_STYLE: u32 = 1;
+const AURORA_VORTEX_STYLE: u32 = 2;
 
 /// Slowest selectable mandala rotation rate, in complete rotations per second.
 pub const MIN_ROTATIONS_PER_SECOND: f32 = 0.01;
@@ -117,7 +119,7 @@ pub const MAX_EXPANSION_SPEED_MULTIPLIER: f32 = 10.0;
 /// CPU-side input prepared for one biofeedback draw.
 ///
 /// Construction performs all normalization needed before the callback reaches wgpu. The
-/// resulting uniform upload is fixed at 48 bytes regardless of the instance count.
+/// resulting uniform upload is fixed at 64 bytes regardless of the instance count.
 #[derive(Debug, Clone, Copy)]
 pub struct PreparedVisualFrame {
     uniforms: VisualUniforms,
@@ -141,25 +143,29 @@ impl PreparedVisualFrame {
                 viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
                 radius_range: [0.0; 2],
                 layer_rotation_radians: [0.0; 4],
+                effect_params: [0.0; 4],
             },
         }
     }
 
-    fn breath_kasina(
+    fn kasina(
+        style: u32,
         layer_rotation_radians: [f32; 4],
         respiration: f32,
         viewport_points: [f32; 2],
         radius_range: [f32; 2],
+        effect_params: [f32; 4],
     ) -> Self {
         Self {
             uniforms: VisualUniforms {
                 time_seconds: 0.0,
                 respiration: respiration.clamp(0.0, 1.0),
                 instance_count: 1,
-                style: BREATH_KASINA_STYLE,
+                style,
                 viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
                 radius_range,
                 layer_rotation_radians,
+                effect_params,
             },
         }
     }
@@ -198,6 +204,8 @@ pub trait KasinaVisual: std::fmt::Debug + Send + Sync {
     fn implementation_id(&self) -> &'static str;
     /// User-facing implementation name.
     fn display_name(&self) -> &'static str;
+    /// Return four independently integrated animation speeds for this frame.
+    fn layer_speeds(&self, expansion: f32) -> [f32; 4];
     /// Prepare one constant-size GPU update.
     fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame;
 }
@@ -276,19 +284,35 @@ impl LuminousMandala {
         if !options.rotation_enabled {
             return [0.0; 4];
         }
-        let factor = 1.0 + expansion.clamp(0.0, 1.0) * (options.expansion_speed_multiplier - 1.0);
-        [
-            options.inner_rotations_per_second,
-            options.middle_rotations_per_second,
-            options.third_rotations_per_second,
-            options.gold_rotations_per_second,
-        ]
-        .map(|speed| (speed * factor).min(MAX_ROTATIONS_PER_SECOND))
+        modulated_layer_speeds(
+            [
+                options.inner_rotations_per_second,
+                options.middle_rotations_per_second,
+                options.third_rotations_per_second,
+                options.gold_rotations_per_second,
+            ],
+            options.expansion_speed_multiplier,
+            expansion,
+        )
     }
 }
 
 fn sanitize_rotation_rate(speed: f32) -> f32 {
     speed.clamp(MIN_ROTATIONS_PER_SECOND, MAX_ROTATIONS_PER_SECOND)
+}
+
+fn modulated_layer_speeds(
+    base_speeds: [f32; 4],
+    expansion_speed_multiplier: f32,
+    expansion: f32,
+) -> [f32; 4] {
+    let factor = 1.0
+        + expansion.clamp(0.0, 1.0)
+            * (expansion_speed_multiplier.clamp(
+                MIN_EXPANSION_SPEED_MULTIPLIER,
+                MAX_EXPANSION_SPEED_MULTIPLIER,
+            ) - 1.0);
+    base_speeds.map(|speed| (speed * factor).min(MAX_ROTATIONS_PER_SECOND))
 }
 
 impl Default for LuminousMandala {
@@ -316,6 +340,10 @@ impl KasinaVisual for LuminousMandala {
         "Luminous mandala"
     }
 
+    fn layer_speeds(&self, expansion: f32) -> [f32; 4] {
+        LuminousMandala::layer_speeds(self, expansion)
+    }
+
     fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame {
         let options = self.sanitized();
         let layer_rotation_radians = if options.rotation_enabled {
@@ -325,11 +353,146 @@ impl KasinaVisual for LuminousMandala {
         } else {
             [0.0; 4]
         };
-        PreparedVisualFrame::breath_kasina(
+        PreparedVisualFrame::kasina(
+            BREATH_KASINA_STYLE,
             layer_rotation_radians,
             input.respiration,
             input.viewport_points,
             [options.minimum_radius, options.maximum_radius],
+            [0.0; 4],
+        )
+    }
+}
+
+/// A prismatic spiral field inspired by aurora curtains and cymatic interference.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuroraVortex {
+    /// Radius at the bottom of the calibrated breathing range.
+    pub minimum_radius: f32,
+    /// Radius at the top of the calibrated breathing range.
+    pub maximum_radius: f32,
+    /// Whether the vortex layers rotate.
+    pub rotation_enabled: bool,
+    /// Contracted rotation speed of the breathing iris.
+    pub iris_rotations_per_second: f32,
+    /// Contracted rotation speed of the opposing filament field.
+    pub filament_rotations_per_second: f32,
+    /// Contracted rotation speed of the outer halo.
+    pub halo_rotations_per_second: f32,
+    /// Contracted rotation speed of the spark orbit.
+    pub spark_rotations_per_second: f32,
+    /// Speed multiplier reached at full expansion. One disables breath modulation.
+    pub expansion_speed_multiplier: f32,
+    /// Number of spiral arms.
+    pub arms: u32,
+    /// Logarithmic spiral winding amount.
+    pub twist: f32,
+    /// Intensity of the luminous lines and aura.
+    pub glow: f32,
+    /// Position around the spectral color wheel, from zero to one.
+    pub hue: f32,
+}
+
+impl AuroraVortex {
+    /// Clamp loaded or edited settings to stable visual and performance bounds.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.minimum_radius = self.minimum_radius.clamp(0.12, 0.80);
+        self.maximum_radius = self.maximum_radius.clamp(0.20, 1.00);
+        if self.maximum_radius < self.minimum_radius + 0.05 {
+            self.maximum_radius = (self.minimum_radius + 0.05).min(1.00);
+            self.minimum_radius = self.minimum_radius.min(self.maximum_radius - 0.05);
+        }
+        self.iris_rotations_per_second = sanitize_rotation_rate(self.iris_rotations_per_second);
+        self.filament_rotations_per_second =
+            sanitize_rotation_rate(self.filament_rotations_per_second);
+        self.halo_rotations_per_second = sanitize_rotation_rate(self.halo_rotations_per_second);
+        self.spark_rotations_per_second = sanitize_rotation_rate(self.spark_rotations_per_second);
+        self.expansion_speed_multiplier = self.expansion_speed_multiplier.clamp(
+            MIN_EXPANSION_SPEED_MULTIPLIER,
+            MAX_EXPANSION_SPEED_MULTIPLIER,
+        );
+        self.arms = self.arms.clamp(3, 24);
+        self.twist = self.twist.clamp(1.0, 14.0);
+        self.glow = self.glow.clamp(0.35, 2.50);
+        self.hue = self.hue.rem_euclid(1.0);
+        self
+    }
+
+    /// Return the four instantaneous vortex speeds for the current breath expansion.
+    #[must_use]
+    pub fn layer_speeds(&self, expansion: f32) -> [f32; 4] {
+        let options = self.sanitized();
+        if !options.rotation_enabled {
+            return [0.0; 4];
+        }
+        modulated_layer_speeds(
+            [
+                options.iris_rotations_per_second,
+                options.filament_rotations_per_second,
+                options.halo_rotations_per_second,
+                options.spark_rotations_per_second,
+            ],
+            options.expansion_speed_multiplier,
+            expansion,
+        )
+    }
+}
+
+impl Default for AuroraVortex {
+    fn default() -> Self {
+        Self {
+            minimum_radius: 0.34,
+            maximum_radius: 0.88,
+            rotation_enabled: true,
+            iris_rotations_per_second: 0.035,
+            filament_rotations_per_second: 0.022,
+            halo_rotations_per_second: 0.014,
+            spark_rotations_per_second: 0.055,
+            expansion_speed_multiplier: 2.8,
+            arms: 9,
+            twist: 7.5,
+            glow: 1.25,
+            hue: 0.54,
+        }
+    }
+}
+
+impl KasinaVisual for AuroraVortex {
+    fn implementation_id(&self) -> &'static str {
+        "aurora-vortex"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Aurora vortex"
+    }
+
+    fn layer_speeds(&self, expansion: f32) -> [f32; 4] {
+        AuroraVortex::layer_speeds(self, expansion)
+    }
+
+    fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame {
+        let options = self.sanitized();
+        let layer_rotation_radians = if options.rotation_enabled {
+            input
+                .layer_rotation_phases
+                .map(|phase| phase.rem_euclid(1.0) * std::f32::consts::TAU)
+        } else {
+            [0.0; 4]
+        };
+        PreparedVisualFrame::kasina(
+            AURORA_VORTEX_STYLE,
+            layer_rotation_radians,
+            input.respiration,
+            input.viewport_points,
+            [options.minimum_radius, options.maximum_radius],
+            [
+                options.arms as f32,
+                options.twist,
+                options.glow,
+                options.hue,
+            ],
         )
     }
 }
@@ -417,6 +580,7 @@ impl BiofeedbackRenderer {
             viewport_points: [1.0, 1.0],
             radius_range: [0.0; 2],
             layer_rotation_radians: [0.0; 4],
+            effect_params: [0.0; 4],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("newKasina biofeedback uniforms"),
@@ -599,7 +763,7 @@ mod tests {
         assert_eq!(low.uniforms.viewport_points, [1.0, 1.0]);
         assert_eq!(high.uniforms.respiration, 1.0);
         assert_eq!(high.uniforms.instance_count, 100_000);
-        assert_eq!(low.upload_bytes().len(), 48);
+        assert_eq!(low.upload_bytes().len(), 64);
         assert_eq!(high.upload_bytes().len(), low.upload_bytes().len());
     }
 
@@ -615,7 +779,7 @@ mod tests {
         assert_eq!(frame.uniforms.style, BREATH_KASINA_STYLE);
         assert_eq!(frame.uniforms.radius_range, [0.40, 0.82]);
         assert_eq!(frame.instance_count(), 1);
-        assert_eq!(frame.upload_bytes().len(), 48);
+        assert_eq!(frame.upload_bytes().len(), 64);
         assert_eq!(
             frame.uniforms.layer_rotation_radians,
             [
@@ -685,6 +849,37 @@ mod tests {
             ..visual
         };
         assert_eq!(disabled.layer_speeds(1.0), [0.0; 4]);
+    }
+
+    #[test]
+    fn aurora_vortex_prepares_distinct_effect_parameters_and_speeds() {
+        let visual = AuroraVortex::default();
+        let frame = visual.prepare_frame(KasinaFrameInput {
+            layer_rotation_phases: [0.10, 0.20, 0.30, 0.40],
+            respiration: 0.75,
+            viewport_points: [1_200.0, 800.0],
+        });
+
+        assert_eq!(frame.uniforms.style, AURORA_VORTEX_STYLE);
+        assert_eq!(frame.uniforms.radius_range, [0.34, 0.88]);
+        assert_eq!(frame.uniforms.effect_params, [9.0, 7.5, 1.25, 0.54]);
+        assert_eq!(frame.upload_bytes().len(), 64);
+        let speeds = visual.layer_speeds(0.0);
+        assert!(speeds[0] > speeds[1]);
+        assert!(speeds[3] > speeds[2]);
+
+        let invalid = AuroraVortex {
+            arms: 100,
+            twist: -4.0,
+            glow: 8.0,
+            hue: 2.25,
+            ..visual
+        }
+        .sanitized();
+        assert_eq!(invalid.arms, 24);
+        assert_eq!(invalid.twist, 1.0);
+        assert_eq!(invalid.glow, 2.5);
+        assert_eq!(invalid.hue, 0.25);
     }
 
     fn assert_array_close(actual: [f32; 4], expected: [f32; 4]) {

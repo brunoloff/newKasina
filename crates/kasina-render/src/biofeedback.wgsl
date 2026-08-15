@@ -6,6 +6,7 @@ struct VisualUniforms {
     viewport_points: vec2<f32>,
     radius_range: vec2<f32>,
     layer_rotation_radians: vec4<f32>,
+    effect_params: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -33,7 +34,7 @@ fn vertex_main(
     let local = corners[vertex_index];
     var output: VertexOutput;
 
-    if visual.style == 1u {
+    if visual.style != 0u {
         output.position = vec4<f32>(local, 0.0, 1.0);
         output.local = local;
         output.color = vec3<f32>(0.0);
@@ -63,6 +64,16 @@ fn line_glow(distance_to_line: f32, width: f32, glow_width: f32) -> f32 {
     let core = 1.0 - smoothstep(0.0, width, distance_to_line);
     let glow = 1.0 - smoothstep(width, glow_width, distance_to_line);
     return core + glow * 0.38;
+}
+
+fn spectral_color(hue: f32) -> vec3<f32> {
+    let shifted = fract(vec3<f32>(hue) + vec3<f32>(0.0, 0.6666667, 0.3333333));
+    let rgb = clamp(
+        abs(shifted * 6.0 - vec3<f32>(3.0)) - vec3<f32>(1.0),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    return rgb * rgb * (vec3<f32>(3.0) - 2.0 * rgb);
 }
 
 fn breath_mandala(local: vec2<f32>) -> vec4<f32> {
@@ -126,10 +137,89 @@ fn breath_mandala(local: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(color, 1.0);
 }
 
+fn aurora_vortex(local: vec2<f32>) -> vec4<f32> {
+    let aspect = max(visual.viewport_points.x / max(visual.viewport_points.y, 1.0), 0.25);
+    let point = local * vec2<f32>(aspect, 1.0);
+    let screen_radius = length(point);
+    let breath = smoothstep(0.0, 1.0, visual.respiration);
+    let vortex_radius = mix(visual.radius_range.x, visual.radius_range.y, breath);
+    let p = point / vortex_radius;
+    let radius = length(p);
+    let angle = atan2(p.y, p.x);
+    let safe_radius = max(radius, 0.025);
+    let log_radius = log(safe_radius);
+    let rotation = visual.layer_rotation_radians;
+    let arms = max(visual.effect_params.x, 3.0);
+    let twist = visual.effect_params.y;
+    let glow = visual.effect_params.z;
+    let hue = visual.effect_params.w;
+
+    let iris_angle = angle - rotation.x;
+    let filament_angle = angle + rotation.y;
+    let halo_angle = angle - rotation.z;
+    let spark_angle = angle + rotation.w;
+
+    let deep_space = vec3<f32>(0.002, 0.004, 0.018);
+    let atmospheric_halo = exp(-screen_radius * 2.1) * (0.08 + breath * 0.08);
+    var color = deep_space
+        + spectral_color(hue + 0.58) * atmospheric_halo * 0.075;
+
+    let iris_shape = 0.225 + breath * 0.055 + 0.080 * cos(iris_angle * arms);
+    let iris = line_glow(abs(radius - iris_shape), 0.009, 0.055);
+
+    let spiral_window = smoothstep(0.18, 0.30, radius)
+        * (1.0 - smoothstep(0.73, 1.03, radius));
+    let primary_phase = iris_angle * arms + log_radius * twist;
+    let opposing_phase = filament_angle * (arms + 3.0) - log_radius * twist * 0.72;
+    let primary_filaments = pow(max(1.0 - abs(sin(primary_phase)), 0.0), 13.0)
+        * spiral_window;
+    let opposing_filaments = pow(max(1.0 - abs(sin(opposing_phase)), 0.0), 12.0)
+        * spiral_window;
+    let interference = pow(
+        max(cos(primary_phase) * cos(opposing_phase), 0.0),
+        7.0,
+    ) * smoothstep(0.25, 0.38, radius)
+        * (1.0 - smoothstep(0.68, 0.92, radius));
+
+    let halo_shape = 0.825
+        + 0.034 * sin(halo_angle * arms * 2.0 + log_radius * 1.7);
+    let halo = line_glow(abs(radius - halo_shape), 0.008, 0.050);
+    let spark_wave = abs(sin(spark_angle * arms * 2.0 + radius * 4.0));
+    let sparks = pow(max(1.0 - spark_wave, 0.0), 24.0)
+        * line_glow(abs(radius - 0.955), 0.008, 0.036);
+
+    let angular_hue = angle / 6.2831853;
+    let primary_color = spectral_color(hue + angular_hue + breath * 0.08);
+    let opposing_color = spectral_color(hue + 0.34 - angular_hue * 0.65);
+    let iris_color = spectral_color(hue + 0.72 + breath * 0.10);
+    let halo_color = spectral_color(hue + 0.16 + radius * 0.22);
+    color += iris_color * iris * glow * 0.82;
+    color += primary_color * primary_filaments * glow * 0.78;
+    color += opposing_color * opposing_filaments * glow * 0.72;
+    color += mix(primary_color, opposing_color, 0.5) * interference * glow * 1.35;
+    color += halo_color * halo * glow * 0.70;
+    color += mix(halo_color, vec3<f32>(1.0, 0.82, 0.42), 0.58) * sparks * glow;
+
+    let corona = exp(-pow(abs(radius - 0.145) * 10.0, 2.0));
+    let central_star = exp(-radius * radius * 180.0);
+    color += spectral_color(hue + 0.83) * corona * glow * 0.65;
+    color += vec3<f32>(0.82, 0.96, 1.0) * central_star * (0.75 + breath * 0.55);
+    color *= 0.24 + 0.76 * smoothstep(0.055, 0.19, radius) + central_star;
+
+    let aura = exp(-abs(screen_radius - vortex_radius * 0.82) * 13.0) * 0.11;
+    color += spectral_color(hue + breath * 0.12) * aura * glow;
+    let vignette = 1.0 - smoothstep(0.72, 1.55, screen_radius);
+    color *= 0.50 + 0.50 * vignette;
+    return vec4<f32>(color, 1.0);
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if visual.style == 1u {
         return breath_mandala(input.local);
+    }
+    if visual.style == 2u {
+        return aurora_vortex(input.local);
     }
 
     let distance_from_center = length(input.local);
