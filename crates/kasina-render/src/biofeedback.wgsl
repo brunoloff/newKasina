@@ -231,6 +231,19 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     let warp = visual.effect_params.z;
     let hue = visual.effect_params.w;
 
+    // Full-screen kasinas draw one instance, so this style reuses the particle instance
+    // field as its exact breath generation. The time scalar packs direction and inhale
+    // progress: [0.0, 0.5) is inhale, while [0.5, 1.0) is exhale/settling.
+    let breath_generation = f32(visual.instance_count);
+    let packed_breath_phase = visual.time_seconds;
+    let inhaling = packed_breath_phase < 0.5;
+    let insertion_progress = select(
+        1.0,
+        smoothstep(0.0, 1.0, packed_breath_phase / 0.49),
+        inhaling,
+    );
+    let exhale_settle = select(1.0 - breath, 0.0, inhaling);
+
     // Fold the plane into one mirrored wedge. Every operation below is performed on
     // this folded coordinate, so even the slowly changing organic field preserves exact
     // kaleidoscopic symmetry without textures or per-frame CPU geometry.
@@ -239,11 +252,34 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     let folded_angle = abs(wedge_phase) * sector_width;
     let mirror_axis = folded_angle / max(sector_width * 0.5, 0.001);
 
-    // Opening the aperture also pushes the sampled radial material gently outward. The
-    // black center is therefore the unmistakable breath signal, while the surrounding
-    // image appears to yield to it instead of merely being covered by a disk.
-    let aperture = mix(visual.radius_range.x, visual.radius_range.y, breath);
-    let source_radius = max(screen_radius - aperture * 0.62, 0.0) * (1.0 + breath * 0.10);
+    // A new generation begins as a colored seed, grows monotonically through inhale, and
+    // remains committed during exhale. Subtracting its current width before indexing the
+    // older bands pushes every previous breath outward; layers beyond the viewport simply
+    // disappear. The small mirrored perturbation gives boundaries an organic scallop.
+    let seed_radius = visual.radius_range.x;
+    let completed_layer_width = visual.radius_range.y;
+    let inserted_width = mix(seed_radius, completed_layer_width, insertion_progress);
+    let boundary_warp = sin(
+        mirror_axis * 3.1415927
+            + screen_radius * density * 2.1
+            + rotation.y * 0.45,
+    ) * warp * 0.012 * smoothstep(0.04, 0.35, screen_radius);
+    let band_radius = max(screen_radius + boundary_warp, 0.0);
+    let is_new_layer = band_radius < inserted_width;
+    let older_coordinate = max(band_radius - inserted_width, 0.0) / completed_layer_width;
+    let older_layer_offset = floor(older_coordinate) + 1.0;
+    let layer_generation = select(
+        breath_generation - older_layer_offset,
+        breath_generation,
+        is_new_layer,
+    );
+    let layer_fraction = select(
+        fract(older_coordinate),
+        band_radius / max(inserted_width, seed_radius),
+        is_new_layer,
+    );
+
+    let source_radius = screen_radius * (1.0 + breath * 0.035);
     let folded = vec2<f32>(cos(folded_angle), sin(folded_angle)) * source_radius;
     let morph_phase = rotation.y;
     let palette_phase = rotation.z / 6.2831853;
@@ -257,7 +293,8 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     // Several inexpensive continuous fields create broad mineral-like regions, nested
     // rings, fine contour ridges, and occasional jewel points. Their phases move at
     // different rates, so the same algorithm keeps generating new coherent motifs.
-    let radial_phase = source_radius * density * 6.2831853;
+    let radial_phase = source_radius * density * 6.2831853
+        + layer_fraction * 1.7;
     let cross_field = sin((q.x * 2.7 + q.y * 3.4) * density + morph_phase)
         * cos((q.y * 2.1 - q.x * 1.6) * density - warp_phase);
     let flowing_field = sin(
@@ -277,16 +314,31 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
         flowing_field * 1.15 - cross_field * 1.55 - radial_phase * 0.17,
     );
 
-    let base = organic_palette(
-        hue + material * 0.23 + source_radius * 0.075 + palette_phase * 0.18,
+    // Every breath receives a stable deterministic hue. Material variation and palette
+    // drift remain deliberately smaller, so each concentric band stays recognizable as
+    // one historical breath even while its internal shapes continue to evolve.
+    let layer_hue = fract(
+        hue
+            + layer_generation * 0.381966
+            + (hash(layer_generation * 1.731 + 19.17) - 0.5) * 0.09,
     );
+    let base = organic_palette(layer_hue + material * 0.10 + palette_phase * 0.045);
     let accent = organic_palette(
-        hue + 0.29 - mineral * 0.19 - palette_phase * 0.13,
+        layer_hue + 0.22 - mineral * 0.09 - palette_phase * 0.032,
     );
-    let shadow = organic_palette(hue + 0.57 + petal_field * 0.11 + palette_phase * 0.09);
+    let shadow = organic_palette(
+        layer_hue + 0.48 + petal_field * 0.07 + palette_phase * 0.025,
+    );
     var color = mix(base, accent, smoothstep(0.30, 0.76, mineral));
     color = mix(color, shadow * 0.52, smoothstep(0.58, 0.94, petal_field) * 0.58);
     color *= 0.42 + material * 0.72;
+    let stable_breath_tint = organic_palette(layer_hue);
+    let material_luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    color = mix(
+        color,
+        stable_breath_tint * (0.32 + material_luminance * 1.05),
+        0.52,
+    );
 
     let ridge_phase = abs(sin(
         flowing_field * 2.05 + cross_field * 0.75 + radial_phase * 0.42,
@@ -298,26 +350,40 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     let jewels = pow(max(cos(
         radial_phase * 0.72 + mirror_axis * 6.2831853 + warp_phase,
     ), 0.0), 18.0) * smoothstep(0.22, 0.82, mineral);
-    color += organic_palette(hue + 0.12 + palette_phase * 0.12) * ridges * 0.44;
-    color += organic_palette(hue + 0.41 - palette_phase * 0.08) * ring_relief * 0.20;
+    color += organic_palette(layer_hue + 0.10 + palette_phase * 0.04) * ridges * 0.44;
+    color += organic_palette(layer_hue + 0.37 - palette_phase * 0.03) * ring_relief * 0.20;
     color += vec3<f32>(0.90, 0.96, 0.78) * jewels * 0.52;
 
-    let aperture_edge = aperture * (
-        1.0 + 0.035 * cos((angle - rotation.x) * sectors)
+    let boundary_distance = min(layer_fraction, 1.0 - layer_fraction)
+        * completed_layer_width;
+    let layer_seam = 1.0 - smoothstep(0.003, 0.022, boundary_distance);
+    color = mix(
+        color * 0.72,
+        organic_palette(layer_hue + 0.16) * 0.92,
+        layer_seam * 0.52,
     );
-    let outside_aperture = smoothstep(
-        aperture_edge - 0.006,
-        aperture_edge + 0.018,
+
+    // During exhale the newest band's bright nucleus condenses toward the center while
+    // its outer boundary stays committed. At the next inhale a different generation hue
+    // is born inside it, making the discrete one-layer-per-breath history easy to read.
+    let newest_mask = select(0.0, 1.0, is_new_layer);
+    let settling_core_radius = inserted_width * mix(0.28, 0.82, breath);
+    let settling_core = 1.0 - smoothstep(
+        settling_core_radius * 0.72,
+        settling_core_radius,
         screen_radius,
     );
-    let aperture_rim = line_glow(
-        abs(screen_radius - aperture_edge),
-        0.0035,
-        0.024,
-    ) * smoothstep(aperture_edge - 0.002, aperture_edge + 0.025, screen_radius);
-    color *= outside_aperture;
-    color += organic_palette(hue + breath * 0.17 + palette_phase * 0.12)
-        * aperture_rim * outside_aperture * 0.58;
+    let core_color = organic_palette(layer_hue + 0.055 + palette_phase * 0.03);
+    color = mix(
+        color,
+        core_color * (0.82 + material * 0.48),
+        newest_mask * settling_core * (0.32 + exhale_settle * 0.24),
+    );
+    let newborn_glint = exp(
+        -screen_radius * screen_radius
+            / max(seed_radius * seed_radius * 0.32, 0.00002),
+    );
+    color += core_color * newborn_glint * newest_mask * (0.18 + (1.0 - insertion_progress) * 0.42);
 
     let outer_vignette = 1.0 - smoothstep(1.32, 1.82, screen_radius);
     color *= outer_vignette;

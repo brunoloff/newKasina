@@ -21,7 +21,8 @@ use kasina_protocol::v1::{
 };
 use kasina_protocol::{AUTH_HEADER, client_hello};
 use kasina_render::{
-    BiofeedbackRenderer, FrameStats, KasinaVisual, LuminousMandala, OrganicKaleidoscope,
+    BiofeedbackRenderer, FrameStats, KasinaAnimationInput, KasinaVisual, LuminousMandala,
+    OrganicKaleidoscope,
 };
 use serde::Serialize;
 use settings::{AppSettings, KasinaVisualPreset, SettingsWriter};
@@ -514,6 +515,21 @@ fn unix_time_ns() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreathDirection {
+    Unknown,
+    Inhaling,
+    Exhaling,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KasinaAnimationFrame {
+    expansion: f32,
+    layer_rotation_phases: [f32; 4],
+    breath_generation: u32,
+    inhaling: bool,
+}
+
 #[derive(Debug)]
 struct BreathKasinaState {
     raw_force: Option<f64>,
@@ -525,6 +541,9 @@ struct BreathKasinaState {
     samples_seen: u64,
     last_animation: Instant,
     layer_rotation_phases: [f32; 4],
+    breath_generation: u32,
+    breath_direction: BreathDirection,
+    direction_streak: i8,
 }
 
 impl BreathKasinaState {
@@ -539,6 +558,9 @@ impl BreathKasinaState {
             samples_seen: 0,
             last_animation: now,
             layer_rotation_phases: [0.0; 4],
+            breath_generation: 0,
+            breath_direction: BreathDirection::Unknown,
+            direction_streak: 0,
         }
     }
 
@@ -550,6 +572,8 @@ impl BreathKasinaState {
         self.displayed_expansion = 0.5;
         self.trend = 0.0;
         self.samples_seen = 0;
+        self.breath_direction = BreathDirection::Unknown;
+        self.direction_streak = 0;
     }
 
     fn observe(&mut self, force: f64) {
@@ -590,6 +614,7 @@ impl BreathKasinaState {
             ((force - self.low_force) / (self.high_force - self.low_force)).clamp(0.0, 1.0);
         self.target_expansion = (0.08 + normalized * 0.84) as f32;
         self.raw_force = Some(force);
+        self.update_breath_direction(normalized_change);
     }
 
     fn advance(&mut self, elapsed: Duration) -> f32 {
@@ -599,12 +624,54 @@ impl BreathKasinaState {
         self.displayed_expansion
     }
 
-    fn animated_frame(&mut self, now: Instant, visual: &dyn KasinaVisual) -> (f32, [f32; 4]) {
+    fn animated_frame(&mut self, now: Instant, visual: &dyn KasinaVisual) -> KasinaAnimationFrame {
         let elapsed = now.saturating_duration_since(self.last_animation);
         self.last_animation = now;
         let expansion = self.advance(elapsed);
-        let phases = self.advance_layer_rotations(elapsed, expansion, visual);
-        (expansion, phases)
+        let layer_rotation_phases = self.advance_layer_rotations(elapsed, expansion, visual);
+        KasinaAnimationFrame {
+            expansion,
+            layer_rotation_phases,
+            breath_generation: self.breath_generation,
+            inhaling: self.breath_direction == BreathDirection::Inhaling,
+        }
+    }
+
+    fn update_breath_direction(&mut self, normalized_change: f64) {
+        if self.samples_seen < 12 {
+            return;
+        }
+        self.direction_streak = if normalized_change > 0.003 {
+            if self.direction_streak > 0 {
+                self.direction_streak.saturating_add(1).min(3)
+            } else {
+                1
+            }
+        } else if normalized_change < -0.003 {
+            if self.direction_streak < 0 {
+                self.direction_streak.saturating_sub(1).max(-3)
+            } else {
+                -1
+            }
+        } else {
+            0
+        };
+        let next_direction = if self.direction_streak >= 2 {
+            Some(BreathDirection::Inhaling)
+        } else if self.direction_streak <= -2 {
+            Some(BreathDirection::Exhaling)
+        } else {
+            None
+        };
+        let Some(next_direction) = next_direction else {
+            return;
+        };
+        if next_direction == BreathDirection::Inhaling
+            && self.breath_direction != BreathDirection::Inhaling
+        {
+            self.breath_generation = self.breath_generation.wrapping_add(1);
+        }
+        self.breath_direction = next_direction;
     }
 
     fn advance_layer_rotations(
@@ -1128,7 +1195,7 @@ impl KasinaApp {
             self.mark_settings_changed(ui.ctx());
         }
         let active_visual = self.settings.active_preset().visual.clone();
-        let (expansion, layer_rotation_phases) = self
+        let animation = self
             .breath_kasina
             .animated_frame(Instant::now(), active_visual.as_visual());
         ui.label("The kasina follows the respiration belt directly: rising force expands it.");
@@ -1139,8 +1206,12 @@ impl KasinaApp {
                 ui,
                 size,
                 active_visual.as_visual(),
-                layer_rotation_phases,
-                expansion,
+                KasinaAnimationInput {
+                    layer_rotation_phases: animation.layer_rotation_phases,
+                    respiration: animation.expansion,
+                    breath_generation: animation.breath_generation,
+                    inhaling: animation.inhaling,
+                },
             );
         } else {
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -1153,13 +1224,12 @@ impl KasinaApp {
                 KasinaVisualPreset::AuroraVortex(options) => {
                     (options.minimum_radius, options.maximum_radius)
                 }
-                KasinaVisualPreset::OrganicKaleidoscope(options) => (
-                    options.minimum_aperture_radius,
-                    options.maximum_aperture_radius,
-                ),
+                KasinaVisualPreset::OrganicKaleidoscope(options) => {
+                    (options.seed_radius, options.completed_layer_width)
+                }
             };
             let radius = rect.width().min(rect.height())
-                * (minimum_radius + (maximum_radius - minimum_radius) * expansion)
+                * (minimum_radius + (maximum_radius - minimum_radius) * animation.expansion)
                 * 0.5;
             for ring in 1..=6 {
                 let fraction = ring as f32 / 6.0;
@@ -1603,23 +1673,20 @@ impl KasinaApp {
                             *options = options.sanitized();
                         }
                         KasinaVisualPreset::OrganicKaleidoscope(options) => {
-                            ui.strong("Closed aperture");
+                            ui.strong("Newborn seed size");
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(
-                                        &mut options.minimum_aperture_radius,
-                                        0.0..=0.40,
-                                    )
-                                    .fixed_decimals(3),
+                                    egui::Slider::new(&mut options.seed_radius, 0.005..=0.15)
+                                        .fixed_decimals(3),
                                 )
                                 .changed();
                             ui.end_row();
-                            ui.strong("Open aperture");
+                            ui.strong("Completed layer width");
                             changed |= ui
                                 .add(
                                     egui::Slider::new(
-                                        &mut options.maximum_aperture_radius,
-                                        0.02..=0.55,
+                                        &mut options.completed_layer_width,
+                                        0.06..=0.35,
                                     )
                                     .fixed_decimals(3),
                                 )
@@ -2666,6 +2733,32 @@ mod tests {
         assert_eq!(state.samples_seen, 2);
         assert!(after > before);
         assert!(after < state.target_expansion);
+    }
+
+    #[test]
+    fn each_exhale_to_inhale_transition_starts_one_new_breath_generation() {
+        let mut state = BreathKasinaState::new(Instant::now());
+        state.samples_seen = 12;
+
+        state.update_breath_direction(-0.2);
+        state.update_breath_direction(-0.2);
+        assert_eq!(state.breath_direction, BreathDirection::Exhaling);
+        assert_eq!(state.breath_generation, 0);
+
+        state.update_breath_direction(0.2);
+        assert_eq!(state.breath_direction, BreathDirection::Exhaling);
+        assert_eq!(state.breath_generation, 0);
+        state.update_breath_direction(0.2);
+        assert_eq!(state.breath_direction, BreathDirection::Inhaling);
+        assert_eq!(state.breath_generation, 1);
+        state.update_breath_direction(0.2);
+        assert_eq!(state.breath_generation, 1);
+
+        state.update_breath_direction(-0.2);
+        state.update_breath_direction(-0.2);
+        state.update_breath_direction(0.2);
+        state.update_breath_direction(0.2);
+        assert_eq!(state.breath_generation, 2);
     }
 
     #[test]

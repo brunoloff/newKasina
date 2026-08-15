@@ -103,9 +103,12 @@ Do not mark a milestone complete until its exit criteria pass.
   counter-rotating logarithmic filaments, a breathing iris, halo, and spark orbit with
   editable arms, twist, glow, hue, radii, and motion. The third `OrganicKaleidoscope`
   folds a continuously morphing procedural material field into mirrored radial sectors;
-  inhale opens an editable black aperture and gently displaces the surrounding rings.
-  Sector count, ring density, warp, palette, and four animation rates are editable. All
-  three implementations use the same fixed 64-byte GPU uniform and retained pipeline.
+  each confirmed exhale-to-inhale transition births a deterministic new color seed. It
+  grows into a permanent band during inhale, pushes the complete breath history outward,
+  and condenses internally during exhale; the oldest bands eventually leave the viewport.
+  Seed size, completed layer width, sector count, ring density, warp, palette, and four
+  animation rates are editable. All three implementations use the same fixed 64-byte GPU
+  uniform and retained pipeline.
 - In-app simulation mode, 2026-08-13: a persistent Settings toggle switches displayed
   input between the live service and a separate local synthetic model without restarting
   or reconfiguring acquisition. The shared deterministic generator produces a harmonic

@@ -126,6 +126,17 @@ pub struct PreparedVisualFrame {
     uniforms: VisualUniforms,
 }
 
+struct KasinaUniformInput {
+    style: u32,
+    animation_state: f32,
+    auxiliary_state: u32,
+    layer_rotation_radians: [f32; 4],
+    respiration: f32,
+    viewport_points: [f32; 2],
+    radius_range: [f32; 2],
+    effect_params: [f32; 4],
+}
+
 impl PreparedVisualFrame {
     /// Normalize one frame of visual state into the exact GPU uniform layout.
     #[must_use]
@@ -149,24 +160,20 @@ impl PreparedVisualFrame {
         }
     }
 
-    fn kasina(
-        style: u32,
-        layer_rotation_radians: [f32; 4],
-        respiration: f32,
-        viewport_points: [f32; 2],
-        radius_range: [f32; 2],
-        effect_params: [f32; 4],
-    ) -> Self {
+    fn kasina(input: KasinaUniformInput) -> Self {
         Self {
             uniforms: VisualUniforms {
-                time_seconds: 0.0,
-                respiration: respiration.clamp(0.0, 1.0),
-                instance_count: 1,
-                style,
-                viewport_points: [viewport_points[0].max(1.0), viewport_points[1].max(1.0)],
-                radius_range,
-                layer_rotation_radians,
-                effect_params,
+                time_seconds: input.animation_state,
+                respiration: input.respiration.clamp(0.0, 1.0),
+                instance_count: input.auxiliary_state,
+                style: input.style,
+                viewport_points: [
+                    input.viewport_points[0].max(1.0),
+                    input.viewport_points[1].max(1.0),
+                ],
+                radius_range: input.radius_range,
+                layer_rotation_radians: input.layer_rotation_radians,
+                effect_params: input.effect_params,
             },
         }
     }
@@ -180,7 +187,11 @@ impl PreparedVisualFrame {
     /// Number of instances emitted by the draw call.
     #[must_use]
     pub const fn instance_count(&self) -> u32 {
-        self.uniforms.instance_count
+        if self.uniforms.style == PARTICLE_STYLE {
+            self.uniforms.instance_count
+        } else {
+            1
+        }
     }
 }
 
@@ -193,6 +204,23 @@ pub struct KasinaFrameInput {
     pub respiration: f32,
     /// Available logical viewport size.
     pub viewport_points: [f32; 2],
+    /// Monotonic generation assigned whenever a new inhale begins.
+    pub breath_generation: u32,
+    /// Whether the latest confidently classified breath direction is inward.
+    pub inhaling: bool,
+}
+
+/// Transient kasina state supplied by the app before the renderer knows its viewport.
+#[derive(Debug, Clone, Copy)]
+pub struct KasinaAnimationInput {
+    /// Independently integrated layer phases, in complete rotations.
+    pub layer_rotation_phases: [f32; 4],
+    /// Smoothed expansion in the inclusive range zero to one.
+    pub respiration: f32,
+    /// Monotonic generation assigned whenever a new inhale begins.
+    pub breath_generation: u32,
+    /// Whether the latest confidently classified breath direction is inward.
+    pub inhaling: bool,
 }
 
 /// A renderable kasina implementation.
@@ -354,14 +382,16 @@ impl KasinaVisual for LuminousMandala {
         } else {
             [0.0; 4]
         };
-        PreparedVisualFrame::kasina(
-            BREATH_KASINA_STYLE,
+        PreparedVisualFrame::kasina(KasinaUniformInput {
+            style: BREATH_KASINA_STYLE,
+            animation_state: 0.0,
+            auxiliary_state: 1,
             layer_rotation_radians,
-            input.respiration,
-            input.viewport_points,
-            [options.minimum_radius, options.maximum_radius],
-            [0.0; 4],
-        )
+            respiration: input.respiration,
+            viewport_points: input.viewport_points,
+            radius_range: [options.minimum_radius, options.maximum_radius],
+            effect_params: [0.0; 4],
+        })
     }
 }
 
@@ -482,30 +512,34 @@ impl KasinaVisual for AuroraVortex {
         } else {
             [0.0; 4]
         };
-        PreparedVisualFrame::kasina(
-            AURORA_VORTEX_STYLE,
+        PreparedVisualFrame::kasina(KasinaUniformInput {
+            style: AURORA_VORTEX_STYLE,
+            animation_state: 0.0,
+            auxiliary_state: 1,
             layer_rotation_radians,
-            input.respiration,
-            input.viewport_points,
-            [options.minimum_radius, options.maximum_radius],
-            [
+            respiration: input.respiration,
+            viewport_points: input.viewport_points,
+            radius_range: [options.minimum_radius, options.maximum_radius],
+            effect_params: [
                 options.arms as f32,
                 options.twist,
                 options.glow,
                 options.hue,
             ],
-        )
+        })
     }
 }
 
-/// A continuously evolving radial kaleidoscope with a breath-controlled dark aperture.
+/// A continuously evolving radial kaleidoscope that accumulates one color layer per breath.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OrganicKaleidoscope {
-    /// Dark aperture radius at the bottom of the calibrated breathing range.
-    pub minimum_aperture_radius: f32,
-    /// Dark aperture radius at the top of the calibrated breathing range.
-    pub maximum_aperture_radius: f32,
+    /// Radius of the new color seed born when an inhale begins.
+    #[serde(alias = "minimum_aperture_radius")]
+    pub seed_radius: f32,
+    /// Width occupied by one completed breath layer.
+    #[serde(alias = "maximum_aperture_radius")]
+    pub completed_layer_width: f32,
     /// Whether the four independent animation channels advance.
     pub animation_enabled: bool,
     /// Rotation speed of the mirrored wedge geometry.
@@ -532,13 +566,11 @@ impl OrganicKaleidoscope {
     /// Clamp loaded or edited settings to stable visual and performance bounds.
     #[must_use]
     pub fn sanitized(mut self) -> Self {
-        self.minimum_aperture_radius = self.minimum_aperture_radius.clamp(0.0, 0.40);
-        self.maximum_aperture_radius = self.maximum_aperture_radius.clamp(0.02, 0.55);
-        if self.maximum_aperture_radius < self.minimum_aperture_radius + 0.02 {
-            self.maximum_aperture_radius = (self.minimum_aperture_radius + 0.02).min(0.55);
-            self.minimum_aperture_radius = self
-                .minimum_aperture_radius
-                .min(self.maximum_aperture_radius - 0.02);
+        self.seed_radius = self.seed_radius.clamp(0.005, 0.15);
+        self.completed_layer_width = self.completed_layer_width.clamp(0.06, 0.35);
+        if self.completed_layer_width < self.seed_radius + 0.02 {
+            self.completed_layer_width = (self.seed_radius + 0.02).min(0.35);
+            self.seed_radius = self.seed_radius.min(self.completed_layer_width - 0.02);
         }
         self.geometry_rotations_per_second =
             sanitize_rotation_rate(self.geometry_rotations_per_second);
@@ -580,8 +612,8 @@ impl OrganicKaleidoscope {
 impl Default for OrganicKaleidoscope {
     fn default() -> Self {
         Self {
-            minimum_aperture_radius: 0.045,
-            maximum_aperture_radius: 0.24,
+            seed_radius: 0.028,
+            completed_layer_width: 0.19,
             animation_enabled: true,
             geometry_rotations_per_second: 0.012,
             morph_rotations_per_second: 0.018,
@@ -618,22 +650,26 @@ impl KasinaVisual for OrganicKaleidoscope {
         } else {
             [0.0; 4]
         };
-        PreparedVisualFrame::kasina(
-            ORGANIC_KALEIDOSCOPE_STYLE,
+        let breath_phase = if input.inhaling {
+            input.respiration.clamp(0.0, 1.0) * 0.49
+        } else {
+            0.50 + input.respiration.clamp(0.0, 1.0) * 0.49
+        };
+        PreparedVisualFrame::kasina(KasinaUniformInput {
+            style: ORGANIC_KALEIDOSCOPE_STYLE,
+            animation_state: breath_phase,
+            auxiliary_state: input.breath_generation,
             layer_rotation_radians,
-            input.respiration,
-            input.viewport_points,
-            [
-                options.minimum_aperture_radius,
-                options.maximum_aperture_radius,
-            ],
-            [
+            respiration: input.respiration,
+            viewport_points: input.viewport_points,
+            radius_range: [options.seed_radius, options.completed_layer_width],
+            effect_params: [
                 options.sectors as f32,
                 options.ring_density,
                 options.warp,
                 options.hue,
             ],
-        )
+        })
     }
 }
 
@@ -781,14 +817,15 @@ impl BiofeedbackRenderer {
         ui: &mut egui::Ui,
         desired_size: egui::Vec2,
         visual: &dyn KasinaVisual,
-        layer_rotation_phases: [f32; 4],
-        respiration: f32,
+        animation: KasinaAnimationInput,
     ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
         let prepared = visual.prepare_frame(KasinaFrameInput {
-            layer_rotation_phases,
-            respiration,
+            layer_rotation_phases: animation.layer_rotation_phases,
+            respiration: animation.respiration,
             viewport_points: [rect.width(), rect.height()],
+            breath_generation: animation.breath_generation,
+            inhaling: animation.inhaling,
         });
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
@@ -847,7 +884,12 @@ impl egui_wgpu::CallbackTrait for BiofeedbackCallback {
         };
         render_pass.set_pipeline(&resources.pipeline);
         render_pass.set_bind_group(0, &resources.bind_group, &[]);
-        render_pass.draw(0..6, 0..self.uniforms.instance_count);
+        let instance_count = if self.uniforms.style == PARTICLE_STYLE {
+            self.uniforms.instance_count
+        } else {
+            1
+        };
+        render_pass.draw(0..6, 0..instance_count);
     }
 }
 
@@ -913,6 +955,8 @@ mod tests {
             layer_rotation_phases: [0.125, 0.25, 0.375, 0.5],
             respiration: 1.5,
             viewport_points: [900.0, 600.0],
+            breath_generation: 0,
+            inhaling: false,
         });
 
         assert_eq!(frame.uniforms.respiration, 1.0);
@@ -946,6 +990,8 @@ mod tests {
             layer_rotation_phases: [0.25; 4],
             respiration: 0.5,
             viewport_points: [100.0, 100.0],
+            breath_generation: 0,
+            inhaling: false,
         });
 
         assert!(sanitized.minimum_radius < sanitized.maximum_radius);
@@ -998,6 +1044,8 @@ mod tests {
             layer_rotation_phases: [0.10, 0.20, 0.30, 0.40],
             respiration: 0.75,
             viewport_points: [1_200.0, 800.0],
+            breath_generation: 0,
+            inhaling: false,
         });
 
         assert_eq!(frame.uniforms.style, AURORA_VORTEX_STYLE);
@@ -1023,17 +1071,22 @@ mod tests {
     }
 
     #[test]
-    fn organic_kaleidoscope_prepares_aperture_and_evolving_field_parameters() {
+    fn organic_kaleidoscope_prepares_breath_generation_and_field_parameters() {
         let visual = OrganicKaleidoscope::default();
         let frame = visual.prepare_frame(KasinaFrameInput {
             layer_rotation_phases: [0.10, 0.20, 0.30, 0.40],
             respiration: 0.75,
             viewport_points: [1_200.0, 800.0],
+            breath_generation: 7,
+            inhaling: true,
         });
 
         assert_eq!(frame.uniforms.style, ORGANIC_KALEIDOSCOPE_STYLE);
-        assert_eq!(frame.uniforms.radius_range, [0.045, 0.24]);
+        assert_eq!(frame.uniforms.radius_range, [0.028, 0.19]);
         assert_eq!(frame.uniforms.effect_params, [18.0, 6.5, 0.82, 0.06]);
+        assert!((frame.uniforms.time_seconds - 0.3675).abs() < 1.0e-5);
+        assert_eq!(frame.uniforms.instance_count, 7);
+        assert_eq!(frame.instance_count(), 1);
         assert_eq!(frame.upload_bytes().len(), 64);
         let contracted_speeds = visual.layer_speeds(0.0);
         let expanded_speeds = visual.layer_speeds(1.0);
@@ -1045,8 +1098,8 @@ mod tests {
         );
 
         let invalid = OrganicKaleidoscope {
-            minimum_aperture_radius: 0.50,
-            maximum_aperture_radius: 0.01,
+            seed_radius: 0.50,
+            completed_layer_width: 0.01,
             sectors: 100,
             ring_density: -4.0,
             warp: 8.0,
@@ -1054,7 +1107,7 @@ mod tests {
             ..visual
         }
         .sanitized();
-        assert!(invalid.minimum_aperture_radius < invalid.maximum_aperture_radius);
+        assert!(invalid.seed_radius < invalid.completed_layer_width);
         assert_eq!(invalid.sectors, 32);
         assert_eq!(invalid.ring_density, 2.0);
         assert_eq!(invalid.warp, 1.5);

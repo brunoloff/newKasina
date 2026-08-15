@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, bail};
 use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala, OrganicKaleidoscope};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 6;
+const SETTINGS_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -584,5 +584,39 @@ mod tests {
         assert_eq!(kaleidoscope_presets.len(), 1);
         assert_eq!(kaleidoscope_presets[0].name, "Kaleidoscopic bloom");
         assert_eq!(migrated.next_preset_id, 6);
+    }
+
+    #[test]
+    fn schema_six_kaleidoscope_aperture_options_migrate_to_breath_layers() {
+        let mut encoded = serde_json::to_value(AppSettings::default()).unwrap();
+        encoded["schema_version"] = serde_json::json!(6);
+        let options = encoded["presets"][4]["visual"]["options"]
+            .as_object_mut()
+            .unwrap();
+        options.remove("seed_radius");
+        options.remove("completed_layer_width");
+        options.insert(
+            "minimum_aperture_radius".to_owned(),
+            serde_json::json!(0.035),
+        );
+        options.insert(
+            "maximum_aperture_radius".to_owned(),
+            serde_json::json!(0.21),
+        );
+
+        let old_settings: AppSettings = serde_json::from_value(encoded).unwrap();
+        let migrated = old_settings.sanitized();
+        let KasinaVisualPreset::OrganicKaleidoscope(options) = &migrated.presets[4].visual else {
+            panic!("fifth default preset should be the organic kaleidoscope")
+        };
+
+        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(options.seed_radius, 0.035);
+        assert_eq!(options.completed_layer_width, 0.21);
+        let rewritten = serde_json::to_string(&migrated).unwrap();
+        assert!(rewritten.contains("seed_radius"));
+        assert!(rewritten.contains("completed_layer_width"));
+        assert!(!rewritten.contains("minimum_aperture_radius"));
+        assert!(!rewritten.contains("maximum_aperture_radius"));
     }
 }
