@@ -48,10 +48,17 @@ flow, petal, contour, relief, and palette phases. It does not need an image text
 per-frame geometry. A hysteretic breath-direction classifier advances one generation only
 on a confirmed exhale-to-inhale transition. The new generation starts as a distinct color
 seed, grows monotonically into a completed band during inhale, and pushes every older band
-outward. Exhale keeps the spatial insertion committed while condensing the new band's bright
-core; layers beyond the viewport are discarded implicitly by clipping. Band colors are
-deterministic functions of their generation, so the visible rings form a rolling breath
-history without uploading a color array. Presets expose seed size, completed layer width,
+outward. Exhale keeps the spatial insertion committed while the radial material contracts
+continuously; layers beyond the viewport are discarded implicitly by clipping. Band colors
+are deterministic functions of their generation, so the visible rings form a rolling breath
+history without uploading a color array. The state representation makes a completed
+generation `N + 1.0` position-equivalent to the next generation's `N+1 + 0.0`; a new seed
+therefore begins at zero area rather than replacing a finite disk. CPU insertion progress is
+monotonic, finishes smoothly after the inhale peak, and uses a zero-velocity smoothstep in
+the shader. Procedural phase is continuous across radial seams, every wrapped animation
+phase is genuinely periodic, and adjacent generation palettes cross-fade before the
+discrete band index changes. Presets expose seed size,
+completed layer width,
 sector count, ring density, organic warp, palette hue, four animation-cycle rates, and a
 breath-speed multiplier. Generation, direction, and insertion progress are packed into an
 otherwise unused kasina instance field plus one scalar while retaining the shared

@@ -527,6 +527,7 @@ struct KasinaAnimationFrame {
     expansion: f32,
     layer_rotation_phases: [f32; 4],
     breath_generation: u32,
+    breath_layer_progress: f32,
     inhaling: bool,
 }
 
@@ -542,6 +543,9 @@ struct BreathKasinaState {
     last_animation: Instant,
     layer_rotation_phases: [f32; 4],
     breath_generation: u32,
+    breath_layer_progress: f32,
+    inhale_start_expansion: f32,
+    pending_breath_generation: bool,
     breath_direction: BreathDirection,
     direction_streak: i8,
 }
@@ -559,6 +563,9 @@ impl BreathKasinaState {
             last_animation: now,
             layer_rotation_phases: [0.0; 4],
             breath_generation: 0,
+            breath_layer_progress: 1.0,
+            inhale_start_expansion: 0.0,
+            pending_breath_generation: false,
             breath_direction: BreathDirection::Unknown,
             direction_streak: 0,
         }
@@ -574,6 +581,7 @@ impl BreathKasinaState {
         self.samples_seen = 0;
         self.breath_direction = BreathDirection::Unknown;
         self.direction_streak = 0;
+        self.pending_breath_generation = false;
     }
 
     fn observe(&mut self, force: f64) {
@@ -628,13 +636,52 @@ impl BreathKasinaState {
         let elapsed = now.saturating_duration_since(self.last_animation);
         self.last_animation = now;
         let expansion = self.advance(elapsed);
+        self.advance_breath_layer(elapsed, expansion);
         let layer_rotation_phases = self.advance_layer_rotations(elapsed, expansion, visual);
         KasinaAnimationFrame {
             expansion,
             layer_rotation_phases,
             breath_generation: self.breath_generation,
+            breath_layer_progress: self.breath_layer_progress,
             inhaling: self.breath_direction == BreathDirection::Inhaling,
         }
+    }
+
+    fn advance_breath_layer(&mut self, elapsed: Duration, expansion: f32) {
+        match self.breath_direction {
+            BreathDirection::Inhaling => {
+                if self.pending_breath_generation {
+                    self.breath_layer_progress = (self.breath_layer_progress
+                        + elapsed.as_secs_f32().min(0.25) / 0.75)
+                        .min(1.0);
+                    if self.breath_layer_progress >= 1.0 {
+                        self.start_new_breath_layer(expansion);
+                    }
+                    return;
+                }
+                let available_span = (0.92 - self.inhale_start_expansion).max(0.10);
+                let progress =
+                    ((expansion - self.inhale_start_expansion) / available_span).clamp(0.0, 1.0);
+                self.breath_layer_progress = self.breath_layer_progress.max(progress);
+            }
+            BreathDirection::Exhaling => {
+                self.breath_layer_progress =
+                    (self.breath_layer_progress + elapsed.as_secs_f32().min(0.25) / 0.75).min(1.0);
+            }
+            BreathDirection::Unknown => {}
+        }
+    }
+
+    fn start_new_breath_layer(&mut self, expansion: f32) {
+        self.breath_generation = self.breath_generation.wrapping_add(1);
+        self.breath_layer_progress = 0.0;
+        self.inhale_start_expansion = expansion;
+        self.pending_breath_generation = false;
+    }
+
+    #[cfg(test)]
+    fn breath_history_position(&self) -> f64 {
+        f64::from(self.breath_generation) + f64::from(self.breath_layer_progress) - 1.0
     }
 
     fn update_breath_direction(&mut self, normalized_change: f64) {
@@ -669,7 +716,11 @@ impl BreathKasinaState {
         if next_direction == BreathDirection::Inhaling
             && self.breath_direction != BreathDirection::Inhaling
         {
-            self.breath_generation = self.breath_generation.wrapping_add(1);
+            if self.breath_layer_progress >= 1.0 {
+                self.start_new_breath_layer(self.displayed_expansion);
+            } else {
+                self.pending_breath_generation = true;
+            }
         }
         self.breath_direction = next_direction;
     }
@@ -1210,6 +1261,7 @@ impl KasinaApp {
                     layer_rotation_phases: animation.layer_rotation_phases,
                     respiration: animation.expansion,
                     breath_generation: animation.breath_generation,
+                    breath_layer_progress: animation.breath_layer_progress,
                     inhaling: animation.inhaling,
                 },
             );
@@ -2744,6 +2796,7 @@ mod tests {
         state.update_breath_direction(-0.2);
         assert_eq!(state.breath_direction, BreathDirection::Exhaling);
         assert_eq!(state.breath_generation, 0);
+        let completed_position = state.breath_history_position();
 
         state.update_breath_direction(0.2);
         assert_eq!(state.breath_direction, BreathDirection::Exhaling);
@@ -2751,14 +2804,20 @@ mod tests {
         state.update_breath_direction(0.2);
         assert_eq!(state.breath_direction, BreathDirection::Inhaling);
         assert_eq!(state.breath_generation, 1);
+        assert_eq!(state.breath_history_position(), completed_position);
         state.update_breath_direction(0.2);
         assert_eq!(state.breath_generation, 1);
 
         state.update_breath_direction(-0.2);
         state.update_breath_direction(-0.2);
+        for _ in 0..3 {
+            state.advance_breath_layer(Duration::from_millis(250), 0.80);
+        }
+        let next_completed_position = state.breath_history_position();
         state.update_breath_direction(0.2);
         state.update_breath_direction(0.2);
         assert_eq!(state.breath_generation, 2);
+        assert_eq!(state.breath_history_position(), next_completed_position);
     }
 
     #[test]

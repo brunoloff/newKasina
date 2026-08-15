@@ -206,6 +206,8 @@ pub struct KasinaFrameInput {
     pub viewport_points: [f32; 2],
     /// Monotonic generation assigned whenever a new inhale begins.
     pub breath_generation: u32,
+    /// Monotonic insertion progress of the newest breath layer.
+    pub breath_layer_progress: f32,
     /// Whether the latest confidently classified breath direction is inward.
     pub inhaling: bool,
 }
@@ -219,6 +221,8 @@ pub struct KasinaAnimationInput {
     pub respiration: f32,
     /// Monotonic generation assigned whenever a new inhale begins.
     pub breath_generation: u32,
+    /// Monotonic insertion progress of the newest breath layer.
+    pub breath_layer_progress: f32,
     /// Whether the latest confidently classified breath direction is inward.
     pub inhaling: bool,
 }
@@ -650,10 +654,11 @@ impl KasinaVisual for OrganicKaleidoscope {
         } else {
             [0.0; 4]
         };
+        let layer_progress = input.breath_layer_progress.clamp(0.0, 1.0);
         let breath_phase = if input.inhaling {
-            input.respiration.clamp(0.0, 1.0) * 0.49
+            layer_progress * 0.49
         } else {
-            0.50 + input.respiration.clamp(0.0, 1.0) * 0.49
+            0.50 + layer_progress * 0.49
         };
         PreparedVisualFrame::kasina(KasinaUniformInput {
             style: ORGANIC_KALEIDOSCOPE_STYLE,
@@ -825,6 +830,7 @@ impl BiofeedbackRenderer {
             respiration: animation.respiration,
             viewport_points: [rect.width(), rect.height()],
             breath_generation: animation.breath_generation,
+            breath_layer_progress: animation.breath_layer_progress,
             inhaling: animation.inhaling,
         });
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -956,6 +962,7 @@ mod tests {
             respiration: 1.5,
             viewport_points: [900.0, 600.0],
             breath_generation: 0,
+            breath_layer_progress: 1.0,
             inhaling: false,
         });
 
@@ -991,6 +998,7 @@ mod tests {
             respiration: 0.5,
             viewport_points: [100.0, 100.0],
             breath_generation: 0,
+            breath_layer_progress: 1.0,
             inhaling: false,
         });
 
@@ -1045,6 +1053,7 @@ mod tests {
             respiration: 0.75,
             viewport_points: [1_200.0, 800.0],
             breath_generation: 0,
+            breath_layer_progress: 1.0,
             inhaling: false,
         });
 
@@ -1078,6 +1087,7 @@ mod tests {
             respiration: 0.75,
             viewport_points: [1_200.0, 800.0],
             breath_generation: 7,
+            breath_layer_progress: 0.75,
             inhaling: true,
         });
 

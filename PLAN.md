@@ -105,7 +105,11 @@ Do not mark a milestone complete until its exit criteria pass.
   folds a continuously morphing procedural material field into mirrored radial sectors;
   each confirmed exhale-to-inhale transition births a deterministic new color seed. It
   grows into a permanent band during inhale, pushes the complete breath history outward,
-  and condenses internally during exhale; the oldest bands eventually leave the viewport.
+  and settles through a continuous radial contraction during exhale; the oldest bands
+  eventually leave the viewport. Generation rollover is position-equivalent, insertion
+  uses a zero-velocity smoothstep, wrapped animation phases remain periodic, and adjacent
+  palettes cross-fade at moving boundaries, so breath reversals, full turns, and layer
+  seams do not introduce frame discontinuities.
   Seed size, completed layer width, sector count, ring density, warp, palette, and four
   animation rates are editable. All three implementations use the same fixed 64-byte GPU
   uniform and retained pipeline.

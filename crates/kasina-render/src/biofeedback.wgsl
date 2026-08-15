@@ -82,6 +82,19 @@ fn organic_palette(value: f32) -> vec3<f32> {
         + vec3<f32>(0.48, 0.44, 0.41) * cos(phase);
 }
 
+fn layered_organic_palette(
+    inner_hue: f32,
+    outward_hue: f32,
+    outward_blend: f32,
+    offset: f32,
+) -> vec3<f32> {
+    return mix(
+        organic_palette(inner_hue + offset),
+        organic_palette(outward_hue + offset),
+        outward_blend,
+    );
+}
+
 fn breath_mandala(local: vec2<f32>) -> vec4<f32> {
     let aspect = max(visual.viewport_points.x / max(visual.viewport_points.y, 1.0), 0.25);
     let point = local * vec2<f32>(aspect, 1.0);
@@ -238,11 +251,10 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     let packed_breath_phase = visual.time_seconds;
     let inhaling = packed_breath_phase < 0.5;
     let insertion_progress = select(
-        1.0,
-        smoothstep(0.0, 1.0, packed_breath_phase / 0.49),
+        clamp((packed_breath_phase - 0.50) / 0.49, 0.0, 1.0),
+        clamp(packed_breath_phase / 0.49, 0.0, 1.0),
         inhaling,
     );
-    let exhale_settle = select(1.0 - breath, 0.0, inhaling);
 
     // Fold the plane into one mirrored wedge. Every operation below is performed on
     // this folded coordinate, so even the slowly changing organic field preserves exact
@@ -252,17 +264,18 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     let folded_angle = abs(wedge_phase) * sector_width;
     let mirror_axis = folded_angle / max(sector_width * 0.5, 0.001);
 
-    // A new generation begins as a colored seed, grows monotonically through inhale, and
-    // remains committed during exhale. Subtracting its current width before indexing the
-    // older bands pushes every previous breath outward; layers beyond the viewport simply
-    // disappear. The small mirrored perturbation gives boundaries an organic scallop.
+    // A new generation grows monotonically from zero area and finishes settling if the
+    // inhale ends early. Subtracting its current width before indexing the older bands
+    // pushes every previous breath outward; layers beyond the viewport simply disappear.
+    // The small mirrored perturbation gives boundaries an organic scallop.
     let seed_radius = visual.radius_range.x;
     let completed_layer_width = visual.radius_range.y;
-    let inserted_width = mix(seed_radius, completed_layer_width, insertion_progress);
+    let inserted_width = completed_layer_width
+        * insertion_progress * insertion_progress * (3.0 - 2.0 * insertion_progress);
     let boundary_warp = sin(
         mirror_axis * 3.1415927
             + screen_radius * density * 2.1
-            + rotation.y * 0.45,
+            + rotation.y,
     ) * warp * 0.012 * smoothstep(0.04, 0.35, screen_radius);
     let band_radius = max(screen_radius + boundary_warp, 0.0);
     let is_new_layer = band_radius < inserted_width;
@@ -275,14 +288,16 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     );
     let layer_fraction = select(
         fract(older_coordinate),
-        band_radius / max(inserted_width, seed_radius),
+        band_radius / max(inserted_width, 0.0001),
         is_new_layer,
     );
 
     let source_radius = screen_radius * (1.0 + breath * 0.035);
     let folded = vec2<f32>(cos(folded_angle), sin(folded_angle)) * source_radius;
     let morph_phase = rotation.y;
-    let palette_phase = rotation.z / 6.2831853;
+    // CPU phases wrap once per turn. Every shader use must therefore be periodic at that
+    // boundary: a non-periodic scale of the wrapped phase would create a visible hue jump.
+    let palette_drift = 0.5 - 0.5 * cos(rotation.z);
     let warp_phase = rotation.w;
     let distortion = vec2<f32>(
         sin(source_radius * density * 1.75 + morph_phase + mirror_axis * 2.2),
@@ -293,8 +308,7 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     // Several inexpensive continuous fields create broad mineral-like regions, nested
     // rings, fine contour ridges, and occasional jewel points. Their phases move at
     // different rates, so the same algorithm keeps generating new coherent motifs.
-    let radial_phase = source_radius * density * 6.2831853
-        + layer_fraction * 1.7;
+    let radial_phase = source_radius * density * 6.2831853;
     let cross_field = sin((q.x * 2.7 + q.y * 3.4) * density + morph_phase)
         * cos((q.y * 2.1 - q.x * 1.6) * density - warp_phase);
     let flowing_field = sin(
@@ -322,17 +336,40 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
             + layer_generation * 0.381966
             + (hash(layer_generation * 1.731 + 19.17) - 0.5) * 0.09,
     );
-    let base = organic_palette(layer_hue + material * 0.10 + palette_phase * 0.045);
-    let accent = organic_palette(
-        layer_hue + 0.22 - mineral * 0.09 - palette_phase * 0.032,
+    let outward_generation = layer_generation - 1.0;
+    let outward_hue = fract(
+        hue
+            + outward_generation * 0.381966
+            + (hash(outward_generation * 1.731 + 19.17) - 0.5) * 0.09,
     );
-    let shadow = organic_palette(
-        layer_hue + 0.48 + petal_field * 0.07 + palette_phase * 0.025,
+    let outward_blend = smoothstep(0.88, 1.0, layer_fraction);
+    let base = layered_organic_palette(
+        layer_hue,
+        outward_hue,
+        outward_blend,
+        material * 0.10 + palette_drift * 0.045,
+    );
+    let accent = layered_organic_palette(
+        layer_hue,
+        outward_hue,
+        outward_blend,
+        0.22 - mineral * 0.09 - palette_drift * 0.032,
+    );
+    let shadow = layered_organic_palette(
+        layer_hue,
+        outward_hue,
+        outward_blend,
+        0.48 + petal_field * 0.07 + palette_drift * 0.025,
     );
     var color = mix(base, accent, smoothstep(0.30, 0.76, mineral));
     color = mix(color, shadow * 0.52, smoothstep(0.58, 0.94, petal_field) * 0.58);
     color *= 0.42 + material * 0.72;
-    let stable_breath_tint = organic_palette(layer_hue);
+    let stable_breath_tint = layered_organic_palette(
+        layer_hue,
+        outward_hue,
+        outward_blend,
+        0.0,
+    );
     let material_luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
     color = mix(
         color,
@@ -350,8 +387,18 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     let jewels = pow(max(cos(
         radial_phase * 0.72 + mirror_axis * 6.2831853 + warp_phase,
     ), 0.0), 18.0) * smoothstep(0.22, 0.82, mineral);
-    color += organic_palette(layer_hue + 0.10 + palette_phase * 0.04) * ridges * 0.44;
-    color += organic_palette(layer_hue + 0.37 - palette_phase * 0.03) * ring_relief * 0.20;
+    color += layered_organic_palette(
+        layer_hue,
+        outward_hue,
+        outward_blend,
+        0.10 + palette_drift * 0.04,
+    ) * ridges * 0.44;
+    color += layered_organic_palette(
+        layer_hue,
+        outward_hue,
+        outward_blend,
+        0.37 - palette_drift * 0.03,
+    ) * ring_relief * 0.20;
     color += vec3<f32>(0.90, 0.96, 0.78) * jewels * 0.52;
 
     let boundary_distance = min(layer_fraction, 1.0 - layer_fraction)
@@ -359,31 +406,27 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     let layer_seam = 1.0 - smoothstep(0.003, 0.022, boundary_distance);
     color = mix(
         color * 0.72,
-        organic_palette(layer_hue + 0.16) * 0.92,
+        layered_organic_palette(layer_hue, outward_hue, outward_blend, 0.16) * 0.92,
         layer_seam * 0.52,
     );
 
-    // During exhale the newest band's bright nucleus condenses toward the center while
-    // its outer boundary stays committed. At the next inhale a different generation hue
-    // is born inside it, making the discrete one-layer-per-breath history easy to read.
+    // The newborn glint fades to zero before its layer is committed. Therefore the
+    // generation-N, progress-1 frame and generation-(N+1), progress-0 frame evaluate to
+    // the same image; the next color then grows continuously out of a zero-area center.
     let newest_mask = select(0.0, 1.0, is_new_layer);
-    let settling_core_radius = inserted_width * mix(0.28, 0.82, breath);
-    let settling_core = 1.0 - smoothstep(
-        settling_core_radius * 0.72,
-        settling_core_radius,
-        screen_radius,
+    let core_color = layered_organic_palette(
+        layer_hue,
+        outward_hue,
+        outward_blend,
+        0.055 + palette_drift * 0.03,
     );
-    let core_color = organic_palette(layer_hue + 0.055 + palette_phase * 0.03);
-    color = mix(
-        color,
-        core_color * (0.82 + material * 0.48),
-        newest_mask * settling_core * (0.32 + exhale_settle * 0.24),
-    );
+    let birth_visibility = smoothstep(0.0, 0.08, insertion_progress);
     let newborn_glint = exp(
         -screen_radius * screen_radius
-            / max(seed_radius * seed_radius * 0.32, 0.00002),
+            / max(seed_radius * seed_radius * birth_visibility * 0.32, 0.00002),
     );
-    color += core_color * newborn_glint * newest_mask * (0.18 + (1.0 - insertion_progress) * 0.42);
+    color += core_color * newborn_glint * newest_mask * birth_visibility
+        * (1.0 - insertion_progress) * 0.60;
 
     let outer_vignette = 1.0 - smoothstep(1.32, 1.82, screen_radius);
     color *= outer_vignette;
