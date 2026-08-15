@@ -106,10 +106,11 @@ struct VisualUniforms {
 const PARTICLE_STYLE: u32 = 0;
 const BREATH_KASINA_STYLE: u32 = 1;
 const AURORA_VORTEX_STYLE: u32 = 2;
+const ORGANIC_KALEIDOSCOPE_STYLE: u32 = 3;
 
-/// Slowest selectable mandala rotation rate, in complete rotations per second.
+/// Slowest selectable kasina animation rate, in complete cycles per second.
 pub const MIN_ROTATIONS_PER_SECOND: f32 = 0.01;
-/// Fastest selectable mandala rotation rate, in complete rotations per second.
+/// Fastest selectable kasina animation rate, in complete cycles per second.
 pub const MAX_ROTATIONS_PER_SECOND: f32 = 10.0;
 /// Smallest selectable full-expansion speed multiplier.
 pub const MIN_EXPANSION_SPEED_MULTIPLIER: f32 = 1.0;
@@ -491,6 +492,145 @@ impl KasinaVisual for AuroraVortex {
                 options.arms as f32,
                 options.twist,
                 options.glow,
+                options.hue,
+            ],
+        )
+    }
+}
+
+/// A continuously evolving radial kaleidoscope with a breath-controlled dark aperture.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrganicKaleidoscope {
+    /// Dark aperture radius at the bottom of the calibrated breathing range.
+    pub minimum_aperture_radius: f32,
+    /// Dark aperture radius at the top of the calibrated breathing range.
+    pub maximum_aperture_radius: f32,
+    /// Whether the four independent animation channels advance.
+    pub animation_enabled: bool,
+    /// Rotation speed of the mirrored wedge geometry.
+    pub geometry_rotations_per_second: f32,
+    /// Evolution speed of the underlying organic field.
+    pub morph_rotations_per_second: f32,
+    /// Speed of the color-palette drift.
+    pub palette_rotations_per_second: f32,
+    /// Evolution speed of the coordinate warping.
+    pub warp_rotations_per_second: f32,
+    /// Animation multiplier reached at full expansion. One disables breath modulation.
+    pub expansion_speed_multiplier: f32,
+    /// Number of mirrored radial sectors.
+    pub sectors: u32,
+    /// Density of the nested rings and material contours.
+    pub ring_density: f32,
+    /// Strength of the slow organic coordinate distortion.
+    pub warp: f32,
+    /// Position around the base color palette, from zero to one.
+    pub hue: f32,
+}
+
+impl OrganicKaleidoscope {
+    /// Clamp loaded or edited settings to stable visual and performance bounds.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.minimum_aperture_radius = self.minimum_aperture_radius.clamp(0.0, 0.40);
+        self.maximum_aperture_radius = self.maximum_aperture_radius.clamp(0.02, 0.55);
+        if self.maximum_aperture_radius < self.minimum_aperture_radius + 0.02 {
+            self.maximum_aperture_radius = (self.minimum_aperture_radius + 0.02).min(0.55);
+            self.minimum_aperture_radius = self
+                .minimum_aperture_radius
+                .min(self.maximum_aperture_radius - 0.02);
+        }
+        self.geometry_rotations_per_second =
+            sanitize_rotation_rate(self.geometry_rotations_per_second);
+        self.morph_rotations_per_second = sanitize_rotation_rate(self.morph_rotations_per_second);
+        self.palette_rotations_per_second =
+            sanitize_rotation_rate(self.palette_rotations_per_second);
+        self.warp_rotations_per_second = sanitize_rotation_rate(self.warp_rotations_per_second);
+        self.expansion_speed_multiplier = self.expansion_speed_multiplier.clamp(
+            MIN_EXPANSION_SPEED_MULTIPLIER,
+            MAX_EXPANSION_SPEED_MULTIPLIER,
+        );
+        self.sectors = self.sectors.clamp(4, 32);
+        self.ring_density = self.ring_density.clamp(2.0, 14.0);
+        self.warp = self.warp.clamp(0.0, 1.50);
+        self.hue = self.hue.rem_euclid(1.0);
+        self
+    }
+
+    /// Return the four instantaneous kaleidoscope animation speeds.
+    #[must_use]
+    pub fn layer_speeds(&self, expansion: f32) -> [f32; 4] {
+        let options = self.sanitized();
+        if !options.animation_enabled {
+            return [0.0; 4];
+        }
+        modulated_layer_speeds(
+            [
+                options.geometry_rotations_per_second,
+                options.morph_rotations_per_second,
+                options.palette_rotations_per_second,
+                options.warp_rotations_per_second,
+            ],
+            options.expansion_speed_multiplier,
+            expansion,
+        )
+    }
+}
+
+impl Default for OrganicKaleidoscope {
+    fn default() -> Self {
+        Self {
+            minimum_aperture_radius: 0.045,
+            maximum_aperture_radius: 0.24,
+            animation_enabled: true,
+            geometry_rotations_per_second: 0.012,
+            morph_rotations_per_second: 0.018,
+            palette_rotations_per_second: 0.010,
+            warp_rotations_per_second: 0.014,
+            expansion_speed_multiplier: 1.6,
+            sectors: 18,
+            ring_density: 6.5,
+            warp: 0.82,
+            hue: 0.06,
+        }
+    }
+}
+
+impl KasinaVisual for OrganicKaleidoscope {
+    fn implementation_id(&self) -> &'static str {
+        "organic-kaleidoscope"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Organic kaleidoscope"
+    }
+
+    fn layer_speeds(&self, expansion: f32) -> [f32; 4] {
+        OrganicKaleidoscope::layer_speeds(self, expansion)
+    }
+
+    fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame {
+        let options = self.sanitized();
+        let layer_rotation_radians = if options.animation_enabled {
+            input
+                .layer_rotation_phases
+                .map(|phase| phase.rem_euclid(1.0) * std::f32::consts::TAU)
+        } else {
+            [0.0; 4]
+        };
+        PreparedVisualFrame::kasina(
+            ORGANIC_KALEIDOSCOPE_STYLE,
+            layer_rotation_radians,
+            input.respiration,
+            input.viewport_points,
+            [
+                options.minimum_aperture_radius,
+                options.maximum_aperture_radius,
+            ],
+            [
+                options.sectors as f32,
+                options.ring_density,
+                options.warp,
                 options.hue,
             ],
         )
@@ -879,6 +1019,45 @@ mod tests {
         assert_eq!(invalid.arms, 24);
         assert_eq!(invalid.twist, 1.0);
         assert_eq!(invalid.glow, 2.5);
+        assert_eq!(invalid.hue, 0.25);
+    }
+
+    #[test]
+    fn organic_kaleidoscope_prepares_aperture_and_evolving_field_parameters() {
+        let visual = OrganicKaleidoscope::default();
+        let frame = visual.prepare_frame(KasinaFrameInput {
+            layer_rotation_phases: [0.10, 0.20, 0.30, 0.40],
+            respiration: 0.75,
+            viewport_points: [1_200.0, 800.0],
+        });
+
+        assert_eq!(frame.uniforms.style, ORGANIC_KALEIDOSCOPE_STYLE);
+        assert_eq!(frame.uniforms.radius_range, [0.045, 0.24]);
+        assert_eq!(frame.uniforms.effect_params, [18.0, 6.5, 0.82, 0.06]);
+        assert_eq!(frame.upload_bytes().len(), 64);
+        let contracted_speeds = visual.layer_speeds(0.0);
+        let expanded_speeds = visual.layer_speeds(1.0);
+        assert!(
+            contracted_speeds
+                .into_iter()
+                .zip(expanded_speeds)
+                .all(|(contracted, expanded)| expanded > contracted)
+        );
+
+        let invalid = OrganicKaleidoscope {
+            minimum_aperture_radius: 0.50,
+            maximum_aperture_radius: 0.01,
+            sectors: 100,
+            ring_density: -4.0,
+            warp: 8.0,
+            hue: 2.25,
+            ..visual
+        }
+        .sanitized();
+        assert!(invalid.minimum_aperture_radius < invalid.maximum_aperture_radius);
+        assert_eq!(invalid.sectors, 32);
+        assert_eq!(invalid.ring_density, 2.0);
+        assert_eq!(invalid.warp, 1.5);
         assert_eq!(invalid.hue, 0.25);
     }
 

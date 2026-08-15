@@ -39,8 +39,17 @@ implementation-specific effect parameters.
 `AuroraVortex` is the second implementation. It combines two opposing logarithmic
 filament fields, a breathing iris, an independently rotating halo, and an orbiting spark
 ring. Presets control radius range, four layer speeds, breath-speed multiplication, spiral
-arm count, twist, glow, and spectral hue. The same four-channel phase clock drives both
-implementations without putting transient animation state into persisted presets.
+arm count, twist, glow, and spectral hue. The same four-channel phase clock drives every
+implementation without putting transient animation state into persisted presets.
+
+`OrganicKaleidoscope` is the third implementation. Its fragment shader folds a procedural
+radial material field into mirrored angular wedges, then combines independently evolving
+flow, petal, contour, relief, and palette phases. It does not need an image texture or
+per-frame geometry. Inhale expands a dark central aperture and applies a smaller radial
+lens displacement to the surrounding pattern; exhale reverses both effects. Presets expose
+the closed and open aperture radii, sector count, ring density, organic warp, palette hue,
+four animation-cycle rates, and a breath-speed multiplier. It reuses the same fixed-size
+uniform by interpreting the radius and effect fields according to its implementation ID.
 
 The app stores `KasinaPreset` values. Each preset has a stable numeric ID, editable name,
 and a tagged `KasinaVisualPreset` enum containing that implementation's typed options.

@@ -95,13 +95,17 @@ Do not mark a milestone complete until its exit criteria pass.
   sanitized radius and rotation options. Versioned application settings retain dynamic
   tab visibility, the active preset, and editable implementation-specific preset data;
   writes are coalesced on a background thread and replace the settings file safely. The
-  default interface exposes only Breath kasina and the unhideable Settings tab. Three
+  default interface exposes only Breath kasina and the unhideable Settings tab. Five
   editable presets ship by default, and users can add, rename, select, and remove presets.
   Each luminous-mandala preset now carries four independent layer speeds plus a shared
   full-expansion speed multiplier; continuous CPU-side phase integration avoids angle
   jumps as breath-driven velocity changes. The second `AuroraVortex` implementation adds
   counter-rotating logarithmic filaments, a breathing iris, halo, and spark orbit with
-  editable arms, twist, glow, hue, radii, and motion. Both use a fixed 64-byte GPU uniform.
+  editable arms, twist, glow, hue, radii, and motion. The third `OrganicKaleidoscope`
+  folds a continuously morphing procedural material field into mirrored radial sectors;
+  inhale opens an editable black aperture and gently displaces the surrounding rings.
+  Sector count, ring density, warp, palette, and four animation rates are editable. All
+  three implementations use the same fixed 64-byte GPU uniform and retained pipeline.
 - In-app simulation mode, 2026-08-13: a persistent Settings toggle switches displayed
   input between the live service and a separate local synthetic model without restarting
   or reconfiguring acquisition. The shared deterministic generator produces a harmonic

@@ -76,6 +76,12 @@ fn spectral_color(hue: f32) -> vec3<f32> {
     return rgb * rgb * (vec3<f32>(3.0) - 2.0 * rgb);
 }
 
+fn organic_palette(value: f32) -> vec3<f32> {
+    let phase = 6.2831853 * (vec3<f32>(value) + vec3<f32>(0.00, 0.19, 0.43));
+    return vec3<f32>(0.50, 0.46, 0.43)
+        + vec3<f32>(0.48, 0.44, 0.41) * cos(phase);
+}
+
 fn breath_mandala(local: vec2<f32>) -> vec4<f32> {
     let aspect = max(visual.viewport_points.x / max(visual.viewport_points.y, 1.0), 0.25);
     let point = local * vec2<f32>(aspect, 1.0);
@@ -213,6 +219,111 @@ fn aurora_vortex(local: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(color, 1.0);
 }
 
+fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
+    let aspect = max(visual.viewport_points.x / max(visual.viewport_points.y, 1.0), 0.25);
+    let point = local * vec2<f32>(aspect, 1.0);
+    let screen_radius = length(point);
+    let angle = atan2(point.y, point.x);
+    let breath = smoothstep(0.0, 1.0, visual.respiration);
+    let rotation = visual.layer_rotation_radians;
+    let sectors = max(visual.effect_params.x, 4.0);
+    let density = visual.effect_params.y;
+    let warp = visual.effect_params.z;
+    let hue = visual.effect_params.w;
+
+    // Fold the plane into one mirrored wedge. Every operation below is performed on
+    // this folded coordinate, so even the slowly changing organic field preserves exact
+    // kaleidoscopic symmetry without textures or per-frame CPU geometry.
+    let sector_width = 6.2831853 / sectors;
+    let wedge_phase = fract((angle - rotation.x) / sector_width + 0.5) - 0.5;
+    let folded_angle = abs(wedge_phase) * sector_width;
+    let mirror_axis = folded_angle / max(sector_width * 0.5, 0.001);
+
+    // Opening the aperture also pushes the sampled radial material gently outward. The
+    // black center is therefore the unmistakable breath signal, while the surrounding
+    // image appears to yield to it instead of merely being covered by a disk.
+    let aperture = mix(visual.radius_range.x, visual.radius_range.y, breath);
+    let source_radius = max(screen_radius - aperture * 0.62, 0.0) * (1.0 + breath * 0.10);
+    let folded = vec2<f32>(cos(folded_angle), sin(folded_angle)) * source_radius;
+    let morph_phase = rotation.y;
+    let palette_phase = rotation.z / 6.2831853;
+    let warp_phase = rotation.w;
+    let distortion = vec2<f32>(
+        sin(source_radius * density * 1.75 + morph_phase + mirror_axis * 2.2),
+        cos(source_radius * density * 1.38 - warp_phase + mirror_axis * 3.1),
+    ) * warp * 0.105;
+    let q = folded + distortion;
+
+    // Several inexpensive continuous fields create broad mineral-like regions, nested
+    // rings, fine contour ridges, and occasional jewel points. Their phases move at
+    // different rates, so the same algorithm keeps generating new coherent motifs.
+    let radial_phase = source_radius * density * 6.2831853;
+    let cross_field = sin((q.x * 2.7 + q.y * 3.4) * density + morph_phase)
+        * cos((q.y * 2.1 - q.x * 1.6) * density - warp_phase);
+    let flowing_field = sin(
+        radial_phase
+            + warp * 2.3 * sin(q.x * density * 2.2 + morph_phase),
+    ) + 0.58 * cos(
+        radial_phase * 1.57 - q.y * density * 3.0 + warp_phase,
+    );
+    let petal_field = 0.5 + 0.5 * cos(
+        mirror_axis * 3.1415927
+            + sin(radial_phase * 0.34 + morph_phase) * (1.0 + warp * 0.45),
+    );
+    let material = 0.5 + 0.5 * sin(
+        flowing_field * 1.7 + cross_field * 1.2 + radial_phase * 0.24,
+    );
+    let mineral = 0.5 + 0.5 * cos(
+        flowing_field * 1.15 - cross_field * 1.55 - radial_phase * 0.17,
+    );
+
+    let base = organic_palette(
+        hue + material * 0.23 + source_radius * 0.075 + palette_phase * 0.18,
+    );
+    let accent = organic_palette(
+        hue + 0.29 - mineral * 0.19 - palette_phase * 0.13,
+    );
+    let shadow = organic_palette(hue + 0.57 + petal_field * 0.11 + palette_phase * 0.09);
+    var color = mix(base, accent, smoothstep(0.30, 0.76, mineral));
+    color = mix(color, shadow * 0.52, smoothstep(0.58, 0.94, petal_field) * 0.58);
+    color *= 0.42 + material * 0.72;
+
+    let ridge_phase = abs(sin(
+        flowing_field * 2.05 + cross_field * 0.75 + radial_phase * 0.42,
+    ));
+    let ridges = 1.0 - smoothstep(0.025, 0.14, ridge_phase);
+    let ring_relief = pow(max(1.0 - abs(sin(
+        radial_phase * 0.51 + petal_field * 2.4 - morph_phase,
+    )), 0.0), 5.0);
+    let jewels = pow(max(cos(
+        radial_phase * 0.72 + mirror_axis * 6.2831853 + warp_phase,
+    ), 0.0), 18.0) * smoothstep(0.22, 0.82, mineral);
+    color += organic_palette(hue + 0.12 + palette_phase * 0.12) * ridges * 0.44;
+    color += organic_palette(hue + 0.41 - palette_phase * 0.08) * ring_relief * 0.20;
+    color += vec3<f32>(0.90, 0.96, 0.78) * jewels * 0.52;
+
+    let aperture_edge = aperture * (
+        1.0 + 0.035 * cos((angle - rotation.x) * sectors)
+    );
+    let outside_aperture = smoothstep(
+        aperture_edge - 0.006,
+        aperture_edge + 0.018,
+        screen_radius,
+    );
+    let aperture_rim = line_glow(
+        abs(screen_radius - aperture_edge),
+        0.0035,
+        0.024,
+    ) * smoothstep(aperture_edge - 0.002, aperture_edge + 0.025, screen_radius);
+    color *= outside_aperture;
+    color += organic_palette(hue + breath * 0.17 + palette_phase * 0.12)
+        * aperture_rim * outside_aperture * 0.58;
+
+    let outer_vignette = 1.0 - smoothstep(1.32, 1.82, screen_radius);
+    color *= outer_vignette;
+    return vec4<f32>(color, 1.0);
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if visual.style == 1u {
@@ -220,6 +331,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     if visual.style == 2u {
         return aurora_vortex(input.local);
+    }
+    if visual.style == 3u {
+        return organic_kaleidoscope(input.local);
     }
 
     let distance_from_center = length(input.local);

@@ -20,7 +20,9 @@ use kasina_protocol::v1::{
     SubscribeRequest,
 };
 use kasina_protocol::{AUTH_HEADER, client_hello};
-use kasina_render::{BiofeedbackRenderer, FrameStats, KasinaVisual, LuminousMandala};
+use kasina_render::{
+    BiofeedbackRenderer, FrameStats, KasinaVisual, LuminousMandala, OrganicKaleidoscope,
+};
 use serde::Serialize;
 use settings::{AppSettings, KasinaVisualPreset, SettingsWriter};
 use tokio_util::sync::CancellationToken;
@@ -646,6 +648,20 @@ fn layer_rotation_speed_slider(ui: &mut egui::Ui, enabled: bool, speed: &mut f32
     .changed()
 }
 
+fn animation_speed_slider(ui: &mut egui::Ui, enabled: bool, speed: &mut f32) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Slider::new(
+            speed,
+            kasina_render::MIN_ROTATIONS_PER_SECOND..=kasina_render::MAX_ROTATIONS_PER_SECOND,
+        )
+        .logarithmic(true)
+        .fixed_decimals(3)
+        .suffix(" cyc/s"),
+    )
+    .changed()
+}
+
 fn expansion_speed_slider(ui: &mut egui::Ui, enabled: bool, multiplier: &mut f32) -> bool {
     let response = ui.add_enabled(
         enabled,
@@ -1137,6 +1153,10 @@ impl KasinaApp {
                 KasinaVisualPreset::AuroraVortex(options) => {
                     (options.minimum_radius, options.maximum_radius)
                 }
+                KasinaVisualPreset::OrganicKaleidoscope(options) => (
+                    options.minimum_aperture_radius,
+                    options.maximum_aperture_radius,
+                ),
             };
             let radius = rect.width().min(rect.height())
                 * (minimum_radius + (maximum_radius - minimum_radius) * expansion)
@@ -1402,6 +1422,7 @@ impl KasinaApp {
                     let current_implementation = match &preset.visual {
                         KasinaVisualPreset::LuminousMandala(_) => 0,
                         KasinaVisualPreset::AuroraVortex(_) => 1,
+                        KasinaVisualPreset::OrganicKaleidoscope(_) => 2,
                     };
                     let mut selected_implementation = current_implementation;
                     egui::ComboBox::from_id_salt("kasina_implementation")
@@ -1413,12 +1434,21 @@ impl KasinaApp {
                                 "Luminous mandala",
                             );
                             ui.selectable_value(&mut selected_implementation, 1, "Aurora vortex");
+                            ui.selectable_value(
+                                &mut selected_implementation,
+                                2,
+                                "Organic kaleidoscope",
+                            );
                         });
                     if selected_implementation != current_implementation {
-                        preset.visual = if selected_implementation == 0 {
-                            KasinaVisualPreset::LuminousMandala(LuminousMandala::default())
-                        } else {
-                            KasinaVisualPreset::AuroraVortex(kasina_render::AuroraVortex::default())
+                        preset.visual = match selected_implementation {
+                            0 => KasinaVisualPreset::LuminousMandala(LuminousMandala::default()),
+                            1 => KasinaVisualPreset::AuroraVortex(
+                                kasina_render::AuroraVortex::default(),
+                            ),
+                            _ => KasinaVisualPreset::OrganicKaleidoscope(
+                                OrganicKaleidoscope::default(),
+                            ),
                         };
                         changed = true;
                     }
@@ -1567,6 +1597,100 @@ impl KasinaApp {
                             changed |= expansion_speed_slider(
                                 ui,
                                 options.rotation_enabled,
+                                &mut options.expansion_speed_multiplier,
+                            );
+                            ui.end_row();
+                            *options = options.sanitized();
+                        }
+                        KasinaVisualPreset::OrganicKaleidoscope(options) => {
+                            ui.strong("Closed aperture");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut options.minimum_aperture_radius,
+                                        0.0..=0.40,
+                                    )
+                                    .fixed_decimals(3),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Open aperture");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut options.maximum_aperture_radius,
+                                        0.02..=0.55,
+                                    )
+                                    .fixed_decimals(3),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Mirrored sectors");
+                            changed |= ui
+                                .add(egui::Slider::new(&mut options.sectors, 4..=32))
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Ring density");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.ring_density, 2.0..=14.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Organic warp");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.warp, 0.0..=1.50)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Palette hue");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.hue, 0.0..=1.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Animation");
+                            changed |= ui
+                                .checkbox(&mut options.animation_enabled, "Enabled")
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Geometry speed");
+                            changed |= animation_speed_slider(
+                                ui,
+                                options.animation_enabled,
+                                &mut options.geometry_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Morph speed");
+                            changed |= animation_speed_slider(
+                                ui,
+                                options.animation_enabled,
+                                &mut options.morph_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Palette speed");
+                            changed |= animation_speed_slider(
+                                ui,
+                                options.animation_enabled,
+                                &mut options.palette_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Warp speed");
+                            changed |= animation_speed_slider(
+                                ui,
+                                options.animation_enabled,
+                                &mut options.warp_rotations_per_second,
+                            );
+                            ui.end_row();
+                            ui.strong("Full-expansion speed");
+                            changed |= expansion_speed_slider(
+                                ui,
+                                options.animation_enabled,
                                 &mut options.expansion_speed_multiplier,
                             );
                             ui.end_row();

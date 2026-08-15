@@ -6,10 +6,10 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context as _, Result, bail};
-use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala};
+use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala, OrganicKaleidoscope};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 5;
+const SETTINGS_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -38,6 +38,7 @@ impl Default for TabVisibility {
 pub(crate) enum KasinaVisualPreset {
     LuminousMandala(LuminousMandala),
     AuroraVortex(AuroraVortex),
+    OrganicKaleidoscope(OrganicKaleidoscope),
 }
 
 impl KasinaVisualPreset {
@@ -45,6 +46,7 @@ impl KasinaVisualPreset {
         match self {
             Self::LuminousMandala(visual) => visual.display_name(),
             Self::AuroraVortex(visual) => visual.display_name(),
+            Self::OrganicKaleidoscope(visual) => visual.display_name(),
         }
     }
 
@@ -52,6 +54,7 @@ impl KasinaVisualPreset {
         match self {
             Self::LuminousMandala(visual) => visual,
             Self::AuroraVortex(visual) => visual,
+            Self::OrganicKaleidoscope(visual) => visual,
         }
     }
 
@@ -59,6 +62,7 @@ impl KasinaVisualPreset {
         match self {
             Self::LuminousMandala(options) => *options = options.sanitized(),
             Self::AuroraVortex(options) => *options = options.sanitized(),
+            Self::OrganicKaleidoscope(options) => *options = options.sanitized(),
         }
     }
 }
@@ -143,6 +147,22 @@ impl AppSettings {
             self.presets.push(default_aurora_preset(id));
             used_ids.insert(id);
         }
+        if source_schema < 6
+            && self
+                .presets
+                .iter()
+                .all(|preset| !matches!(&preset.visual, KasinaVisualPreset::OrganicKaleidoscope(_)))
+        {
+            let id = (self.next_preset_id.max(1)..=u64::MAX)
+                .find(|candidate| !used_ids.contains(candidate))
+                .unwrap_or_else(|| {
+                    (1..self.next_preset_id)
+                        .find(|candidate| !used_ids.contains(candidate))
+                        .expect("a finite preset list must leave an unused identifier")
+                });
+            self.presets.push(default_kaleidoscope_preset(id));
+            used_ids.insert(id);
+        }
         if !used_ids.contains(&self.active_preset_id) {
             self.active_preset_id = self.presets[0].id;
         }
@@ -213,7 +233,7 @@ impl Default for AppSettings {
             simulation_mode: false,
             visible_tabs: TabVisibility::default(),
             active_preset_id: 1,
-            next_preset_id: 5,
+            next_preset_id: 6,
             presets: vec![
                 KasinaPreset {
                     id: 1,
@@ -245,6 +265,7 @@ impl Default for AppSettings {
                     }),
                 },
                 default_aurora_preset(4),
+                default_kaleidoscope_preset(5),
             ],
         }
     }
@@ -255,6 +276,14 @@ fn default_aurora_preset(id: u64) -> KasinaPreset {
         id,
         name: "Aurora tide".to_owned(),
         visual: KasinaVisualPreset::AuroraVortex(AuroraVortex::default()),
+    }
+}
+
+fn default_kaleidoscope_preset(id: u64) -> KasinaPreset {
+    KasinaPreset {
+        id,
+        name: "Kaleidoscopic bloom".to_owned(),
+        visual: KasinaVisualPreset::OrganicKaleidoscope(OrganicKaleidoscope::default()),
     }
 }
 
@@ -368,19 +397,25 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn defaults_show_only_breath_and_include_both_visual_styles() {
+    fn defaults_show_only_breath_and_include_all_visual_styles() {
         let settings = AppSettings::default();
         assert!(settings.visible_tabs.breath_kasina);
         assert!(!settings.simulation_mode);
         assert!(!settings.visible_tabs.dashboard);
         assert!(!settings.visible_tabs.raw_signals);
-        assert_eq!(settings.presets.len(), 4);
+        assert_eq!(settings.presets.len(), 5);
         assert_eq!(settings.active_preset().name, "Luminous flow");
         assert!(
             settings
                 .presets
                 .iter()
                 .any(|preset| matches!(&preset.visual, KasinaVisualPreset::AuroraVortex(_)))
+        );
+        assert!(
+            settings
+                .presets
+                .iter()
+                .any(|preset| matches!(&preset.visual, KasinaVisualPreset::OrganicKaleidoscope(_)))
         );
     }
 
@@ -389,9 +424,9 @@ mod tests {
         let mut settings = AppSettings::default();
         let custom_id = settings.add_preset(2);
         assert_eq!(settings.active_preset_id, custom_id);
-        assert_eq!(settings.presets.len(), 5);
+        assert_eq!(settings.presets.len(), 6);
         assert!(settings.remove_preset(custom_id));
-        assert_eq!(settings.presets.len(), 4);
+        assert_eq!(settings.presets.len(), 5);
 
         settings.presets.truncate(1);
         assert!(!settings.remove_preset(settings.presets[0].id));
@@ -524,6 +559,30 @@ mod tests {
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(aurora_presets.len(), 1);
         assert_eq!(aurora_presets[0].name, "Aurora tide");
-        assert_eq!(migrated.next_preset_id, 5);
+        assert_eq!(migrated.next_preset_id, 6);
+    }
+
+    #[test]
+    fn schema_five_settings_gain_one_kaleidoscope_preset() {
+        let mut settings = AppSettings {
+            schema_version: 5,
+            ..AppSettings::default()
+        };
+        settings
+            .presets
+            .retain(|preset| !matches!(&preset.visual, KasinaVisualPreset::OrganicKaleidoscope(_)));
+        settings.next_preset_id = 5;
+
+        let migrated = settings.sanitized();
+        let kaleidoscope_presets = migrated
+            .presets
+            .iter()
+            .filter(|preset| matches!(&preset.visual, KasinaVisualPreset::OrganicKaleidoscope(_)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(kaleidoscope_presets.len(), 1);
+        assert_eq!(kaleidoscope_presets[0].name, "Kaleidoscopic bloom");
+        assert_eq!(migrated.next_preset_id, 6);
     }
 }
