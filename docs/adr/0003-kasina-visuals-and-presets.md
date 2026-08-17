@@ -64,6 +64,18 @@ breath-speed multiplier. Generation, direction, and insertion progress are packe
 otherwise unused kasina instance field plus one scalar while retaining the shared
 fixed-size uniform and a single full-screen draw instance.
 
+`PaperDisk` is the fourth implementation. It renders a quiet off-white paper circle over
+a warm wooden tabletop and maps only the circle radius to smoothed breath expansion. Both
+material fields are fixed in screen-point space, so breathing reveals and conceals the
+paper without stretching, sliding, or rescaling its fibers. A small set of band-limited
+procedural noise layers bends
+the broad grain, adds fine pores and paper mottling, and curls the grain around two
+elongated knots. Analytic derivative-smoothed edges, a faint inset rim, and a slightly
+offset contact shadow with a broad penumbra make the disk read as paper resting above the
+wood. No image asset, animation clock, extra geometry, or additional draw call is needed.
+Presets expose radius range, wood-grain scale and contrast, paper-texture strength, and
+shadow strength through the existing four effect parameters.
+
 The app stores `KasinaPreset` values. Each preset has a stable numeric ID, editable name,
 and a tagged `KasinaVisualPreset` enum containing that implementation's typed options.
 The active preset is independent of the preset being edited. Adding a preset duplicates

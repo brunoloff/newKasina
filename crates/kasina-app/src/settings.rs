@@ -6,10 +6,10 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context as _, Result, bail};
-use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala, OrganicKaleidoscope};
+use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala, OrganicKaleidoscope, PaperDisk};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 7;
+const SETTINGS_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,6 +39,7 @@ pub(crate) enum KasinaVisualPreset {
     LuminousMandala(LuminousMandala),
     AuroraVortex(AuroraVortex),
     OrganicKaleidoscope(OrganicKaleidoscope),
+    PaperDisk(PaperDisk),
 }
 
 impl KasinaVisualPreset {
@@ -47,6 +48,7 @@ impl KasinaVisualPreset {
             Self::LuminousMandala(visual) => visual.display_name(),
             Self::AuroraVortex(visual) => visual.display_name(),
             Self::OrganicKaleidoscope(visual) => visual.display_name(),
+            Self::PaperDisk(visual) => visual.display_name(),
         }
     }
 
@@ -55,6 +57,7 @@ impl KasinaVisualPreset {
             Self::LuminousMandala(visual) => visual,
             Self::AuroraVortex(visual) => visual,
             Self::OrganicKaleidoscope(visual) => visual,
+            Self::PaperDisk(visual) => visual,
         }
     }
 
@@ -63,6 +66,7 @@ impl KasinaVisualPreset {
             Self::LuminousMandala(options) => *options = options.sanitized(),
             Self::AuroraVortex(options) => *options = options.sanitized(),
             Self::OrganicKaleidoscope(options) => *options = options.sanitized(),
+            Self::PaperDisk(options) => *options = options.sanitized(),
         }
     }
 }
@@ -163,6 +167,22 @@ impl AppSettings {
             self.presets.push(default_kaleidoscope_preset(id));
             used_ids.insert(id);
         }
+        if source_schema < 8
+            && self
+                .presets
+                .iter()
+                .all(|preset| !matches!(&preset.visual, KasinaVisualPreset::PaperDisk(_)))
+        {
+            let id = (self.next_preset_id.max(1)..=u64::MAX)
+                .find(|candidate| !used_ids.contains(candidate))
+                .unwrap_or_else(|| {
+                    (1..self.next_preset_id)
+                        .find(|candidate| !used_ids.contains(candidate))
+                        .expect("a finite preset list must leave an unused identifier")
+                });
+            self.presets.push(default_paper_preset(id));
+            used_ids.insert(id);
+        }
         if !used_ids.contains(&self.active_preset_id) {
             self.active_preset_id = self.presets[0].id;
         }
@@ -233,7 +253,7 @@ impl Default for AppSettings {
             simulation_mode: false,
             visible_tabs: TabVisibility::default(),
             active_preset_id: 1,
-            next_preset_id: 6,
+            next_preset_id: 7,
             presets: vec![
                 KasinaPreset {
                     id: 1,
@@ -266,6 +286,7 @@ impl Default for AppSettings {
                 },
                 default_aurora_preset(4),
                 default_kaleidoscope_preset(5),
+                default_paper_preset(6),
             ],
         }
     }
@@ -284,6 +305,14 @@ fn default_kaleidoscope_preset(id: u64) -> KasinaPreset {
         id,
         name: "Kaleidoscopic bloom".to_owned(),
         visual: KasinaVisualPreset::OrganicKaleidoscope(OrganicKaleidoscope::default()),
+    }
+}
+
+fn default_paper_preset(id: u64) -> KasinaPreset {
+    KasinaPreset {
+        id,
+        name: "Breathing paper".to_owned(),
+        visual: KasinaVisualPreset::PaperDisk(PaperDisk::default()),
     }
 }
 
@@ -403,7 +432,7 @@ mod tests {
         assert!(!settings.simulation_mode);
         assert!(!settings.visible_tabs.dashboard);
         assert!(!settings.visible_tabs.raw_signals);
-        assert_eq!(settings.presets.len(), 5);
+        assert_eq!(settings.presets.len(), 6);
         assert_eq!(settings.active_preset().name, "Luminous flow");
         assert!(
             settings
@@ -417,6 +446,12 @@ mod tests {
                 .iter()
                 .any(|preset| matches!(&preset.visual, KasinaVisualPreset::OrganicKaleidoscope(_)))
         );
+        assert!(
+            settings
+                .presets
+                .iter()
+                .any(|preset| matches!(&preset.visual, KasinaVisualPreset::PaperDisk(_)))
+        );
     }
 
     #[test]
@@ -424,9 +459,9 @@ mod tests {
         let mut settings = AppSettings::default();
         let custom_id = settings.add_preset(2);
         assert_eq!(settings.active_preset_id, custom_id);
-        assert_eq!(settings.presets.len(), 6);
+        assert_eq!(settings.presets.len(), 7);
         assert!(settings.remove_preset(custom_id));
-        assert_eq!(settings.presets.len(), 5);
+        assert_eq!(settings.presets.len(), 6);
 
         settings.presets.truncate(1);
         assert!(!settings.remove_preset(settings.presets[0].id));
@@ -559,7 +594,7 @@ mod tests {
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(aurora_presets.len(), 1);
         assert_eq!(aurora_presets[0].name, "Aurora tide");
-        assert_eq!(migrated.next_preset_id, 6);
+        assert_eq!(migrated.next_preset_id, 7);
     }
 
     #[test]
@@ -583,7 +618,7 @@ mod tests {
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(kaleidoscope_presets.len(), 1);
         assert_eq!(kaleidoscope_presets[0].name, "Kaleidoscopic bloom");
-        assert_eq!(migrated.next_preset_id, 6);
+        assert_eq!(migrated.next_preset_id, 7);
     }
 
     #[test]
@@ -618,5 +653,29 @@ mod tests {
         assert!(rewritten.contains("completed_layer_width"));
         assert!(!rewritten.contains("minimum_aperture_radius"));
         assert!(!rewritten.contains("maximum_aperture_radius"));
+    }
+
+    #[test]
+    fn schema_seven_settings_gain_one_paper_preset() {
+        let mut settings = AppSettings {
+            schema_version: 7,
+            ..AppSettings::default()
+        };
+        settings
+            .presets
+            .retain(|preset| !matches!(&preset.visual, KasinaVisualPreset::PaperDisk(_)));
+        settings.next_preset_id = 6;
+
+        let migrated = settings.sanitized();
+        let paper_presets = migrated
+            .presets
+            .iter()
+            .filter(|preset| matches!(&preset.visual, KasinaVisualPreset::PaperDisk(_)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(paper_presets.len(), 1);
+        assert_eq!(paper_presets[0].name, "Breathing paper");
+        assert_eq!(migrated.next_preset_id, 7);
     }
 }

@@ -22,6 +22,44 @@ fn hash(value: f32) -> f32 {
     return fract(sin(value * 91.3458) * 47453.5453);
 }
 
+fn material_hash(position: vec2<f32>) -> f32 {
+    var p3 = fract(
+        vec3<f32>(position.x, position.y, position.x)
+            * vec3<f32>(0.1031, 0.1030, 0.0973),
+    );
+    p3 += vec3<f32>(dot(p3, p3.yzx + vec3<f32>(33.33)));
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn material_noise(position: vec2<f32>) -> f32 {
+    let cell = floor(position);
+    let local = fract(position);
+    let blend = local * local * (vec2<f32>(3.0) - 2.0 * local);
+    let lower = mix(
+        material_hash(cell),
+        material_hash(cell + vec2<f32>(1.0, 0.0)),
+        blend.x,
+    );
+    let upper = mix(
+        material_hash(cell + vec2<f32>(0.0, 1.0)),
+        material_hash(cell + vec2<f32>(1.0, 1.0)),
+        blend.x,
+    );
+    return mix(lower, upper, blend.y);
+}
+
+fn layered_material_noise(position: vec2<f32>) -> f32 {
+    var p = position;
+    var result = material_noise(p) * 0.5714286;
+    p = vec2<f32>(p.y * 1.71 - p.x * 1.13, p.x * 1.71 + p.y * 1.13)
+        + vec2<f32>(7.3, 3.1);
+    result += material_noise(p) * 0.2857143;
+    p = vec2<f32>(p.y * 1.67 - p.x * 1.19, p.x * 1.67 + p.y * 1.19)
+        + vec2<f32>(5.7, 9.2);
+    result += material_noise(p) * 0.1428571;
+    return result;
+}
+
 @vertex
 fn vertex_main(
     @builtin(vertex_index) vertex_index: u32,
@@ -433,6 +471,123 @@ fn organic_kaleidoscope(local: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(color, 1.0);
 }
 
+fn paper_disk(local: vec2<f32>) -> vec4<f32> {
+    let aspect = max(visual.viewport_points.x / max(visual.viewport_points.y, 1.0), 0.25);
+    let point = local * vec2<f32>(aspect, 1.0);
+    let screen_radius = length(point);
+    let breath = smoothstep(0.0, 1.0, visual.respiration);
+    let disk_radius = mix(visual.radius_range.x, visual.radius_range.y, breath);
+    let grain_scale = visual.effect_params.x;
+    let wood_contrast = visual.effect_params.y;
+    let paper_texture = visual.effect_params.z;
+    let shadow_strength = visual.effect_params.w;
+
+    // A few band-limited noise layers bend broad growth lines and break their repetition.
+    // The grain remains fixed in screen space while the paper alone follows the breath.
+    let table = point * vec2<f32>(0.72, 1.0);
+    let broad_noise = layered_material_noise(table * vec2<f32>(0.82, 1.34) + vec2<f32>(4.2, 1.7));
+    let fine_noise = material_noise(
+        table * vec2<f32>(grain_scale * 2.2, grain_scale * 15.0)
+            + vec2<f32>(13.4, 8.1),
+    );
+
+    // Two elongated knots locally curl otherwise horizontal grain lines. One sits near
+    // an edge so the background feels like a larger slab rather than a tiled swatch.
+    let first_knot = (table - vec2<f32>(-0.72, 0.34)) * vec2<f32>(0.78, 3.2);
+    let second_knot = (table - vec2<f32>(0.98, -0.52)) * vec2<f32>(0.72, 3.6);
+    let first_distance = length(first_knot);
+    let second_distance = length(second_knot);
+    let first_envelope = exp(-first_distance * 3.4);
+    let second_envelope = exp(-second_distance * 3.8);
+    let knot_flow = first_envelope * sin(atan2(first_knot.y, first_knot.x) * 2.0)
+        + second_envelope * sin(atan2(second_knot.y, second_knot.x) * 2.0);
+    let grain_coordinate = table.y * grain_scale
+        + (broad_noise - 0.5) * 2.1
+        + sin(table.x * 2.7) * 0.20
+        + knot_flow * 0.82;
+    let grain_phase = grain_coordinate * 6.2831853 + fine_noise * 1.35;
+    let broad_grain = 0.5 + 0.5 * sin(grain_phase);
+    let dark_veins = pow(max(1.0 - abs(sin(grain_phase * 1.013 + 0.7)), 0.0), 7.0);
+    let knot_rings = (
+        first_envelope * (0.5 + 0.5 * sin(first_distance * 38.0 + fine_noise * 2.0))
+            + second_envelope * (0.5 + 0.5 * sin(second_distance * 42.0 - fine_noise * 1.8))
+    ) * wood_contrast;
+
+    let deep_walnut = vec3<f32>(0.145, 0.047, 0.014);
+    let warm_honey = vec3<f32>(0.515, 0.258, 0.086);
+    let timber_mix = clamp(
+        0.28 + broad_grain * 0.58 + (fine_noise - 0.5) * wood_contrast * 0.20,
+        0.0,
+        1.0,
+    );
+    var wood = mix(deep_walnut, warm_honey, timber_mix);
+    wood = mix(
+        wood,
+        vec3<f32>(0.105, 0.030, 0.008),
+        clamp(dark_veins * wood_contrast * 0.34 + knot_rings * 0.20, 0.0, 0.42),
+    );
+    wood *= 0.94 + (broad_noise - 0.5) * 0.12;
+    let table_vignette = 1.0 - smoothstep(0.72, 1.90, screen_radius);
+    wood *= 0.87 + table_vignette * 0.13;
+
+    // A compact contact shadow plus a wider offset penumbra lifts the paper from the
+    // tabletop. Both are analytic and change continuously with the breathing radius.
+    let shadow_point = point - vec2<f32>(0.018, -0.024);
+    let shadow_distance = length(shadow_point) - disk_radius * 1.006;
+    let penumbra = 1.0 - smoothstep(-0.006, 0.058, shadow_distance);
+    let contact = 1.0 - smoothstep(-0.003, 0.014, shadow_distance);
+    let shadow = shadow_strength * (penumbra * 0.16 + contact * 0.15);
+    wood *= 1.0 - shadow;
+
+    // Paper combines cloudy pulp formation, crossed anisotropic fiber fields, and sparse
+    // warm inclusions. The material is evaluated in stable screen-point coordinates, so
+    // breathing reveals or conceals paper without stretching or sliding its texture.
+    let paper_point = point * visual.viewport_points.y * 0.5;
+    let paper_mottle = layered_material_noise(
+        paper_point * vec2<f32>(0.014, 0.017) + vec2<f32>(2.4, 5.8),
+    );
+    let horizontal_fibers = material_noise(
+        paper_point * vec2<f32>(0.035, 0.280) + vec2<f32>(17.1, 9.6),
+    );
+    let rotated_paper = vec2<f32>(
+        paper_point.x * 0.8192 + paper_point.y * 0.5736,
+        -paper_point.x * 0.5736 + paper_point.y * 0.8192,
+    );
+    let crossed_fibers = material_noise(
+        rotated_paper * vec2<f32>(0.245, 0.028) + vec2<f32>(6.3, 21.7),
+    );
+    let fleck_noise = material_noise(
+        paper_point * vec2<f32>(0.200, 0.230) + vec2<f32>(31.2, 14.5),
+    );
+    let paper_variation = (paper_mottle - 0.5) * 0.105
+        + (horizontal_fibers - 0.5) * 0.060
+        + (crossed_fibers - 0.5) * 0.045;
+    var paper = vec3<f32>(0.971, 0.965, 0.940)
+        * (1.0 + paper_variation * paper_texture);
+    let warm_flecks = pow(
+        clamp((fleck_noise - 0.70) / 0.30, 0.0, 1.0),
+        3.0,
+    );
+    paper = mix(
+        paper,
+        vec3<f32>(0.73, 0.68, 0.56),
+        warm_flecks * paper_texture * 0.11,
+    );
+    let fiber_sheen = pow(abs(crossed_fibers * 2.0 - 1.0), 5.0);
+    paper += vec3<f32>(0.026, 0.023, 0.016) * fiber_sheen * paper_texture;
+
+    let disk_distance = screen_radius - disk_radius;
+    let edge_width = max(2.0 / max(visual.viewport_points.y, 1.0), 0.001);
+    let disk_mask = 1.0 - smoothstep(-edge_width, edge_width, disk_distance);
+    let inner_edge = smoothstep(-0.030, -edge_width, disk_distance);
+    let light_direction = normalize(vec2<f32>(-0.7, 0.6));
+    let edge_lighting = dot(point / max(screen_radius, 0.001), light_direction);
+    paper *= 1.0 - inner_edge * 0.026 + inner_edge * edge_lighting * 0.012;
+
+    let color = mix(wood, paper, disk_mask);
+    return vec4<f32>(color, 1.0);
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if visual.style == 1u {
@@ -443,6 +598,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     if visual.style == 3u {
         return organic_kaleidoscope(input.local);
+    }
+    if visual.style == 4u {
+        return paper_disk(input.local);
     }
 
     let distance_from_center = length(input.local);

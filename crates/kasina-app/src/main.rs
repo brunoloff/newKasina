@@ -22,7 +22,7 @@ use kasina_protocol::v1::{
 use kasina_protocol::{AUTH_HEADER, client_hello};
 use kasina_render::{
     BiofeedbackRenderer, FrameStats, KasinaAnimationInput, KasinaVisual, LuminousMandala,
-    OrganicKaleidoscope,
+    OrganicKaleidoscope, PaperDisk,
 };
 use serde::Serialize;
 use settings::{AppSettings, KasinaVisualPreset, SettingsWriter};
@@ -1279,6 +1279,9 @@ impl KasinaApp {
                 KasinaVisualPreset::OrganicKaleidoscope(options) => {
                     (options.seed_radius, options.completed_layer_width)
                 }
+                KasinaVisualPreset::PaperDisk(options) => {
+                    (options.minimum_radius, options.maximum_radius)
+                }
             };
             let radius = rect.width().min(rect.height())
                 * (minimum_radius + (maximum_radius - minimum_radius) * animation.expansion)
@@ -1545,6 +1548,7 @@ impl KasinaApp {
                         KasinaVisualPreset::LuminousMandala(_) => 0,
                         KasinaVisualPreset::AuroraVortex(_) => 1,
                         KasinaVisualPreset::OrganicKaleidoscope(_) => 2,
+                        KasinaVisualPreset::PaperDisk(_) => 3,
                     };
                     let mut selected_implementation = current_implementation;
                     egui::ComboBox::from_id_salt("kasina_implementation")
@@ -1561,6 +1565,7 @@ impl KasinaApp {
                                 2,
                                 "Organic kaleidoscope",
                             );
+                            ui.selectable_value(&mut selected_implementation, 3, "Paper on wood");
                         });
                     if selected_implementation != current_implementation {
                         preset.visual = match selected_implementation {
@@ -1568,9 +1573,10 @@ impl KasinaApp {
                             1 => KasinaVisualPreset::AuroraVortex(
                                 kasina_render::AuroraVortex::default(),
                             ),
-                            _ => KasinaVisualPreset::OrganicKaleidoscope(
+                            2 => KasinaVisualPreset::OrganicKaleidoscope(
                                 OrganicKaleidoscope::default(),
                             ),
+                            _ => KasinaVisualPreset::PaperDisk(PaperDisk::default()),
                         };
                         changed = true;
                     }
@@ -1812,6 +1818,57 @@ impl KasinaApp {
                                 options.animation_enabled,
                                 &mut options.expansion_speed_multiplier,
                             );
+                            ui.end_row();
+                            *options = options.sanitized();
+                        }
+                        KasinaVisualPreset::PaperDisk(options) => {
+                            ui.strong("Minimum radius");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.minimum_radius, 0.12..=0.80)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Maximum radius");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.maximum_radius, 0.20..=1.00)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Wood grain scale");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.wood_grain_scale, 2.0..=16.0)
+                                        .fixed_decimals(1),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Wood contrast");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.wood_contrast, 0.0..=1.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Paper texture");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.paper_texture, 0.0..=1.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.strong("Shadow strength");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut options.shadow_strength, 0.0..=1.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
                             ui.end_row();
                             *options = options.sanitized();
                         }

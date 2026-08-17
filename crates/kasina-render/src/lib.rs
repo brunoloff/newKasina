@@ -107,6 +107,7 @@ const PARTICLE_STYLE: u32 = 0;
 const BREATH_KASINA_STYLE: u32 = 1;
 const AURORA_VORTEX_STYLE: u32 = 2;
 const ORGANIC_KALEIDOSCOPE_STYLE: u32 = 3;
+const PAPER_DISK_STYLE: u32 = 4;
 
 /// Slowest selectable kasina animation rate, in complete cycles per second.
 pub const MIN_ROTATIONS_PER_SECOND: f32 = 0.01;
@@ -678,6 +679,88 @@ impl KasinaVisual for OrganicKaleidoscope {
     }
 }
 
+/// A quiet white paper disk resting on a procedurally textured wooden table.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaperDisk {
+    /// Radius at the bottom of the calibrated breathing range.
+    pub minimum_radius: f32,
+    /// Radius at the top of the calibrated breathing range.
+    pub maximum_radius: f32,
+    /// Spatial frequency of the broad wooden grain.
+    pub wood_grain_scale: f32,
+    /// Contrast between the lighter and darker grain bands.
+    pub wood_contrast: f32,
+    /// Strength of subtle fibers and mottling in the paper.
+    pub paper_texture: f32,
+    /// Opacity of the contact shadow and its soft penumbra.
+    pub shadow_strength: f32,
+}
+
+impl PaperDisk {
+    /// Clamp loaded or edited settings to stable visual and performance bounds.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.minimum_radius = self.minimum_radius.clamp(0.12, 0.80);
+        self.maximum_radius = self.maximum_radius.clamp(0.20, 1.00);
+        if self.maximum_radius < self.minimum_radius + 0.05 {
+            self.maximum_radius = (self.minimum_radius + 0.05).min(1.00);
+            self.minimum_radius = self.minimum_radius.min(self.maximum_radius - 0.05);
+        }
+        self.wood_grain_scale = self.wood_grain_scale.clamp(2.0, 16.0);
+        self.wood_contrast = self.wood_contrast.clamp(0.0, 1.0);
+        self.paper_texture = self.paper_texture.clamp(0.0, 1.0);
+        self.shadow_strength = self.shadow_strength.clamp(0.0, 1.0);
+        self
+    }
+}
+
+impl Default for PaperDisk {
+    fn default() -> Self {
+        Self {
+            minimum_radius: 0.28,
+            maximum_radius: 0.82,
+            wood_grain_scale: 6.5,
+            wood_contrast: 0.58,
+            paper_texture: 0.42,
+            shadow_strength: 0.62,
+        }
+    }
+}
+
+impl KasinaVisual for PaperDisk {
+    fn implementation_id(&self) -> &'static str {
+        "paper-disk"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Paper on wood"
+    }
+
+    fn layer_speeds(&self, _expansion: f32) -> [f32; 4] {
+        [0.0; 4]
+    }
+
+    fn prepare_frame(&self, input: KasinaFrameInput) -> PreparedVisualFrame {
+        let options = self.sanitized();
+        PreparedVisualFrame::kasina(KasinaUniformInput {
+            style: PAPER_DISK_STYLE,
+            animation_state: 0.0,
+            auxiliary_state: 1,
+            layer_rotation_radians: [0.0; 4],
+            respiration: input.respiration,
+            viewport_points: input.viewport_points,
+            radius_range: [options.minimum_radius, options.maximum_radius],
+            effect_params: [
+                options.wood_grain_scale,
+                options.wood_contrast,
+                options.paper_texture,
+                options.shadow_strength,
+            ],
+        })
+    }
+}
+
 struct BiofeedbackResources {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -942,6 +1025,13 @@ mod tests {
     }
 
     #[test]
+    fn paper_disk_anchors_material_to_screen_points() {
+        let shader = include_str!("biofeedback.wgsl");
+        assert!(shader.contains("let paper_point = point * visual.viewport_points.y * 0.5"));
+        assert!(!shader.contains("let paper_point = point / max(disk_radius"));
+    }
+
+    #[test]
     fn prepared_frame_clamps_inputs_and_has_a_fixed_upload() {
         let low = PreparedVisualFrame::new(2.0, -4.0, 0, [0.0, -10.0]);
         let high = PreparedVisualFrame::new(2.0, 4.0, 100_000, [1_920.0, 1_080.0]);
@@ -1122,6 +1212,43 @@ mod tests {
         assert_eq!(invalid.ring_density, 2.0);
         assert_eq!(invalid.warp, 1.5);
         assert_eq!(invalid.hue, 0.25);
+    }
+
+    #[test]
+    fn paper_disk_prepares_static_material_parameters() {
+        let visual = PaperDisk::default();
+        let frame = visual.prepare_frame(KasinaFrameInput {
+            layer_rotation_phases: [0.10, 0.20, 0.30, 0.40],
+            respiration: 0.75,
+            viewport_points: [1_200.0, 800.0],
+            breath_generation: 7,
+            breath_layer_progress: 0.75,
+            inhaling: true,
+        });
+
+        assert_eq!(frame.uniforms.style, PAPER_DISK_STYLE);
+        assert_eq!(frame.uniforms.radius_range, [0.28, 0.82]);
+        assert_eq!(frame.uniforms.effect_params, [6.5, 0.58, 0.42, 0.62]);
+        assert_eq!(frame.uniforms.layer_rotation_radians, [0.0; 4]);
+        assert_eq!(frame.instance_count(), 1);
+        assert_eq!(frame.upload_bytes().len(), 64);
+        assert_eq!(visual.layer_speeds(0.0), [0.0; 4]);
+        assert_eq!(visual.layer_speeds(1.0), [0.0; 4]);
+
+        let invalid = PaperDisk {
+            minimum_radius: 2.0,
+            maximum_radius: -1.0,
+            wood_grain_scale: 100.0,
+            wood_contrast: -1.0,
+            paper_texture: 4.0,
+            shadow_strength: 3.0,
+        }
+        .sanitized();
+        assert!(invalid.minimum_radius < invalid.maximum_radius);
+        assert_eq!(invalid.wood_grain_scale, 16.0);
+        assert_eq!(invalid.wood_contrast, 0.0);
+        assert_eq!(invalid.paper_texture, 1.0);
+        assert_eq!(invalid.shadow_strength, 1.0);
     }
 
     fn assert_array_close(actual: [f32; 4], expected: [f32; 4]) {
