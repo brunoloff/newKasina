@@ -672,6 +672,9 @@ fn write_metadata(directory: &Path, metadata: &SessionMetadata) -> Result<()> {
     serde_json::to_writer_pretty(&mut file, metadata)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
+    // Windows ReplaceFileW needs to open the replacement file without our
+    // write handle still holding it. The contents are durable before closing.
+    drop(file);
     replace_metadata_file(&temporary, &path)?;
     #[cfg(unix)]
     if let Err(error) = File::open(directory).and_then(|directory| directory.sync_all()) {

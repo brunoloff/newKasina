@@ -1195,12 +1195,12 @@ mod tests {
             cancellation.clone(),
         ));
 
-        let contents = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Ok(contents) = fs::read_to_string(&output)
-                    && contents.lines().count() >= 2
+                    && contents.bytes().filter(|byte| *byte == b'\n').count() >= 2
                 {
-                    break contents;
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1210,6 +1210,9 @@ mod tests {
         cancellation.cancel();
         writer.await.unwrap().unwrap();
 
+        // Read the final snapshot after the writer has flushed and closed;
+        // an earlier read can end partway through a concurrently appended line.
+        let contents = fs::read_to_string(&output).unwrap();
         let records = contents
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
