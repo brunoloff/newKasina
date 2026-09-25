@@ -55,8 +55,8 @@ jobs:
           sudo apt-get update && sudo apt-get install -y
           libasound2-dev libdbus-1-dev libudev-dev libwayland-dev
           libgtk-3-dev libayatana-appindicator3-dev
-          libx11-dev libxcursor-dev libxi-dev libxkbcommon-dev libxrandr-dev
-          xvfb mesa-vulkan-drivers
+          libx11-dev libxcursor-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-0 libxrandr-dev
+          xvfb mesa-vulkan-drivers libgl1-mesa-dri
       - name: Validate packaging resources
         run: python scripts/package-desktop.py --check
       - run: cargo fmt --all --check
@@ -67,6 +67,9 @@ jobs:
         run: python scripts/package-desktop.py --binary-dir "${{ matrix.binary_dir }}"
       - name: Smoke-test packaged desktop application (Linux)
         if: runner.os == 'Linux'
+        env:
+          WGPU_BACKEND: gl
+          LIBGL_ALWAYS_SOFTWARE: "1"
         run: xvfb-run -a python scripts/package-desktop.py --smoke-test
       - name: Smoke-test packaged desktop application (Windows and macOS)
         if: runner.os != 'Linux'
