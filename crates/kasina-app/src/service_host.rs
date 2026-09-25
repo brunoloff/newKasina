@@ -185,28 +185,32 @@ fn host_loop(
             Ok(CommandMessage::Start) if config.allow_start && owned.is_none() => {
                 update(status, repaint, Phase::Starting, None, None);
                 let result = runtime.block_on(async {
-                    if service_listener_present(&config.endpoint).await? {
-                        let token = kasina_service::read_token(&config.token_path)
-                            .context("A service is already listening, but its access token could not be read")?;
-                        let info = tokio::time::timeout(Duration::from_secs(3), async {
-                            let mut client = KasinaClient::connect(config.endpoint.clone()).await?;
-                            Ok::<_, anyhow::Error>(client.get_service_info(
-                                kasina_service::authenticated_request(client_hello("kasina-app", env!("CARGO_PKG_VERSION")), &token)?
-                            ).await?.into_inner())
-                        }).await.context("The existing service did not respond")??;
-                        update(status, repaint, Phase::External, Some(info.instance_id), None);
-                        return Ok(());
-                    }
                     match config.mode {
                         LaunchMode::Embedded => {
-                            let service = PreparedService::prepare(config.options.clone()).await?;
-                            let instance = service.state().instance_id().to_owned();
-                            let cancellation = CancellationToken::new();
-                            let stop = cancellation.clone();
-                            owned = Some(OwnedService { cancellation, task: tokio::spawn(service.run(stop)) });
-                            update(status, repaint, Phase::Owned, Some(instance), None);
+                            // Locking and binding prove ownership before hardware opens.
+                            // A connect probe to an unused Windows port can time out,
+                            // so absence must not depend on receiving connection-refused.
+                            match PreparedService::prepare(config.options.clone()).await {
+                                Ok(service) => {
+                                    let instance = service.state().instance_id().to_owned();
+                                    let cancellation = CancellationToken::new();
+                                    let stop = cancellation.clone();
+                                    owned = Some(OwnedService { cancellation, task: tokio::spawn(service.run(stop)) });
+                                    update(status, repaint, Phase::Owned, Some(instance), None);
+                                }
+                                Err(start_error) => {
+                                    let instance = existing_service_instance(&config).await
+                                        .with_context(|| format!("Could not reserve the measurement service: {start_error:#}"))?;
+                                    update(status, repaint, Phase::External, Some(instance), None);
+                                }
+                            }
                         }
                         LaunchMode::Separate => {
+                            if service_listener_present(&config.endpoint).await? {
+                                let instance = existing_service_instance(&config).await?;
+                                update(status, repaint, Phase::External, Some(instance), None);
+                                return Ok(());
+                            }
                             let path = std::env::current_exe()?.with_file_name("kasina-service");
                             if !path.is_file() { bail!("The sensor service is missing. Build or install kasina-service alongside this app, then try again."); }
                             let mut command = Command::new(path);
@@ -276,6 +280,26 @@ fn host_loop(
     }
     // Dropping a Child handle does not terminate the independent Linux tray process.
     Ok(())
+}
+
+async fn existing_service_instance(config: &HostConfig) -> Result<String> {
+    let token = kasina_service::read_token(&config.token_path)
+        .context("The existing service's access token could not be read")?;
+    let info = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut client = KasinaClient::connect(config.endpoint.clone()).await?;
+        Ok::<_, anyhow::Error>(
+            client
+                .get_service_info(kasina_service::authenticated_request(
+                    client_hello("kasina-app", env!("CARGO_PKG_VERSION")),
+                    &token,
+                )?)
+                .await?
+                .into_inner(),
+        )
+    })
+    .await
+    .context("The existing service did not respond")??;
+    Ok(info.instance_id)
 }
 
 async fn service_listener_present(endpoint: &str) -> Result<bool> {
