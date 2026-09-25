@@ -3,9 +3,19 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   native:
+    name: Build and test (${{ matrix.os }})
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -16,6 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Linux dependencies
         if: runner.os == 'Linux'
         run: >-
@@ -24,7 +35,40 @@ jobs:
           libgtk-3-dev libayatana-appindicator3-dev
           libx11-dev libxcursor-dev libxi-dev libxkbcommon-dev libxrandr-dev
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
-      - run: cargo build --workspace --release
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-features
+      - run: cargo build --locked --workspace --release
+      - name: Package desktop binaries
+        shell: python
+        run: |
+          import os
+          import pathlib
+          import shutil
 
+          platform = os.environ["RUNNER_OS"]
+          architecture = os.environ["RUNNER_ARCH"]
+          name = f"newKasina-{platform}-{architecture}"
+          bundle = pathlib.Path("dist") / name
+          bundle.mkdir(parents=True)
+          suffix = ".exe" if platform == "Windows" else ""
+          for executable in ("kasina-app", "kasina-service"):
+              shutil.copy2(pathlib.Path("target/release") / (executable + suffix), bundle)
+          shutil.copy2("README.md", bundle)
+          shutil.copytree("docs", bundle / "docs")
+          shutil.copy2("PLAN.md", bundle)
+          (bundle / "BUILD.txt").write_text(
+              f"Commit: {os.environ['GITHUB_SHA']}\n"
+              f"Platform: {platform} {architecture}\n"
+              "Development build; not a signed installer.\n"
+              "Start kasina-service, then kasina-app.\n"
+          )
+          format = "zip" if platform == "Windows" else "gztar"
+          shutil.make_archive(str(bundle), format, root_dir="dist", base_dir=name)
+          shutil.rmtree(bundle)
+      - name: Upload downloadable build
+        uses: actions/upload-artifact@v7
+        with:
+          name: newKasina-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

@@ -1,4 +1,5 @@
 /target/
+/dist/
 /.cargo-local/
 /.rustup-local/
 /.git-local/

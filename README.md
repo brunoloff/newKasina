@@ -150,6 +150,16 @@ Polar H10 · Go Direct · ThoughtStream · Simulator
 
 ## Development checks
 
+GitHub Actions builds and tests Linux, Windows, and macOS on every push and pull
+request. Open a successful run in [Actions](https://github.com/brunoloff/newKasina/actions)
+and download the matching `newKasina` artifact at the bottom of its page (sign in
+to GitHub to download). Each archive contains the interface and sensor service,
+documentation, and the source revision. Artifacts are retained for 14 days.
+
+These are development binaries, not signed installers. The Mac build's architecture
+appears in its artifact name; it does not automatically include both Intel and Apple
+Silicon. Building successfully does not establish physical sensor compatibility.
+
 ```sh
 scripts/cargo-local fmt --all --check
 scripts/cargo-local clippy --workspace --all-targets --all-features -- -D warnings
