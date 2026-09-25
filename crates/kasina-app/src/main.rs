@@ -1157,13 +1157,15 @@ impl KasinaApp {
                 ClientEvent::Connection(connection) => self.model.connection = connection,
                 ClientEvent::Connected(connected) => {
                     self.model.connected = connected;
+                    // Controls belong to one connection. Even if its disconnect
+                    // event was lost to backpressure, a fresh session clears them.
+                    self.service_command_pending = false;
+                    self.recording_command_pending = false;
                     if connected {
                         self.service_notice = None;
                     }
                     if !connected {
                         self.last_status_at = None;
-                        self.service_command_pending = false;
-                        self.recording_command_pending = false;
                         self.serial_ports = None;
                     }
                 }
@@ -3114,13 +3116,11 @@ async fn connected_session(
                 let control_repaint = repaint.clone();
                 let control_token = token.to_owned();
                 control_tasks.spawn(async move {
-                    handle_network_command(&mut control_client, command, &control_token, &control_sender, &control_repaint).await;
+                    handle_network_command(&mut control_client, command, &control_token, &control_sender, &control_repaint).await
                 });
             }
             Some(result) = control_tasks.join_next(), if !control_tasks.is_empty() => {
-                if let Err(error) = result {
-                    send_event(sender, ClientEvent::ServiceCommandComplete(Some(format!("A service control failed: {error}"))), repaint);
-                }
+                result.context("A service control task failed")??;
             }
         }
     }
@@ -3144,7 +3144,7 @@ async fn handle_network_command(
     token: &str,
     sender: &SyncSender<ClientEvent>,
     repaint: &egui::Context,
-) {
+) -> Result<()> {
     if !matches!(
         &command,
         NetworkCommand::StartRecording { .. } | NetworkCommand::StopRecording
@@ -3162,46 +3162,50 @@ async fn handle_network_command(
                     .to_owned(),
             ),
         };
-        send_event(sender, ClientEvent::ServiceCommandComplete(notice), repaint);
-        return;
+        return send_required_event(sender, ClientEvent::ServiceCommandComplete(notice), repaint);
     }
-    let result = match command {
-        NetworkCommand::StartRecording { label, notes } => client
-            .start_recording(
-                authenticated_request(
-                    StartRecordingRequest {
-                        client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
-                        label,
-                        notes,
-                    },
-                    token,
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        match command {
+            NetworkCommand::StartRecording { label, notes } => client
+                .start_recording(
+                    authenticated_request(
+                        StartRecordingRequest {
+                            client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
+                            label,
+                            notes,
+                        },
+                        token,
+                    )
+                    .expect("validated service token remains valid metadata"),
                 )
-                .expect("validated service token remains valid metadata"),
-            )
-            .await
-            .map(tonic::Response::into_inner),
-        NetworkCommand::StopRecording => client
-            .stop_recording(
-                authenticated_request(
-                    StopRecordingRequest {
-                        client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
-                    },
-                    token,
+                .await
+                .map(tonic::Response::into_inner),
+            NetworkCommand::StopRecording => client
+                .stop_recording(
+                    authenticated_request(
+                        StopRecordingRequest {
+                            client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
+                        },
+                        token,
+                    )
+                    .expect("validated service token remains valid metadata"),
                 )
-                .expect("validated service token remains valid metadata"),
-            )
-            .await
-            .map(tonic::Response::into_inner),
-        _ => unreachable!("service controls handled above"),
-    };
-    match result {
-        Ok(recording) => send_event(sender, ClientEvent::Recording(recording), repaint),
-        Err(error) => send_event(
-            sender,
-            ClientEvent::RecordingError(format!("recording command failed: {error}")),
-            repaint,
+                .await
+                .map(tonic::Response::into_inner),
+            _ => unreachable!("service controls handled above"),
+        }
+    })
+    .await;
+    let event = match result {
+        Ok(Ok(recording)) => ClientEvent::Recording(recording),
+        Ok(Err(error)) => {
+            ClientEvent::RecordingError(format!("recording command failed: {error}"))
+        }
+        Err(_) => ClientEvent::RecordingError(
+            "The recording response was not received in time. Its state may have changed; check the session status before trying again.".to_owned(),
         ),
-    }
+    };
+    send_required_event(sender, event, repaint)
 }
 
 async fn handle_service_command(
@@ -3402,7 +3406,7 @@ mod tests {
     }
 
     #[test]
-    fn full_ui_queue_rejects_required_handshake_events_until_they_can_be_delivered() {
+    fn full_ui_queue_rejects_required_handshake_and_completion_events() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(2);
         let repaint = egui::Context::default();
         sender.try_send(ClientEvent::Connected(false)).unwrap();
@@ -3415,6 +3419,13 @@ mod tests {
             send_required_event(&sender, ClientEvent::ServiceInfo(info.clone()), &repaint).is_err()
         );
         assert!(send_required_event(&sender, ClientEvent::Connected(true), &repaint).is_err());
+        for completion in [
+            ClientEvent::ServiceCommandComplete(None),
+            ClientEvent::Recording(RecordingStatus::default()),
+            ClientEvent::RecordingError("response unavailable".to_owned()),
+        ] {
+            assert!(send_required_event(&sender, completion, &repaint).is_err());
+        }
         assert!(matches!(
             receiver.recv().unwrap(),
             ClientEvent::Connected(false)
@@ -3435,6 +3446,40 @@ mod tests {
         assert!(matches!(
             receiver.recv().unwrap(),
             ClientEvent::Connected(true)
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_ui_queue_propagates_command_completion_failure() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender.try_send(ClientEvent::Connected(false)).unwrap();
+        let repaint = egui::Context::default();
+        let mut client =
+            KasinaClient::new(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
+        // Invalid metadata fails locally, so this exercises command error delivery
+        // without opening a service or depending on a remote response.
+        let result = handle_network_command(
+            &mut client,
+            NetworkCommand::RefreshSerialPorts,
+            "invalid\ntoken",
+            &sender,
+            &repaint,
+        )
+        .await;
+        assert!(result.is_err());
+        receiver.recv().unwrap();
+        handle_network_command(
+            &mut client,
+            NetworkCommand::RefreshSerialPorts,
+            "invalid\ntoken",
+            &sender,
+            &repaint,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientEvent::ServiceCommandComplete(Some(_))
         ));
     }
 
