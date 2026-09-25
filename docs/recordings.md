@@ -96,3 +96,13 @@ Future analysis code should treat raw data as authoritative and write derived br
 phase, holds, and HRV results separately with an algorithm name and version. CSV export,
 recording browsing, explicit gap-event records, and captured app/preset settings remain
 planned work.
+
+## ThoughtStream USB
+
+ThoughtStream sessions also contain `skin_resistance` in `ohm` and
+`thoughtstream_adc` in `count`, with device kind `thoughtstream` in metadata.
+Quality bits 3–6 mean low battery, recalculation, stale data, and probe error;
+probe errors also set bit 1 (source invalid). Invalid ADC counts are retained,
+but undefined or negative resistance is omitted. Existing field names and schema
+version remain unchanged. See [the protocol notes](hardware/thoughtstream-protocol.md)
+for packet handling and acquisition semantics.

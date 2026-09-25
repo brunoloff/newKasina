@@ -1,4 +1,5 @@
 mod settings;
+mod thoughtstream;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -207,6 +208,7 @@ enum View {
     Dashboard,
     Raw,
     BreathKasina,
+    ThoughtStream,
     Visualizer,
     Diagnostics,
     Settings,
@@ -221,7 +223,7 @@ fn repaint_interval(
         None
     } else if matches!(view, View::BreathKasina | View::Visualizer) {
         Some(ANIMATION_INTERVAL)
-    } else if simulation_mode {
+    } else if simulation_mode || view == View::ThoughtStream {
         Some(SIMULATION_SAMPLE_INTERVAL)
     } else {
         None
@@ -457,6 +459,22 @@ impl SimulationState {
             if tick.is_multiple_of(10) {
                 let heart_sequence = tick / 10 + 1;
                 samples.extend([
+                    simulated_sample(
+                        StreamKind::SkinResistance,
+                        heart_sequence,
+                        monotonic_time_ns,
+                        self.wall_time_epoch_ns,
+                        values.skin_resistance_ohms,
+                        "ohm",
+                    ),
+                    simulated_sample(
+                        StreamKind::ThoughtStreamAdc,
+                        heart_sequence,
+                        monotonic_time_ns,
+                        self.wall_time_epoch_ns,
+                        values.thoughtstream_adc,
+                        "count",
+                    ),
                     simulated_sample(
                         StreamKind::HeartRate,
                         heart_sequence,
@@ -807,6 +825,7 @@ struct KasinaApp {
     model: ClientModel,
     simulation: SimulationState,
     breath_kasina: BreathKasinaState,
+    thoughtstream: thoughtstream::ThoughtStreamPanel,
     settings: AppSettings,
     settings_path: PathBuf,
     settings_writer: SettingsWriter,
@@ -956,6 +975,7 @@ impl KasinaApp {
             model: ClientModel::default(),
             simulation: SimulationState::new(now),
             breath_kasina: BreathKasinaState::new(now),
+            thoughtstream: thoughtstream::ThoughtStreamPanel::new(now),
             settings,
             settings_path,
             settings_writer,
@@ -1045,6 +1065,7 @@ impl KasinaApp {
         if self.settings.simulation_mode == enabled {
             return;
         }
+        self.thoughtstream.deactivate(now);
         self.settings.simulation_mode = enabled;
         self.breath_kasina.reset();
         if enabled {
@@ -1108,7 +1129,7 @@ impl KasinaApp {
             .show(ui, |ui| {
                 ui.add_space(8.0);
                 let visibility = &self.settings.visible_tabs;
-                let mut tabs = Vec::with_capacity(6);
+                let mut tabs = Vec::with_capacity(7);
                 if visibility.dashboard {
                     tabs.push((View::Dashboard, "Dashboard"));
                 }
@@ -1117,6 +1138,9 @@ impl KasinaApp {
                 }
                 if visibility.breath_kasina {
                     tabs.push((View::BreathKasina, "Breath kasina"));
+                }
+                if visibility.thoughtstream {
+                    tabs.push((View::ThoughtStream, "ThoughtStream"));
                 }
                 if visibility.gpu_stress_test {
                     tabs.push((View::Visualizer, "GPU stress test"));
@@ -1178,6 +1202,10 @@ impl KasinaApp {
     }
 
     fn raw_signals(&self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| self.raw_signals_content(ui));
+    }
+
+    fn raw_signals_content(&self, ui: &mut egui::Ui) {
         let model = self.active_model();
         ui.heading(if self.settings.simulation_mode {
             "Simulated streams"
@@ -1204,6 +1232,20 @@ impl KasinaApp {
             model.samples.get(&(StreamKind::RrInterval as i32)),
             egui::Color32::from_rgb(210, 160, 90),
             160.0,
+        );
+        draw_signal(
+            ui,
+            "ThoughtStream · skin resistance (ohm)",
+            model.samples.get(&(StreamKind::SkinResistance as i32)),
+            egui::Color32::from_rgb(150, 210, 125),
+            160.0,
+        );
+        draw_signal(
+            ui,
+            "ThoughtStream · raw ADC (count)",
+            model.samples.get(&(StreamKind::ThoughtStreamAdc as i32)),
+            egui::Color32::from_rgb(175, 145, 220),
+            130.0,
         );
     }
 
@@ -1330,7 +1372,7 @@ impl KasinaApp {
             changed = true;
         }
         ui.label(
-            "Generates a regular 10-second breathing wave at 10 Hz, plus heart rate and RR intervals at 1 Hz. The measurement service keeps running unchanged.",
+            "Generates a regular 10-second breathing wave at 10 Hz, plus heart rate, RR intervals, and ThoughtStream resistance/ADC at 1 Hz. The measurement service keeps running unchanged.",
         );
         ui.add_space(18.0);
         ui.separator();
@@ -1467,6 +1509,13 @@ impl KasinaApp {
                         "GPU stress test",
                     )
                     .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.visible_tabs.thoughtstream,
+                        "ThoughtStream",
+                    )
+                    .changed();
+                ui.end_row();
                 let mut settings_visible = true;
                 ui.add_enabled(
                     false,
@@ -2274,10 +2323,36 @@ impl eframe::App for KasinaApp {
         self.last_frame = now;
         self.top_bar(ui);
         self.navigation(ui);
+        if self.view == View::ThoughtStream {
+            let model = if self.settings.simulation_mode {
+                &self.simulation.model
+            } else {
+                &self.model
+            };
+            let session = model
+                .service_info
+                .as_ref()
+                .map_or("simulation", |info| info.instance_id.as_str());
+            self.thoughtstream.update(
+                model.samples.get(&(StreamKind::SkinResistance as i32)),
+                model.latest(StreamKind::ThoughtStreamAdc),
+                session,
+                now,
+                unix_time_ns(),
+                &self.settings.thoughtstream,
+            );
+        } else {
+            self.thoughtstream.deactivate(now);
+        }
         egui::CentralPanel::default().show(ui, |ui| match self.view {
             View::Dashboard => self.dashboard(ui),
             View::Raw => self.raw_signals(ui),
             View::BreathKasina => self.breath_kasina(ui),
+            View::ThoughtStream => {
+                if self.thoughtstream.ui(ui, &mut self.settings.thoughtstream) {
+                    self.mark_settings_changed(ui.ctx());
+                }
+            }
             View::Visualizer => self.visualizer(ui),
             View::Diagnostics => self.diagnostics(ui),
             View::Settings => self.settings(ui),
@@ -2321,7 +2396,26 @@ fn draw_signal(
     color: egui::Color32,
     height: f32,
 ) {
-    ui.label(label);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+        if let Some(sample) = samples.and_then(|samples| samples.back()) {
+            ui.monospace(format!("{:.2} {}", sample.value, sample.unit));
+            for (flag, label) in [
+                (quality::SOURCE_INVALID, "invalid reading"),
+                (quality::PROBE_ERROR, "probe error"),
+                (quality::LOW_BATTERY, "low battery"),
+                (quality::RECALIBRATED, "recalculated"),
+                (quality::STALE, "no new data"),
+                (quality::AFTER_GAP, "after gap"),
+            ] {
+                if sample.quality_flags & flag != 0 {
+                    ui.colored_label(egui::Color32::YELLOW, label);
+                }
+            }
+        } else {
+            ui.weak("Waiting for samples");
+        }
+    });
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::hover(),
@@ -2346,6 +2440,9 @@ fn draw_signal(
         let x = rect.left() + rect.width() * index as f32 / divisor;
         let normalized = ((sample.value - minimum) / span) as f32;
         let point = egui::pos2(x, rect.bottom() - normalized * rect.height());
+        if sample.quality_flags & quality::AFTER_GAP != 0 {
+            previous = None;
+        }
         if let Some(previous) = previous {
             ui.painter()
                 .line_segment([previous, point], egui::Stroke::new(1.5, color));
@@ -2667,6 +2764,8 @@ fn all_streams() -> Vec<i32> {
         StreamKind::AccelerationX,
         StreamKind::AccelerationY,
         StreamKind::AccelerationZ,
+        StreamKind::SkinResistance,
+        StreamKind::ThoughtStreamAdc,
     ]
     .map(|stream| stream as i32)
     .to_vec()

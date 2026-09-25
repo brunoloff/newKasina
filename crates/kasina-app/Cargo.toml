@@ -11,6 +11,7 @@ clap.workspace = true
 directories.workspace = true
 eframe.workspace = true
 egui.workspace = true
+kasina-audio = { path = "../kasina-audio" }
 kasina-domain = { path = "../kasina-domain" }
 kasina-devices = { path = "../kasina-devices" }
 kasina-protocol = { path = "../kasina-protocol" }

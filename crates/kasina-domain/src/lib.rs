@@ -21,23 +21,31 @@ pub enum StreamKind {
     AccelerationY,
     /// Z acceleration.
     AccelerationZ,
+    /// ThoughtStream skin resistance in ohms.
+    SkinResistance,
+    /// Unconverted ThoughtStream ADC count.
+    ThoughtStreamAdc,
 }
 
 impl StreamKind {
     /// All currently defined stream kinds in stable display order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::HeartRate,
         Self::RrInterval,
         Self::RespirationForce,
         Self::AccelerationX,
         Self::AccelerationY,
         Self::AccelerationZ,
+        Self::SkinResistance,
+        Self::ThoughtStreamAdc,
     ];
 
     /// Canonical unit used on the wire and in recordings.
     #[must_use]
     pub const fn unit(self) -> &'static str {
         match self {
+            Self::SkinResistance => "ohm",
+            Self::ThoughtStreamAdc => "count",
             Self::HeartRate => "bpm",
             Self::RrInterval => "us",
             Self::RespirationForce => "device",
@@ -54,6 +62,14 @@ pub mod quality {
     pub const SOURCE_INVALID: u32 = 1 << 1;
     /// A discontinuity preceded this sample.
     pub const AFTER_GAP: u32 = 1 << 2;
+    /// The device reports a low battery.
+    pub const LOW_BATTERY: u32 = 1 << 3;
+    /// The device reports recalculation/recalibration.
+    pub const RECALIBRATED: u32 = 1 << 4;
+    /// The packet does not report a fresh measurement.
+    pub const STALE: u32 = 1 << 5;
+    /// ThoughtStream reports a probe error (also sets SOURCE_INVALID).
+    pub const PROBE_ERROR: u32 = 1 << 6;
 }
 
 /// One timestamped, sequenced scalar measurement.

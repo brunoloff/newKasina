@@ -16,6 +16,7 @@ kasina-devices = { path = "../kasina-devices" }
 kasina-domain = { path = "../kasina-domain" }
 kasina-godirect = { path = "../kasina-godirect" }
 kasina-polar = { path = "../kasina-polar" }
+kasina-thoughtstream = { path = "../kasina-thoughtstream" }
 kasina-protocol = { path = "../kasina-protocol" }
 parking_lot.workspace = true
 serde.workspace = true
@@ -34,6 +35,7 @@ uuid.workspace = true
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+tokio-serial = "5.5.0"
 async-trait.workspace = true
 tempfile = "3.26.0"
 

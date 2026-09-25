@@ -1,0 +1,18 @@
+[package]
+name = "kasina-thoughtstream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+kasina-devices = { path = "../kasina-devices" }
+kasina-domain = { path = "../kasina-domain" }
+tokio = { workspace = true, features = ["io-util"] }
+tokio-serial = "5.5.0"
+tokio-util.workspace = true
+
+[lints]
+workspace = true

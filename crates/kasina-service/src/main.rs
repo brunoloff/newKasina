@@ -1,3 +1,4 @@
+mod port_settings;
 mod tray;
 
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use kasina_service::{
     DEFAULT_PORT, KasinaRpc, ServiceLock, ServicePaths, ServiceState, bind_loopback,
     load_or_create_token, serve, write_diagnostics_jsonl,
 };
+use kasina_thoughtstream::{ThoughtStreamDriver, ThoughtStreamPortSelection};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -38,7 +40,7 @@ struct Args {
     /// Override the standard private session-recordings directory.
     #[arg(long)]
     recordings_dir: Option<PathBuf>,
-    /// Acquisition source. `hardware` supervises Polar and Go Direct concurrently.
+    /// Acquisition source. `hardware` supervises Polar, Go Direct, and ThoughtStream concurrently.
     #[arg(long, value_enum, default_value_t = Source::Simulated)]
     source: Source,
     /// Prefer this saved platform peripheral identifier for the Polar sensor.
@@ -47,6 +49,11 @@ struct Args {
     /// Prefer this saved platform peripheral identifier for the Go Direct sensor.
     #[arg(long)]
     go_direct_id: Option<String>,
+    /// ThoughtStream serial port (e.g. /dev/ttyUSB0 or COM3); otherwise discover by USB product name.
+    #[arg(long)]
+    thoughtstream_port: Option<String>,
+    #[arg(skip)]
+    thoughtstream_selection: Option<ThoughtStreamPortSelection>,
     /// Append periodic service/device/stream health snapshots as JSON Lines.
     #[arg(long)]
     diagnostics_jsonl: Option<PathBuf>,
@@ -60,6 +67,7 @@ enum Source {
     Simulated,
     Polar,
     GoDirect,
+    Thoughtstream,
     Hardware,
 }
 
@@ -77,7 +85,18 @@ fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+    let saved_port = port_settings::settings_path().and_then(|path| port_settings::load(&path));
+    let saved_port = match saved_port {
+        Ok(port) => port,
+        Err(error) => {
+            tracing::warn!(%error, "could not load saved ThoughtStream port; using automatic discovery");
+            None
+        }
+    };
+    args.thoughtstream_selection = Some(ThoughtStreamPortSelection::new(
+        args.thoughtstream_port.clone().or(saved_port),
+    ));
     if args.headless {
         run_service_thread(args, CancellationToken::new(), None)
     } else {
@@ -109,13 +128,23 @@ async fn run_service(
     let _lock = ServiceLock::acquire(&lock_path)?;
     let token = load_or_create_token(&token_path)?;
 
+    let thoughtstream_selection = args
+        .thoughtstream_selection
+        .clone()
+        .unwrap_or_else(|| ThoughtStreamPortSelection::new(args.thoughtstream_port.clone()));
     let drivers: Vec<Box<dyn SensorDriver>> = match args.source {
         Source::Simulated => vec![Box::new(SimulatedDriver::default())],
         Source::Polar => vec![Box::new(polar_driver(args.polar_id.as_deref()))],
         Source::GoDirect => vec![Box::new(go_direct_driver(args.go_direct_id.as_deref()))],
+        Source::Thoughtstream => vec![Box::new(ThoughtStreamDriver::with_selection(
+            thoughtstream_selection.clone(),
+        ))],
         Source::Hardware => vec![
             Box::new(polar_driver(args.polar_id.as_deref())),
             Box::new(go_direct_driver(args.go_direct_id.as_deref())),
+            Box::new(ThoughtStreamDriver::with_selection(
+                thoughtstream_selection.clone(),
+            )),
         ],
     };
     let descriptors = drivers

@@ -84,6 +84,7 @@ impl From<&DeviceDescriptor> for SessionDevice {
             kind: match device.kind {
                 DeviceKind::Polar => "polar",
                 DeviceKind::GoDirect => "go_direct",
+                DeviceKind::ThoughtStream => "thoughtstream",
                 DeviceKind::Simulated => "simulated",
             }
             .to_owned(),
@@ -172,6 +173,8 @@ where
         "acceleration_x" | "AccelerationX" => Ok(StreamKind::AccelerationX),
         "acceleration_y" | "AccelerationY" => Ok(StreamKind::AccelerationY),
         "acceleration_z" | "AccelerationZ" => Ok(StreamKind::AccelerationZ),
+        "skin_resistance" | "SkinResistance" => Ok(StreamKind::SkinResistance),
+        "thoughtstream_adc" | "ThoughtStreamAdc" => Ok(StreamKind::ThoughtStreamAdc),
         _ => Err(serde::de::Error::custom(format!(
             "unrecognized recording stream {stream:?}"
         ))),
@@ -803,6 +806,8 @@ fn stream_name(stream: StreamKind) -> &'static str {
         StreamKind::AccelerationX => "acceleration_x",
         StreamKind::AccelerationY => "acceleration_y",
         StreamKind::AccelerationZ => "acceleration_z",
+        StreamKind::SkinResistance => "skin_resistance",
+        StreamKind::ThoughtStreamAdc => "thoughtstream_adc",
     }
 }
 

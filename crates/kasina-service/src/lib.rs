@@ -586,6 +586,8 @@ fn proto_stream(stream: StreamKind) -> kasina_protocol::v1::StreamKind {
         StreamKind::AccelerationX => Proto::AccelerationX,
         StreamKind::AccelerationY => Proto::AccelerationY,
         StreamKind::AccelerationZ => Proto::AccelerationZ,
+        StreamKind::SkinResistance => Proto::SkinResistance,
+        StreamKind::ThoughtStreamAdc => Proto::ThoughtStreamAdc,
     }
 }
 
@@ -598,6 +600,8 @@ fn domain_stream(stream: i32) -> Result<StreamKind, Status> {
         Proto::AccelerationX => Ok(StreamKind::AccelerationX),
         Proto::AccelerationY => Ok(StreamKind::AccelerationY),
         Proto::AccelerationZ => Ok(StreamKind::AccelerationZ),
+        Proto::SkinResistance => Ok(StreamKind::SkinResistance),
+        Proto::ThoughtStreamAdc => Ok(StreamKind::ThoughtStreamAdc),
         Proto::Unspecified => Err(Status::invalid_argument("stream is unspecified")),
     }
 }
@@ -607,6 +611,7 @@ fn proto_device_kind(kind: DeviceKind) -> kasina_protocol::v1::DeviceKind {
     match kind {
         DeviceKind::Polar => Proto::Polar,
         DeviceKind::GoDirect => Proto::GoDirect,
+        DeviceKind::ThoughtStream => Proto::ThoughtStream,
         DeviceKind::Simulated => Proto::Simulated,
     }
 }

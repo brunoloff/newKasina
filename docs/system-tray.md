@@ -12,17 +12,20 @@ outside the current desktop-only target.
 
 ## Icon
 
-The generated 64-pixel icon has two rows:
+The generated 64-pixel icon contains three independent device symbols:
 
-- a heart and its Polar H10 connection light;
-- breath waves and their Go Direct connection light.
+- a pink heart for Polar H10;
+- cyan breath waves for Go Direct;
+- a violet thought bubble for ThoughtStream USB.
 
-The light colors mean:
+Each symbol uses its vivid color when connected and neutral grayscale otherwise.
+Stopped, unconfigured, connecting, reconnecting, and disconnected devices all have
+an inactive gray symbol; the menu and tooltip distinguish those detailed states.
+The symbols themselves communicate connection status, with no separate traffic lights.
+Edges are antialiased for small desktop-panel sizes.
 
-- green: connected;
-- amber: discovering, connecting, or reconnecting;
-- red: disconnected or an acquisition error;
-- gray: the server is stopped or that device family is not configured.
+A [size/state preview](validation/tray-icons-2026-09-10.png) shows all-off, all-connected,
+and ThoughtStream-only states at full and small panel sizes.
 
 The image is generated directly from status, with no external icon file to lose during
 packaging. Windows and macOS also receive a concise hover tooltip. Linux AppIndicator
@@ -34,7 +37,7 @@ right click may open that same menu.
 The menu reports:
 
 - service lifecycle, uptime, and connected client count;
-- Polar and Go Direct connection state, detail, newest-sample age, and retry count;
+- Polar, Go Direct, and ThoughtStream connection state, detail, newest-sample age, and retry count;
 - recording state, label, sample count, and dropped-sample count;
 - the result of the latest tray action.
 
@@ -112,3 +115,10 @@ sudo apt install libgtk-3-dev libayatana-appindicator3-dev
 ```
 
 This development machine already has the required packages.
+
+ThoughtStream USB has its own menu status and tooltip entry, including connection,
+probe/battery, and freshness details. Its thought-bubble glyph changes independently of the heart and breath glyphs. `--source hardware` includes the ThoughtStream
+driver and automatically probes likely USB adapters for valid ThoughtStream data.
+**Choose ThoughtStream port…** lists available serial ports and **Find automatically**;
+choices are saved and reconnect only ThoughtStream, leaving the rest of acquisition
+and recording running. The list refreshes when devices are plugged in.

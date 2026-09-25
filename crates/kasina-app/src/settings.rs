@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, bail};
 use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala, OrganicKaleidoscope, PaperDisk};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 8;
+const SETTINGS_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,6 +17,7 @@ pub(crate) struct TabVisibility {
     pub dashboard: bool,
     pub raw_signals: bool,
     pub breath_kasina: bool,
+    pub thoughtstream: bool,
     pub gpu_stress_test: bool,
     pub diagnostics: bool,
 }
@@ -27,6 +28,7 @@ impl Default for TabVisibility {
             dashboard: false,
             raw_signals: false,
             breath_kasina: true,
+            thoughtstream: true,
             gpu_stress_test: false,
             diagnostics: false,
         }
@@ -89,6 +91,7 @@ pub(crate) struct KasinaPreset {
 pub(crate) struct AppSettings {
     pub schema_version: u32,
     pub simulation_mode: bool,
+    pub thoughtstream: crate::thoughtstream::ThoughtStreamSettings,
     pub visible_tabs: TabVisibility,
     pub active_preset_id: u64,
     pub next_preset_id: u64,
@@ -116,6 +119,7 @@ impl AppSettings {
 
     #[must_use]
     pub fn sanitized(mut self) -> Self {
+        self.thoughtstream.sanitize();
         let source_schema = self.schema_version;
         if source_schema < 4 {
             let value_was_radians_per_second = source_schema < 3;
@@ -251,6 +255,7 @@ impl Default for AppSettings {
         Self {
             schema_version: SETTINGS_SCHEMA_VERSION,
             simulation_mode: false,
+            thoughtstream: Default::default(),
             visible_tabs: TabVisibility::default(),
             active_preset_id: 1,
             next_preset_id: 7,

@@ -9,22 +9,26 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow};
 use kasina_protocol::v1::{ConnectionState, DeviceKind, RecordingState, StatusSnapshot};
 use kasina_service::{ServicePaths, ServiceState};
+use kasina_thoughtstream::{SerialPortChoice, ThoughtStreamPortSelection, available_serial_ports};
 use parking_lot::RwLock;
 use tao::event::{Event, StartCause};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use super::{Args, run_service_thread};
+use super::{Args, port_settings, run_service_thread};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const MENU_RECORDING: &str = "recording-action";
 const MENU_SERVER: &str = "server-action";
 const MENU_LAUNCH_APP: &str = "launch-app";
 const MENU_OPEN_RECORDINGS: &str = "open-recordings";
+const MENU_PORT_AUTO: &str = "thoughtstream-auto";
+const MENU_PORT_REFRESH: &str = "thoughtstream-refresh";
+const MENU_PORT_PREFIX: &str = "thoughtstream-port:";
 const MENU_QUIT: &str = "quit";
 const ICON_SIZE: u32 = 64;
 
@@ -131,7 +135,7 @@ impl ServiceBridge {
                     )
                     .await
                 {
-                    Ok(_) => bridge.set_notice("Recording raw breath and heartbeat data"),
+                    Ok(_) => bridge.set_notice("Recording raw sensor data"),
                     Err(error) => bridge.set_notice(format!("Could not start recording: {error}")),
                 }
             });
@@ -270,6 +274,7 @@ impl Drop for ServiceRunner {
 #[derive(Debug, Clone)]
 enum UserEvent {
     Menu(MenuEvent),
+    SerialPorts(std::result::Result<Vec<SerialPortChoice>, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +289,7 @@ enum TrafficState {
 struct VisualState {
     heart: TrafficState,
     breath: TrafficState,
+    thought: TrafficState,
 }
 
 #[derive(Debug)]
@@ -305,6 +311,11 @@ struct TrayUi {
     service_status: MenuItem,
     heart_status: MenuItem,
     breath_status: MenuItem,
+    thoughtstream_status: MenuItem,
+    port_menu: Submenu,
+    port_choices: Vec<SerialPortChoice>,
+    displayed_port: Option<String>,
+    ports_loaded: bool,
     recording_status: MenuItem,
     notice: MenuItem,
     recording_action: MenuItem,
@@ -320,6 +331,9 @@ impl TrayUi {
         let service_status = MenuItem::new("Service: Starting", false, None);
         let heart_status = MenuItem::new("♥ Polar H10: Starting", false, None);
         let breath_status = MenuItem::new("≋ Go Direct: Starting", false, None);
+        let thoughtstream_status = MenuItem::new("ThoughtStream USB: Starting", false, None);
+        let port_menu = Submenu::new("Choose ThoughtStream port…", true);
+        port_menu.append(&MenuItem::new("Looking for serial ports…", false, None))?;
         let recording_status = MenuItem::new("Recording: Waiting for service", false, None);
         let notice = MenuItem::new("Starting measurement server…", false, None);
         let recording_action = MenuItem::with_id(MENU_RECORDING, "Start recording", false, None);
@@ -335,6 +349,8 @@ impl TrayUi {
             &service_status,
             &heart_status,
             &breath_status,
+            &thoughtstream_status,
+            &port_menu,
             &recording_status,
             &notice,
             &first_separator,
@@ -349,6 +365,7 @@ impl TrayUi {
         let last_visual = VisualState {
             heart: TrafficState::Connecting,
             breath: TrafficState::Connecting,
+            thought: TrafficState::Connecting,
         };
         let last_tooltip = "newKasina · measurement server starting".to_owned();
         let tray = TrayIconBuilder::new()
@@ -366,6 +383,11 @@ impl TrayUi {
             service_status,
             heart_status,
             breath_status,
+            thoughtstream_status,
+            port_menu,
+            port_choices: Vec::new(),
+            displayed_port: None,
+            ports_loaded: false,
             recording_status,
             notice,
             recording_action,
@@ -376,6 +398,71 @@ impl TrayUi {
         })
     }
 
+    fn refresh_ports(
+        &mut self,
+        choices: Vec<SerialPortChoice>,
+        selected: Option<String>,
+    ) -> Result<()> {
+        if self.ports_loaded && self.port_choices == choices && self.displayed_port == selected {
+            return Ok(());
+        }
+        while self.port_menu.remove_at(0).is_some() {}
+        self.port_menu.append(&CheckMenuItem::with_id(
+            MENU_PORT_AUTO,
+            "Find automatically",
+            true,
+            selected.is_none(),
+            None,
+        ))?;
+        self.port_menu.append(&MenuItem::with_id(
+            MENU_PORT_REFRESH,
+            "Refresh port list",
+            true,
+            None,
+        ))?;
+        self.port_menu.append(&PredefinedMenuItem::separator())?;
+        if choices.is_empty() {
+            self.port_menu.append(&MenuItem::new(
+                "No serial ports found — plug in the USB device",
+                false,
+                None,
+            ))?;
+        }
+        let other_ports = Submenu::new("Other serial ports", true);
+        for choice in &choices {
+            let item = CheckMenuItem::with_id(
+                format!("{MENU_PORT_PREFIX}{}", choice.path),
+                &choice.label,
+                true,
+                selected.as_ref() == Some(&choice.path),
+                None,
+            );
+            if choice.usb {
+                self.port_menu.append(&item)?;
+            } else {
+                other_ports.append(&item)?;
+            }
+        }
+        if !other_ports.items().is_empty() {
+            self.port_menu.append(&other_ports)?;
+        }
+        if let Some(path) = &selected
+            && !choices.iter().any(|choice| &choice.path == path)
+        {
+            self.port_menu.append(&CheckMenuItem::with_id(
+                format!("{MENU_PORT_PREFIX}{path}"),
+                format!("Saved port (unavailable): {path}"),
+                true,
+                true,
+                None,
+            ))?;
+        }
+        self.port_choices = choices;
+        self.displayed_port = selected;
+        self.ports_loaded = true;
+        Ok(())
+    }
+
     fn refresh(
         &mut self,
         lifecycle: ServiceLifecycle,
@@ -384,6 +471,7 @@ impl TrayUi {
     ) {
         let heart = device_summary(status, DeviceKind::Polar, lifecycle);
         let breath = device_summary(status, DeviceKind::GoDirect, lifecycle);
+        let thoughtstream = device_summary(status, DeviceKind::ThoughtStream, lifecycle);
         let recording = recording_summary(status);
         let service = service_summary(lifecycle, status);
         set_menu_text(&self.service_status, &format!("Service: {service}"));
@@ -391,6 +479,10 @@ impl TrayUi {
         set_menu_text(
             &self.breath_status,
             &format!("≋ Go Direct: {}", breath.text),
+        );
+        set_menu_text(
+            &self.thoughtstream_status,
+            &format!("ThoughtStream USB: {}", thoughtstream.text),
         );
         set_menu_text(
             &self.recording_status,
@@ -439,6 +531,7 @@ impl TrayUi {
         let visual = VisualState {
             heart: heart.light,
             breath: breath.light,
+            thought: thoughtstream.light,
         };
         if visual != self.last_visual {
             match tray_icon(visual)
@@ -449,9 +542,10 @@ impl TrayUi {
             }
         }
         let tooltip = format!(
-            "newKasina · Heart: {} · Breath: {} · {}",
+            "newKasina · Heart: {} · Breath: {} · ThoughtStream: {} · {}",
             short_state(heart.light),
             short_state(breath.light),
+            short_state(thoughtstream.light),
             if recording.active {
                 "recording"
             } else {
@@ -472,17 +566,25 @@ impl TrayUi {
 pub(crate) fn run(args: Args) -> Result<()> {
     let defaults = ServicePaths::for_user()?;
     let fallback_recordings = args.recordings_dir.clone().unwrap_or(defaults.recordings);
+    let selection = args
+        .thoughtstream_selection
+        .clone()
+        .unwrap_or_else(|| ThoughtStreamPortSelection::new(args.thoughtstream_port.clone()));
+    let settings_path = port_settings::settings_path()?;
     let bridge = ServiceBridge::default();
     let mut runner = ServiceRunner::new(args, bridge.clone());
     runner.start();
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event| {
-        let _ignored = proxy.send_event(UserEvent::Menu(event));
+        let _ignored = menu_proxy.send_event(UserEvent::Menu(event));
     }));
     let mut ui: Option<TrayUi> = None;
     let mut quit_when_stopped = false;
+    let mut scanning_ports = false;
+    let mut last_port_scan = Instant::now() - Duration::from_secs(5);
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + REFRESH_INTERVAL);
@@ -499,6 +601,20 @@ pub(crate) fn run(args: Args) -> Result<()> {
                 }
             },
             Event::UserEvent(UserEvent::Menu(event)) => match event.id.as_ref() {
+                MENU_PORT_AUTO => apply_port_choice(&selection, &settings_path, None, &bridge),
+                MENU_PORT_REFRESH => {
+                    last_port_scan = Instant::now() - Duration::from_secs(5);
+                }
+                id if id.starts_with(MENU_PORT_PREFIX) => {
+                    if let Some(path) = id.strip_prefix(MENU_PORT_PREFIX) {
+                        apply_port_choice(
+                            &selection,
+                            &settings_path,
+                            Some(path.to_owned()),
+                            &bridge,
+                        );
+                    }
+                }
                 MENU_RECORDING => bridge.toggle_recording(),
                 MENU_SERVER => match runner.lifecycle() {
                     ServiceLifecycle::Stopped | ServiceLifecycle::Error => runner.start(),
@@ -526,8 +642,45 @@ pub(crate) fn run(args: Args) -> Result<()> {
                 }
                 _ => {}
             },
+            Event::UserEvent(UserEvent::SerialPorts(result)) => {
+                scanning_ports = false;
+                last_port_scan = Instant::now();
+                match result {
+                    Ok(ports) => {
+                        if let Some(ui) = &mut ui
+                            && let Err(error) = ui.refresh_ports(ports, selection.selected_port())
+                        {
+                            bridge.set_notice(format!("Could not update serial ports: {error:#}"));
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(ui) = &mut ui {
+                            // Keep the chooser and retry action usable even when enumeration fails.
+                            let _ = ui
+                                .refresh_ports(ui.port_choices.clone(), selection.selected_port());
+                        }
+                        bridge.set_notice(format!("Could not list serial ports: {error}"));
+                    }
+                }
+            }
             Event::MainEventsCleared => {
                 runner.poll();
+                if !scanning_ports && last_port_scan.elapsed() >= Duration::from_secs(3) {
+                    match scan_ports(proxy.clone()) {
+                        Ok(()) => scanning_ports = true,
+                        Err(error) => {
+                            last_port_scan = Instant::now();
+                            bridge.set_notice(format!("Could not scan serial ports: {error:#}"));
+                        }
+                    }
+                }
+                if let Some(ui) = &mut ui
+                    && ui.ports_loaded
+                    && let Err(error) =
+                        ui.refresh_ports(ui.port_choices.clone(), selection.selected_port())
+                {
+                    bridge.set_notice(format!("Could not update port selection: {error:#}"));
+                }
                 if let Some(ui) = &mut ui {
                     let status = bridge.snapshot();
                     ui.refresh(runner.lifecycle(), status.as_ref(), &bridge.notice());
@@ -545,6 +698,34 @@ pub(crate) fn run(args: Args) -> Result<()> {
             _ => {}
         }
     })
+}
+
+fn scan_ports(proxy: EventLoopProxy<UserEvent>) -> Result<()> {
+    thread::Builder::new()
+        .name("kasina-serial-ports".to_owned())
+        .spawn(move || {
+            let result = available_serial_ports().map_err(|error| format!("{error:#}"));
+            let _ = proxy.send_event(UserEvent::SerialPorts(result));
+        })?;
+    Ok(())
+}
+
+fn apply_port_choice(
+    selection: &ThoughtStreamPortSelection,
+    settings_path: &Path,
+    port: Option<String>,
+    bridge: &ServiceBridge,
+) {
+    let saved = port_settings::save(settings_path, port.clone());
+    selection.select(port);
+    match saved {
+        Ok(()) => {
+            bridge.set_notice("ThoughtStream port selection saved; reconnecting ThoughtStream")
+        }
+        Err(error) => bridge.set_notice(format!(
+            "Port changed for this run, but could not save the choice: {error:#}"
+        )),
+    }
 }
 
 fn device_summary(
@@ -741,96 +922,98 @@ fn tray_icon(state: VisualState) -> Result<Icon> {
         .map_err(|error| anyhow!("construct tray icon: {error}"))
 }
 
+// Keep the same three-glyph arrangement in the packaged service SVG.
+const HEART_COLOR: [u8; 4] = [255, 75, 115, 255];
+const BREATH_COLOR: [u8; 4] = [34, 211, 238, 255];
+const THOUGHT_COLOR: [u8; 4] = [185, 105, 255, 255];
+const INACTIVE_COLOR: [u8; 4] = [120, 120, 120, 255];
+const ICON_BACKGROUND: [u8; 4] = [22, 22, 22, 255];
+
+fn glyph_color(state: TrafficState, vivid: [u8; 4]) -> [u8; 4] {
+    if state == TrafficState::Connected {
+        vivid
+    } else {
+        INACTIVE_COLOR
+    }
+}
+
 fn icon_rgba(state: VisualState) -> Vec<u8> {
     let mut pixels = vec![0_u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
-    draw_rounded_background(&mut pixels);
-    draw_heart(&mut pixels);
-    draw_breath(&mut pixels);
-    draw_status_light(&mut pixels, 49, 18, state.heart);
-    draw_status_light(&mut pixels, 49, 46, state.breath);
+    let heart = glyph_color(state.heart, HEART_COLOR);
+    let breath = glyph_color(state.breath, BREATH_COLOR);
+    let thought = glyph_color(state.thought, THOUGHT_COLOR);
+    // Supersampling keeps small tray silhouettes smooth without external assets.
+    const SAMPLES: u32 = 4;
+    for y in 0..ICON_SIZE {
+        for x in 0..ICON_SIZE {
+            let mut rgba = [0_u32; 4];
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let px = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
+                    let color = if heart_contains(px, py) {
+                        heart
+                    } else if breath_contains(px, py) {
+                        breath
+                    } else if thought_contains(px, py) {
+                        thought
+                    } else if circle_contains(
+                        px,
+                        py,
+                        px.clamp(12.0, 52.0),
+                        py.clamp(12.0, 52.0),
+                        10.0,
+                    ) {
+                        ICON_BACKGROUND
+                    } else {
+                        [0; 4]
+                    };
+                    for channel in 0..3 {
+                        rgba[channel] += u32::from(color[channel]) * u32::from(color[3]);
+                    }
+                    rgba[3] += u32::from(color[3]);
+                }
+            }
+            let index = ((y * ICON_SIZE + x) * 4) as usize;
+            for channel in 0..3 {
+                pixels[index + channel] = rgba[channel].checked_div(rgba[3]).unwrap_or(0) as u8;
+            }
+            pixels[index + 3] = (rgba[3] / (SAMPLES * SAMPLES)) as u8;
+        }
+    }
     pixels
 }
 
-fn draw_rounded_background(pixels: &mut [u8]) {
-    for y in 3..61 {
-        for x in 3..61 {
-            let corner_x = if x < 13 {
-                13 - x
-            } else if x > 50 {
-                x - 50
-            } else {
-                0
-            };
-            let corner_y = if y < 13 {
-                13 - y
-            } else if y > 50 {
-                y - 50
-            } else {
-                0
-            };
-            if corner_x * corner_x + corner_y * corner_y <= 100 {
-                put_pixel(pixels, x, y, [12, 20, 33, 244]);
-            }
-        }
-    }
+fn heart_contains(x: f32, y: f32) -> bool {
+    let x = (x - 18.0) / 9.5;
+    let y = (16.0 - y) / 8.5;
+    (x * x + y * y - 1.0).powi(3) - x * x * y.powi(3) <= 0.0
 }
 
-fn draw_heart(pixels: &mut [u8]) {
-    let color = [247, 139, 158, 255];
-    for y in 8..33 {
-        for x in 7..33 {
-            let left_circle = squared_distance(x, y, 14, 15) <= 42;
-            let right_circle = squared_distance(x, y, 24, 15) <= 42;
-            let triangle = (14..=31).contains(&y) && (x - 19).abs() <= 17 - (y - 14);
-            if left_circle || right_circle || triangle {
-                put_pixel(pixels, x, y, color);
-            }
-        }
-    }
+fn breath_contains(x: f32, y: f32) -> bool {
+    let wave_x = x.clamp(36.0, 55.0);
+    let offset = ((wave_x - 36.0) * std::f32::consts::TAU / 20.0).sin() * 1.7;
+    [11.0, 17.0, 23.0]
+        .iter()
+        .any(|base| circle_contains(x, y, wave_x, base + offset, 1.5))
 }
 
-fn draw_breath(pixels: &mut [u8]) {
-    const WAVE: [i32; 16] = [0, 1, 2, 3, 3, 2, 1, 0, 0, -1, -2, -3, -3, -2, -1, 0];
-    let color = [144, 215, 247, 255];
-    for x in 7..34 {
-        let offset = WAVE[((x - 7) % WAVE.len() as i32) as usize];
-        draw_circle(pixels, x, 42 + offset, 1, color);
-        draw_circle(pixels, x, 51 + offset, 1, color);
-    }
+fn thought_contains(x: f32, y: f32) -> bool {
+    [
+        (26.0, 43.0, 7.0),
+        (33.0, 39.0, 8.0),
+        (41.0, 43.0, 7.0),
+        (39.0, 47.0, 6.0),
+        (29.0, 48.0, 6.0),
+        (17.0, 54.0, 2.3),
+        (12.0, 58.0, 1.4),
+    ]
+    .iter()
+    .any(|&(cx, cy, radius)| circle_contains(x, y, cx, cy, radius))
 }
 
-fn draw_status_light(pixels: &mut [u8], center_x: i32, center_y: i32, state: TrafficState) {
-    draw_circle(pixels, center_x, center_y, 9, [220, 228, 236, 255]);
-    let color = match state {
-        TrafficState::Off => [91, 103, 120, 255],
-        TrafficState::Connecting => [247, 184, 48, 255],
-        TrafficState::Connected => [45, 215, 108, 255],
-        TrafficState::Error => [239, 67, 75, 255],
-    };
-    draw_circle(pixels, center_x, center_y, 7, color);
-    draw_circle(pixels, center_x - 2, center_y - 2, 2, [255, 255, 255, 150]);
-}
-
-fn draw_circle(pixels: &mut [u8], center_x: i32, center_y: i32, radius: i32, color: [u8; 4]) {
-    for y in center_y - radius..=center_y + radius {
-        for x in center_x - radius..=center_x + radius {
-            if squared_distance(x, y, center_x, center_y) <= radius * radius {
-                put_pixel(pixels, x, y, color);
-            }
-        }
-    }
-}
-
-fn squared_distance(x: i32, y: i32, center_x: i32, center_y: i32) -> i32 {
-    (x - center_x).pow(2) + (y - center_y).pow(2)
-}
-
-fn put_pixel(pixels: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
-    if x < 0 || y < 0 || x >= ICON_SIZE as i32 || y >= ICON_SIZE as i32 {
-        return;
-    }
-    let index = ((y as u32 * ICON_SIZE + x as u32) * 4) as usize;
-    pixels[index..index + 4].copy_from_slice(&color);
+fn circle_contains(x: f32, y: f32, cx: f32, cy: f32, radius: f32) -> bool {
+    (x - cx).powi(2) + (y - cy).powi(2) <= radius * radius
 }
 
 #[cfg(test)]
@@ -840,18 +1023,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icon_contains_distinct_heart_and_breath_traffic_lights() {
-        let icon = icon_rgba(VisualState {
-            heart: TrafficState::Connected,
-            breath: TrafficState::Error,
-        });
-        assert_eq!(icon.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
-        assert_eq!(&icon[0..4], &[0, 0, 0, 0]);
-        assert_eq!(pixel(&icon, 49, 18), [45, 215, 108, 255]);
-        assert_eq!(pixel(&icon, 49, 46), [239, 67, 75, 255]);
-        assert_eq!(pixel(&icon, 47, 16), [255, 255, 255, 150]);
-        assert_eq!(pixel(&icon, 18, 18), [247, 139, 158, 255]);
-        assert_ne!(pixel(&icon, 18, 42)[3], 0);
+    fn each_connected_sensor_colors_only_its_own_glyph() {
+        let off = VisualState {
+            heart: TrafficState::Off,
+            breath: TrafficState::Off,
+            thought: TrafficState::Off,
+        };
+        let gray = icon_rgba(off);
+        assert_eq!(gray.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
+        assert_eq!(&gray[0..4], &[0, 0, 0, 0]);
+        assert!(gray.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]));
+        for (state, active_point, color, inactive_points) in [
+            (
+                VisualState {
+                    heart: TrafficState::Connected,
+                    ..off
+                },
+                (18, 17),
+                HEART_COLOR,
+                [(43, 12), (33, 43)],
+            ),
+            (
+                VisualState {
+                    breath: TrafficState::Connected,
+                    ..off
+                },
+                (43, 12),
+                BREATH_COLOR,
+                [(18, 17), (33, 43)],
+            ),
+            (
+                VisualState {
+                    thought: TrafficState::Connected,
+                    ..off
+                },
+                (33, 43),
+                THOUGHT_COLOR,
+                [(18, 17), (43, 12)],
+            ),
+        ] {
+            let icon = icon_rgba(state);
+            assert_eq!(pixel(&icon, active_point.0, active_point.1), color);
+            for (x, y) in inactive_points {
+                assert_eq!(pixel(&icon, x, y), INACTIVE_COLOR);
+            }
+        }
+        assert_eq!(
+            icon_rgba(VisualState {
+                heart: TrafficState::Connecting,
+                breath: TrafficState::Error,
+                thought: TrafficState::Off,
+            }),
+            gray
+        );
     }
 
     #[test]

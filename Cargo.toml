@@ -7,6 +7,7 @@ members = [
     "crates/kasina-devices",
     "crates/kasina-polar",
     "crates/kasina-godirect",
+    "crates/kasina-thoughtstream",
     "crates/kasina-service",
     "crates/kasina-render",
     "crates/kasina-audio",

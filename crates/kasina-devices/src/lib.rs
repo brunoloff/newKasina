@@ -19,6 +19,8 @@ pub enum DeviceKind {
     Polar,
     /// Vernier Go Direct device.
     GoDirect,
+    /// ThoughtStream USB skin-resistance sensor.
+    ThoughtStream,
     /// Deterministic development source.
     Simulated,
 }
@@ -179,7 +181,7 @@ pub trait SensorDriver: Send {
     ) -> Result<()>;
 }
 
-/// Deterministic dual-stream development source.
+/// Deterministic multi-sensor development source.
 #[derive(Debug, Clone)]
 pub struct SimulatedDriver {
     descriptor: DeviceDescriptor,
@@ -195,6 +197,10 @@ pub struct SimulatedValues {
     pub heart_rate_bpm: f64,
     /// RR interval in microseconds.
     pub rr_interval_us: f64,
+    /// Synthetic skin resistance in ohms.
+    pub skin_resistance_ohms: f64,
+    /// ADC count consistent with the synthetic resistance.
+    pub thoughtstream_adc: f64,
 }
 
 /// Generate regular, physiologically plausible test input without any sensor hardware.
@@ -207,7 +213,10 @@ pub fn simulated_values(seconds: f64) -> SimulatedValues {
     let respiration_force = 50.0 + breath_phase.sin() * 22.0 + (breath_phase * 3.0).sin() * 1.5;
     let heart_rate_bpm =
         66.0 + breath_phase.sin() * 5.5 + (seconds * std::f64::consts::TAU / 37.0).sin() * 0.8;
+    let thoughtstream_adc = (10_000.0 + (seconds / 25.0).sin() * 1_000.0).round();
     SimulatedValues {
+        skin_resistance_ohms: 7_700_010_000.0 / thoughtstream_adc - 470_000.0,
+        thoughtstream_adc,
         respiration_force,
         heart_rate_bpm,
         rr_interval_us: 60_000_000.0 / heart_rate_bpm,
@@ -219,7 +228,7 @@ impl Default for SimulatedDriver {
         Self {
             descriptor: DeviceDescriptor {
                 id: "simulated:biofeedback".to_owned(),
-                name: "Simulated Polar + respiration belt".to_owned(),
+                name: "Simulated Polar + respiration belt + ThoughtStream".to_owned(),
                 kind: DeviceKind::Simulated,
             },
             sample_period: Duration::from_millis(100),
@@ -289,6 +298,8 @@ impl SensorDriver for SimulatedDriver {
                         for (stream, value) in [
                             (StreamKind::HeartRate, values.heart_rate_bpm),
                             (StreamKind::RrInterval, values.rr_interval_us),
+                            (StreamKind::SkinResistance, values.skin_resistance_ohms),
+                            (StreamKind::ThoughtStreamAdc, values.thoughtstream_adc),
                         ] {
                             if !send_driver_event(&sender, &cancellation, DriverEvent::Measurement {
                                 stream,

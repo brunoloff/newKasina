@@ -1,28 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="newKasina sensor service">
-  <defs>
-    <linearGradient id="background" x1="18" y1="12" x2="108" y2="118" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#1d304d"/>
-      <stop offset="1" stop-color="#091321"/>
-    </linearGradient>
-    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
-      <feGaussianBlur stdDeviation="2.2" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-  </defs>
-  <rect x="4" y="4" width="120" height="120" rx="27" fill="url(#background)"/>
-  <rect x="12" y="12" width="104" height="104" rx="21" fill="none" stroke="#385273" stroke-width="2"/>
-  <path d="M43 27C37 19 23 22 23 34C23 45 43 57 43 57C43 57 63 45 63 34C63 22 49 19 43 27Z" fill="#f78b9e"/>
-  <g fill="none" stroke="#90d7f7" stroke-width="6" stroke-linecap="round">
-    <path d="M22 78C29 70 37 70 44 78C51 86 59 86 66 78"/>
-    <path d="M22 96C29 88 37 88 44 96C51 104 59 104 66 96"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="newKasina sensor service: heart, breath and thought bubble">
+  <rect x="2" y="2" width="60" height="60" rx="10" fill="#161616"/>
+  <path d="M18 10C13 3 6 7 8 15C10 20 18 26 18 26C18 26 26 20 28 15C30 7 23 3 18 10Z" fill="#ff4b73"/>
+  <g fill="none" stroke="#22d3ee" stroke-width="3" stroke-linecap="round">
+    <path d="M36 11C39 13.3 42 13.3 46 11C49 8.7 52 8.7 55 10.5"/>
+    <path d="M36 17C39 19.3 42 19.3 46 17C49 14.7 52 14.7 55 16.5"/>
+    <path d="M36 23C39 25.3 42 25.3 46 23C49 20.7 52 20.7 55 22.5"/>
   </g>
-  <g filter="url(#glow)">
-    <circle cx="91" cy="39" r="14" fill="#dce4ec"/>
-    <circle cx="91" cy="39" r="10" fill="#2dd76c"/>
-    <circle cx="87" cy="35" r="3" fill="#fff" opacity=".78"/>
-    <circle cx="91" cy="89" r="14" fill="#dce4ec"/>
-    <circle cx="91" cy="89" r="10" fill="#2dd76c"/>
-    <circle cx="87" cy="85" r="3" fill="#fff" opacity=".78"/>
+  <g fill="#b969ff">
+    <circle cx="26" cy="43" r="7"/><circle cx="33" cy="39" r="8"/>
+    <circle cx="41" cy="43" r="7"/><circle cx="39" cy="47" r="6"/>
+    <circle cx="29" cy="48" r="6"/>
+    <circle cx="17" cy="54" r="2.3"/><circle cx="12" cy="58" r="1.4"/>
   </g>
 </svg>
