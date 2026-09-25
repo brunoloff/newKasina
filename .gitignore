@@ -4,10 +4,20 @@
 /.git-local/
 /render-benchmark.json
 /render-benchmark-*.json
-/hardware-soak-*.jsonl
+/hardware-soak*.jsonl
 /sessions/
 *.log
 *.profraw
 *.sqlite-shm
 *.sqlite-wal
 .DS_Store
+
+# Local assistant metadata and credentials
+/.agents/
+/.codex/
+.env
+.env.*
+!.env.example
+/service-token
+/service-devices.json
+/app-settings.json
