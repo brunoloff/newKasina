@@ -9,10 +9,10 @@ that runs it. Linux still supports the separate persistent service and GUI.
 1. In **Apple menu → About This Mac**, check the chip: download **AppleSilicon**
    for an Apple M-series chip or **Intel** for an Intel processor. The builds
    target macOS 13 Ventura or newer and require a Metal-capable Mac.
-2. Download the corresponding macOS artifact from a successful [GitHub Actions
-   run](https://github.com/brunoloff/newKasina/actions). GitHub wraps the download
-   in a ZIP; open that ZIP to find the `.dmg` disk image. GitHub sign-in is required
-   to download Actions artifacts.
+2. Download the corresponding `.dmg` from [Releases](https://github.com/brunoloff/newKasina/releases).
+   These direct downloads do not require a GitHub account. Experimental builds
+   also appear in successful [GitHub Actions runs](https://github.com/brunoloff/newKasina/actions);
+   those artifacts require sign-in and wrap the `.dmg` in a ZIP.
 3. Double-click the `.dmg`, then drag **newKasina** to **Applications**.
 4. Open **Applications → newKasina**. If macOS blocks this development build,
    follow the first-open instructions below.
@@ -50,9 +50,16 @@ the public CI workflow does not contain or request them. See Apple's
   app currently using the sensor. If permission was previously denied, enable it
   there and reopen newKasina.
 - **ThoughtStream USB:** connect its cable and turn it on. Automatic port
-  detection runs in the app. If needed, choose its serial port in the Measurement
-  service panel. Some older USB-to-serial adapters need a compatible driver from
-  their manufacturer; the app does not silently install system drivers.
+  detection runs in the app; you can also choose a port under **Measurement
+  service → ThoughtStream connection**. If the device is missing after refreshing
+  the list, our tested unit uses a Silicon Labs CP2102 USB adapter. Install the
+  current macOS CP210x VCP driver from [Silicon Labs](https://www.silabs.com/software-and-tools/usb-to-uart-bridge-vcp-drivers):
+  open the downloaded ZIP, open `SiLabsUSBDriverDisk.dmg`, and run its installer.
+  Follow the prompts to approve the Silicon Labs driver extension; depending on
+  macOS version, this can appear under Privacy & Security or **General → Login
+  Items & Extensions → Drivers** ([Apple's settings guide](https://support.apple.com/guide/mac-help/change-login-items-extensions-settings-mtusr003/mac)).
+  Reconnect the USB cable and refresh the list in newKasina. Driver installation
+  is separate from the app; actual sensor operation on a Mac still needs testing.
 - **Without hardware:** use simulated signals in Settings to explore the displays.
 
 The app bundle includes `NSBluetoothAlwaysUsageDescription`, which CoreBluetooth

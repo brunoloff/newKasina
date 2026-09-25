@@ -47,6 +47,8 @@ for protocol details and Linux serial permissions.
 
 ## Build and open the desktop apps
 
+Download ready-to-open packages from [Releases](https://github.com/brunoloff/newKasina/releases).
+
 **Mac users:** download the Apple Silicon or Intel disk image, drag newKasina to
 Applications, and open it. Read the [Mac installation guide](docs/macos.md) for the
 first-open permission and Bluetooth setup. No developer tools are needed.
@@ -56,9 +58,11 @@ It starts measurements inside the app. Development builds are not code-signed.
 
 The following instructions are for building from source.
 
-You need Rust **1.96 or newer** and a working Vulkan or OpenGL driver. On Linux,
+You need Rust **1.96 or newer** and working graphics drivers (Metal on macOS,
+Direct3D 12 on Windows, or Vulkan/OpenGL on Linux). On Linux,
 install development dependencies for ALSA, D-Bus/BlueZ, udev, Wayland/X11, GTK 3,
-and AppIndicator. Windows builds need the MSVC toolchain and Windows SDK; macOS
+and AppIndicator. X11 also needs the `libxkbcommon-x11` runtime library (on Ubuntu,
+`libxkbcommon-x11-0`). Windows builds need the MSVC toolchain and Windows SDK; macOS
 builds need the Xcode command-line tools.
 
 Build both programs:
