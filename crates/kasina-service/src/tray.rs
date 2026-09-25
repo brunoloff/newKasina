@@ -275,6 +275,8 @@ impl Drop for ServiceRunner {
 enum UserEvent {
     Menu(MenuEvent),
     SerialPorts(std::result::Result<Vec<SerialPortChoice>, String>),
+    #[cfg(target_os = "linux")]
+    StartService,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,6 +567,17 @@ impl TrayUi {
 /// Run the default desktop tray host. This function owns the native event loop.
 pub(crate) fn run(args: Args) -> Result<()> {
     let defaults = ServicePaths::for_user()?;
+    #[cfg(target_os = "linux")]
+    let mut tray_host = {
+        let lock = args.lock_path.as_deref().unwrap_or(&defaults.lock);
+        match super::tray_control::TrayHost::acquire_or_start(lock)? {
+            Some(host) => Some(host),
+            None => {
+                info!("asked existing measurement tray to start the service");
+                return Ok(());
+            }
+        }
+    };
     let fallback_recordings = args.recordings_dir.clone().unwrap_or(defaults.recordings);
     let selection = args
         .thoughtstream_selection
@@ -573,16 +586,26 @@ pub(crate) fn run(args: Args) -> Result<()> {
     let settings_path = port_settings::settings_path()?;
     let bridge = ServiceBridge::default();
     let mut runner = ServiceRunner::new(args, bridge.clone());
-    runner.start();
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    #[cfg(target_os = "linux")]
+    {
+        let start_proxy = proxy.clone();
+        tray_host
+            .as_mut()
+            .expect("new tray host owns its singleton")
+            .listen(move || start_proxy.send_event(UserEvent::StartService).is_ok())?;
+    }
+    runner.start();
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event| {
         let _ignored = menu_proxy.send_event(UserEvent::Menu(event));
     }));
     let mut ui: Option<TrayUi> = None;
     let mut quit_when_stopped = false;
+    #[cfg(target_os = "linux")]
+    let mut restart_when_stopped = false;
     let mut scanning_ports = false;
     let mut last_port_scan = Instant::now() - Duration::from_secs(5);
 
@@ -663,8 +686,29 @@ pub(crate) fn run(args: Args) -> Result<()> {
                     }
                 }
             }
+            #[cfg(target_os = "linux")]
+            Event::UserEvent(UserEvent::StartService) => {
+                if !quit_when_stopped {
+                    match runner.lifecycle() {
+                        ServiceLifecycle::Stopped | ServiceLifecycle::Error => runner.start(),
+                        ServiceLifecycle::Stopping => restart_when_stopped = true,
+                        ServiceLifecycle::Starting | ServiceLifecycle::Running => {}
+                    }
+                }
+            }
             Event::MainEventsCleared => {
                 runner.poll();
+                #[cfg(target_os = "linux")]
+                if restart_when_stopped
+                    && !quit_when_stopped
+                    && matches!(
+                        runner.lifecycle(),
+                        ServiceLifecycle::Stopped | ServiceLifecycle::Error
+                    )
+                {
+                    restart_when_stopped = false;
+                    runner.start();
+                }
                 if !scanning_ports && last_port_scan.elapsed() >= Duration::from_secs(3) {
                     match scan_ports(proxy.clone()) {
                         Ok(()) => scanning_ports = true,
@@ -694,7 +738,11 @@ pub(crate) fn run(args: Args) -> Result<()> {
                     *control_flow = ControlFlow::Exit;
                 }
             }
-            Event::LoopDestroyed => runner.stop(),
+            Event::LoopDestroyed => {
+                runner.stop();
+                #[cfg(target_os = "linux")]
+                drop(tray_host.take());
+            }
             _ => {}
         }
     })
@@ -716,14 +764,28 @@ fn apply_port_choice(
     port: Option<String>,
     bridge: &ServiceBridge,
 ) {
+    if let Some(control) = bridge.control() {
+        let bridge = bridge.clone();
+        control.runtime.spawn(async move {
+            match control.state.set_thoughtstream_port(port).await {
+                Ok(()) => bridge
+                    .set_notice("ThoughtStream port selection saved; reconnecting ThoughtStream"),
+                Err(error) => bridge.set_notice(format!(
+                    "Could not change ThoughtStream port: {}",
+                    error.message()
+                )),
+            }
+        });
+        return;
+    }
     let saved = port_settings::save(settings_path, port.clone());
-    selection.select(port);
     match saved {
         Ok(()) => {
+            selection.select(port);
             bridge.set_notice("ThoughtStream port selection saved; reconnecting ThoughtStream")
         }
         Err(error) => bridge.set_notice(format!(
-            "Port changed for this run, but could not save the choice: {error:#}"
+            "Could not save ThoughtStream port choice: {error:#}"
         )),
     }
 }
@@ -1097,6 +1159,7 @@ mod tests {
                 detail: "streaming".to_owned(),
                 reconnect_attempts: 0,
                 last_sample_age_millis: 42,
+                ..DeviceStatus::default()
             }],
             recording: Some(RecordingStatus {
                 state: RecordingState::Recording as i32,

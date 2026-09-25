@@ -1,6 +1,10 @@
 //! Persistent acquisition state and authenticated streaming RPC implementation.
 
+pub mod port_settings;
 mod recording;
+mod runtime;
+
+pub use runtime::{PreparedService, ServiceOptions, ServiceSource};
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -25,13 +29,14 @@ use kasina_protocol::v1::{
     ClientHello, ConnectionState, DeviceCommand, DeviceInfo, DeviceList, DeviceStatus,
     PreferredDeviceCommand, RecordingList, RecordingState, RecordingStatus, SampleBatch,
     SamplesSinceRequest, ServiceInfo, StartRecordingRequest, StatusSnapshot, StopRecordingRequest,
-    StreamDiagnostics, StreamGap, SubscribeRequest,
+    StreamDiagnostics, StreamGap, SubscribeRequest, ThoughtStreamPort, ThoughtStreamPortCommand,
+    ThoughtStreamPorts,
 };
 use kasina_protocol::{AUTH_HEADER, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -212,6 +217,20 @@ struct DeviceRuntime {
     state: DriverConnectionState,
     detail: String,
     reconnect_attempts: u64,
+    connection_enabled: bool,
+}
+
+#[derive(Debug)]
+struct DeviceControl {
+    enabled: bool,
+    response: oneshot::Sender<Result<(), String>>,
+}
+
+#[derive(Debug, Clone)]
+struct PortControl {
+    selection: kasina_thoughtstream::ThoughtStreamPortSelection,
+    settings_path: PathBuf,
+    update: Arc<Mutex<()>>,
 }
 
 /// Shared acquisition state, independent of transport connections.
@@ -227,6 +246,8 @@ pub struct ServiceState {
     transport_lagged_samples: AtomicU64,
     service_batch_sequence: AtomicU64,
     recording: RecordingManager,
+    controls: RwLock<std::collections::BTreeMap<String, mpsc::Sender<DeviceControl>>>,
+    port_control: RwLock<Option<PortControl>>,
 }
 
 impl ServiceState {
@@ -276,6 +297,7 @@ impl ServiceState {
                         state: DriverConnectionState::Connecting,
                         detail: "starting".to_owned(),
                         reconnect_attempts: 0,
+                        connection_enabled: true,
                     },
                 )
             })
@@ -291,7 +313,91 @@ impl ServiceState {
             transport_lagged_samples: AtomicU64::new(0),
             service_batch_sequence: AtomicU64::new(0),
             recording,
+            controls: RwLock::new(std::collections::BTreeMap::new()),
+            port_control: RwLock::new(None),
         })
+    }
+
+    /// Identity of this acquisition lifetime, also returned by `GetServiceInfo`.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Connect or pause one supervised source without affecting other devices.
+    pub async fn set_device_connection(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<DeviceStatus, Status> {
+        if !self.devices.read().contains_key(id) {
+            return Err(Status::not_found("unknown device"));
+        }
+        let control =
+            self.controls.read().get(id).cloned().ok_or_else(|| {
+                Status::failed_precondition("device has no connection supervisor")
+            })?;
+        let (response, received) = oneshot::channel();
+        control
+            .send(DeviceControl { enabled, response })
+            .await
+            .map_err(|_| Status::unavailable("device supervisor has stopped"))?;
+        received
+            .await
+            .map_err(|_| Status::unavailable("device supervisor has stopped"))?
+            .map_err(Status::internal)?;
+        let now_ns = self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let devices = self.devices.read();
+        let device = devices
+            .get(id)
+            .ok_or_else(|| Status::not_found("unknown device"))?;
+        Ok(self.proto_device_status(device, now_ns))
+    }
+
+    /// Enumerate serial choices and return the currently selected service preference.
+    pub async fn thoughtstream_ports(&self) -> Result<ThoughtStreamPorts, Status> {
+        let control = self.port_control.read().clone().ok_or_else(|| {
+            Status::failed_precondition("ThoughtStream is not enabled in this service")
+        })?;
+        let ports = tokio::task::spawn_blocking(kasina_thoughtstream::available_serial_ports)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map_err(|error| Status::internal(format!("could not list serial ports: {error:#}")))?
+            .into_iter()
+            .map(|port| ThoughtStreamPort {
+                name: port.path,
+                label: port.label,
+                likely_thoughtstream: port.automatic_candidate,
+            })
+            .collect();
+        Ok(ThoughtStreamPorts {
+            ports,
+            selected_port: control.selection.selected_port().unwrap_or_default(),
+        })
+    }
+
+    /// Save the port before reconnecting ThoughtStream. Other sensors keep their sessions.
+    pub async fn set_thoughtstream_port(&self, port: Option<String>) -> Result<(), Status> {
+        if port
+            .as_ref()
+            .is_some_and(|port| port.is_empty() || port.len() > 1024 || port.contains('\0'))
+        {
+            return Err(Status::invalid_argument("invalid serial port name"));
+        }
+        let control = self.port_control.read().clone().ok_or_else(|| {
+            Status::failed_precondition("ThoughtStream is not enabled in this service")
+        })?;
+        let saved_port = port.clone();
+        tokio::task::spawn_blocking(move || {
+            let _update = control.update.lock();
+            port_settings::save(&control.settings_path, saved_port.clone()).map_err(|error| {
+                Status::internal(format!("could not save serial port: {error:#}"))
+            })?;
+            control.selection.select(saved_port);
+            Ok(())
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
     }
 
     /// Consume events from one driver until it ends or is cancelled.
@@ -304,6 +410,7 @@ impl ServiceState {
         let (sender, mut receiver) = mpsc::channel(1_024);
         let driver_cancel = cancellation.child_token();
         let driver_task = tokio::spawn(driver.run(sender, driver_cancel.clone()));
+        let mut ingest_error = None;
 
         while let Some(event) = receiver.recv().await {
             match event {
@@ -333,10 +440,15 @@ impl ServiceState {
                     );
                     sample.device_time_ns = device_time_ns;
                     sample.quality_flags = quality_flags;
-                    self.buffers
+                    let accepted = self
+                        .buffers
                         .write()
                         .push(sample.clone())
-                        .context("service buffer rejected driver sample")?;
+                        .context("service buffer rejected driver sample");
+                    if let Err(error) = accepted {
+                        ingest_error = Some(error);
+                        break;
+                    }
                     self.recording.record(sample.clone());
                     let _ = self.sample_sender.send(sample);
                 }
@@ -358,7 +470,11 @@ impl ServiceState {
         }
 
         driver_cancel.cancel();
-        let driver_result = driver_task.await.context("driver task panicked")?;
+        let driver_result = driver_task
+            .await
+            .context("driver task panicked")
+            .and_then(|result| result);
+        let driver_result = ingest_error.map_or(driver_result, Err);
         if let Some(device) = self.devices.write().get_mut(&runtime_id) {
             device.state = DriverConnectionState::Disconnected;
             device.detail = match (&driver_result, cancellation.is_cancelled()) {
@@ -512,6 +628,8 @@ impl ServiceState {
             reconnect_attempts: runtime.reconnect_attempts,
             last_sample_age_millis: last_sample_time
                 .map_or(0, |time| now_ns.saturating_sub(time) / 1_000_000),
+            connection_enabled: runtime.connection_enabled,
+            connection_control_available: self.controls.read().contains_key(&runtime.descriptor.id),
         }
     }
 }
@@ -656,6 +774,7 @@ fn proto_recording(snapshot: RecordingSnapshot) -> RecordingStatus {
 pub struct KasinaRpc {
     state: Arc<ServiceState>,
     token: Arc<str>,
+    cancellation: CancellationToken,
 }
 
 impl KasinaRpc {
@@ -665,6 +784,7 @@ impl KasinaRpc {
         Self {
             state,
             token: token.into(),
+            cancellation: CancellationToken::new(),
         }
     }
 
@@ -689,14 +809,6 @@ impl KasinaRpc {
             )));
         }
         Ok(())
-    }
-
-    fn now_ns(&self) -> u64 {
-        self.state
-            .started
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64
     }
 }
 
@@ -766,18 +878,10 @@ impl Kasina for KasinaRpc {
         self.authorize(&request)?;
         Self::check_hello(request.get_ref().client.as_ref())?;
         let command = request.into_inner();
-        let mut devices = self.state.devices.write();
-        let runtime = devices
-            .get_mut(&command.device_id)
-            .ok_or_else(|| Status::not_found("unknown device"))?;
-        runtime.detail = if command.connect {
-            "connection requested; driver supervisor owns lifecycle".to_owned()
-        } else {
-            "disconnect requested; driver supervisor owns lifecycle".to_owned()
-        };
-        let status = self.state.proto_device_status(runtime, self.now_ns());
-        drop(devices);
-        Ok(Response::new(status))
+        self.state
+            .set_device_connection(&command.device_id, command.connect)
+            .await
+            .map(Response::new)
     }
 
     async fn set_preferred_device(
@@ -786,14 +890,31 @@ impl Kasina for KasinaRpc {
     ) -> Result<Response<DeviceStatus>, Status> {
         self.authorize(&request)?;
         Self::check_hello(request.get_ref().client.as_ref())?;
-        let command = request.into_inner();
-        let devices = self.state.devices.read();
-        let runtime = devices
-            .get(&command.device_id)
-            .ok_or_else(|| Status::not_found("unknown device"))?;
-        Ok(Response::new(
-            self.state.proto_device_status(runtime, self.now_ns()),
+        Err(Status::unimplemented(
+            "choosing a preferred Bluetooth device is not supported yet",
         ))
+    }
+
+    async fn list_thought_stream_ports(
+        &self,
+        request: Request<ClientHello>,
+    ) -> Result<Response<ThoughtStreamPorts>, Status> {
+        self.authorize(&request)?;
+        Self::check_hello(Some(request.get_ref()))?;
+        self.state.thoughtstream_ports().await.map(Response::new)
+    }
+
+    async fn set_thought_stream_port(
+        &self,
+        request: Request<ThoughtStreamPortCommand>,
+    ) -> Result<Response<ThoughtStreamPorts>, Status> {
+        self.authorize(&request)?;
+        Self::check_hello(request.get_ref().client.as_ref())?;
+        let port = request.into_inner().port;
+        self.state
+            .set_thoughtstream_port((!port.is_empty()).then_some(port))
+            .await?;
+        self.state.thoughtstream_ports().await.map(Response::new)
     }
 
     async fn get_status(
@@ -812,12 +933,16 @@ impl Kasina for KasinaRpc {
         self.authorize(&request)?;
         Self::check_hello(Some(request.get_ref()))?;
         let state = Arc::clone(&self.state);
+        let cancellation = self.cancellation.clone();
         let output = try_stream! {
             let _guard = ClientGuard::new(Arc::clone(&state));
             let mut ticker = tokio::time::interval(Duration::from_millis(500));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
                 yield state.status_snapshot();
             }
         };
@@ -879,6 +1004,7 @@ impl Kasina for KasinaRpc {
             .collect::<Result<_, _>>()?;
         let state = Arc::clone(&self.state);
         let mut receiver = state.sample_sender.subscribe();
+        let cancellation = self.cancellation.clone();
         let output = try_stream! {
             let _guard = ClientGuard::new(Arc::clone(&state));
             let mut pending = Vec::with_capacity(64);
@@ -888,6 +1014,7 @@ impl Kasina for KasinaRpc {
             ticker.tick().await;
             loop {
                 tokio::select! {
+                    () = cancellation.cancelled() => break,
                     received = receiver.recv() => match received {
                         Ok(sample) => {
                             if requested.is_empty() || requested.contains(&sample.stream) {
@@ -998,9 +1125,10 @@ impl Kasina for KasinaRpc {
 /// Serve RPC until `cancellation` fires. The listener may use an ephemeral test port.
 pub async fn serve(
     listener: TcpListener,
-    rpc: KasinaRpc,
+    mut rpc: KasinaRpc,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    rpc.cancellation = cancellation.clone();
     Server::builder()
         .add_service(KasinaServer::new(rpc))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), cancellation.cancelled())

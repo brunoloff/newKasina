@@ -1,4 +1,4 @@
-//! Persist the tray's ThoughtStream selection independently of acquisition and recordings.
+//! Shared persistent ThoughtStream selection used by the service, app, and tray.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -12,13 +12,15 @@ struct PortSettings {
     thoughtstream_port: Option<String>,
 }
 
-pub(crate) fn settings_path() -> Result<PathBuf> {
+/// Standard per-user device preference file.
+pub fn settings_path() -> Result<PathBuf> {
     let project = directories::ProjectDirs::from("org", "newkasina", "newKasina")
         .context("no user configuration directory")?;
     Ok(project.config_dir().join("service-devices.json"))
 }
 
-pub(crate) fn load(path: &Path) -> Result<Option<String>> {
+/// Load an explicit port; a missing file or `None` selects automatic discovery.
+pub fn load(path: &Path) -> Result<Option<String>> {
     match fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice::<PortSettings>(&bytes)
             .with_context(|| format!("read {}", path.display()))?
@@ -28,7 +30,8 @@ pub(crate) fn load(path: &Path) -> Result<Option<String>> {
     }
 }
 
-pub(crate) fn save(path: &Path, port: Option<String>) -> Result<()> {
+/// Atomically persist the chosen port.
+pub fn save(path: &Path, port: Option<String>) -> Result<()> {
     let parent = path.parent().context("settings path has no parent")?;
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(".service-devices-{}.tmp", uuid::Uuid::new_v4()));
@@ -47,7 +50,7 @@ pub(crate) fn save(path: &Path, port: Option<String>) -> Result<()> {
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, path)?;
+        crate::recording::replace_file(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {

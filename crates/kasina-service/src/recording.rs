@@ -357,6 +357,30 @@ impl RecordingManager {
             .await
             .map_err(|_| "recording writer discarded list response".to_owned())?
     }
+
+    /// Drain every accepted sample and finalize before the service releases its lock.
+    pub async fn shutdown(&self) -> std::result::Result<(), String> {
+        let Some(thread) = self.thread.lock().take() else {
+            return Ok(());
+        };
+        let sender = self.sender.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(sender) = sender {
+                let _ = sender.send(RecorderCommand::Shutdown);
+            }
+            thread
+                .join()
+                .map_err(|_| "session recorder thread panicked".to_owned())
+        })
+        .await
+        .map_err(|error| format!("recorder shutdown task failed: {error}"))??;
+        let snapshot = self.snapshot();
+        if snapshot.state == SessionState::Error {
+            Err(snapshot.detail)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for RecordingManager {
@@ -461,13 +485,19 @@ fn recorder_loop(
                 let _ignored = response.send(result);
             }
             RecorderCommand::Shutdown => {
-                if let Some(mut session) = active.take() {
-                    let _ignored = finish_session(
+                if let Some(mut session) = active.take()
+                    && let Err(error) = finish_session(
                         &mut session,
                         SessionState::Completed,
                         "recording stopped during clean service shutdown",
                         status,
-                    );
+                    )
+                {
+                    let mut snapshot = status.write();
+                    snapshot.state = SessionState::Error;
+                    snapshot.detail =
+                        format!("could not finalize recording during shutdown: {error:#}");
+                    tracing::error!(detail = %snapshot.detail, "recording shutdown failed");
                 }
                 break;
             }
@@ -675,7 +705,7 @@ fn write_metadata(directory: &Path, metadata: &SessionMetadata) -> Result<()> {
     // Windows ReplaceFileW needs to open the replacement file without our
     // write handle still holding it. The contents are durable before closing.
     drop(file);
-    replace_metadata_file(&temporary, &path)?;
+    replace_file(&temporary, &path)?;
     #[cfg(unix)]
     if let Err(error) = File::open(directory).and_then(|directory| directory.sync_all()) {
         tracing::warn!(%error, path = %directory.display(), "could not sync recording directory entry");
@@ -684,12 +714,12 @@ fn write_metadata(directory: &Path, metadata: &SessionMetadata) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn replace_metadata_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(temporary, destination)
 }
 
 #[cfg(windows)]
-fn replace_metadata_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 

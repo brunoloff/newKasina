@@ -7,6 +7,8 @@ service Kasina {
   rpc ListDevices(ClientHello) returns (DeviceList);
   rpc SetDeviceConnection(DeviceCommand) returns (DeviceStatus);
   rpc SetPreferredDevice(PreferredDeviceCommand) returns (DeviceStatus);
+  rpc ListThoughtStreamPorts(ClientHello) returns (ThoughtStreamPorts);
+  rpc SetThoughtStreamPort(ThoughtStreamPortCommand) returns (ThoughtStreamPorts);
   rpc GetStatus(ClientHello) returns (StatusSnapshot);
   rpc SubscribeStatus(ClientHello) returns (stream StatusSnapshot);
   rpc GetSamplesSince(SamplesSinceRequest) returns (SampleBatch);
@@ -115,6 +117,26 @@ message DeviceStatus {
   string detail = 3;
   uint64 reconnect_attempts = 4;
   uint64 last_sample_age_millis = 5;
+  bool connection_enabled = 6;
+  bool connection_control_available = 7;
+}
+
+message ThoughtStreamPort {
+  string name = 1;
+  string label = 2;
+  bool likely_thoughtstream = 3;
+}
+
+message ThoughtStreamPorts {
+  repeated ThoughtStreamPort ports = 1;
+  // Empty means automatic discovery. This reports the saved preference, not the active port.
+  string selected_port = 2;
+}
+
+message ThoughtStreamPortCommand {
+  ClientHello client = 1;
+  // Empty restores automatic discovery.
+  string port = 2;
 }
 
 message DeviceList {

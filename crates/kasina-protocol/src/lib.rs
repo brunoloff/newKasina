@@ -3,7 +3,7 @@
 /// Protocol major version. A mismatch is incompatible.
 pub const PROTOCOL_MAJOR: u32 = 1;
 /// Protocol minor version. New optional fields and methods increment this value.
-pub const PROTOCOL_MINOR: u32 = 2;
+pub const PROTOCOL_MINOR: u32 = 3;
 /// Metadata header used for local authentication.
 pub const AUTH_HEADER: &str = "x-kasina-token";
 
