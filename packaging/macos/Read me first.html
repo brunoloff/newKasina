@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome to newKasina</title>
+<style>
+  :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+  body { max-width: 640px; margin: 64px auto; padding: 0 28px 40px; line-height: 1.6; }
+  h1 { font-size: 38px; letter-spacing: -1px; margin-bottom: 0; }
+  h2 { margin-top: 32px; font-size: 21px; }
+  .intro { font-size: 20px; opacity: .7; }
+  li { padding: 5px 0; }
+  a { color: #9361d6; }
+  .note { padding: 16px 22px; border: 1px solid #9472aa66; border-radius: 16px; }
+</style>
+<h1>Welcome to newKasina</h1>
+<p class="intro">A quiet space for live biofeedback.</p>
+<h2>Make yourself at home</h2>
+<ol>
+  <li>Drag <strong>newKasina</strong> to the <strong>Applications</strong> folder in this disk image.</li>
+  <li>Open your Applications folder and double-click <strong>newKasina</strong>.</li>
+  <li>Allow Bluetooth access when macOS asks. Turn on your sensors; the <strong>Measurement service</strong> panel shows their connection status.</li>
+</ol>
+<p>Everything runs inside the app. You do not need Terminal, Python, a separate service, or an account. Close the app to stop its measurement service.</p>
+<div class="note">
+  <strong>A note about this preview</strong>
+  <p>This is a development build. It has not been signed with an Apple Developer ID or notarized by Apple, so your Mac may block the first launch.</p>
+  <p>If you trust this copy from Bruno, first try opening it, then go to <strong>System Settings → Privacy &amp; Security</strong>, scroll to the message about newKasina, choose <strong>Open Anyway</strong>, and confirm. You normally only need to do this once for this copy.</p>
+  <p><a href="https://support.apple.com/102445">Apple's explanation of the first-open check</a></p>
+</div>
+<h2>No sensor? You can still explore.</h2>
+<p>Open <strong>Settings</strong> and turn on simulated signals to try the displays. Simulation is labeled in the app so you can distinguish it from real measurements.</p>
+<h2>If a sensor does not appear</h2>
+<ul>
+  <li>For Bluetooth sensors, check <strong>System Settings → Privacy &amp; Security → Bluetooth → newKasina</strong>, then reopen the app. Close other apps using the sensor.</li>
+  <li>For ThoughtStream, plug in its USB cable and turn the unit on. The <strong>Measurement service</strong> panel lets you choose another serial port if automatic detection does not find it.</li>
+</ul>
+<p>Requires macOS 13 Ventura or newer and a Metal-capable Mac. Download <strong>Apple Silicon</strong> for an M-series Mac or <strong>Intel</strong> for an Intel Mac; <strong>Apple menu → About This Mac</strong> shows which you have.</p>
+<p><a href="https://github.com/brunoloff/newKasina/issues">Report a problem</a> · <a href="https://github.com/brunoloff/newKasina">Project and documentation</a></p>
+</html>

@@ -1,0 +1,9 @@
+{
+  "detail": "The UI received live samples from its isolated embedded service",
+  "embedded_instance": "e0bae3c7-f040-4543-bf9d-f0bba707e12a",
+  "platform": "linux",
+  "samples_received": 47,
+  "service_instance": "e0bae3c7-f040-4543-bf9d-f0bba707e12a",
+  "success": true,
+  "ui_frames": 203
+}

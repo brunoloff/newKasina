@@ -2,10 +2,10 @@
 
 **Live biofeedback, breathing visuals, and a calmer place to watch your signals.**
 
-newKasina is a Rust rewrite of pyKasina, built around a persistent
-measurement service and an independently restartable, GPU-accelerated desktop app.
-Close the interface, change a visual, or reopen a panel: the service keeps acquiring
-and recording your sensor data.
+newKasina is a Rust rewrite of pyKasina with a GPU-accelerated desktop interface.
+On Windows and macOS, one application runs both the interface and measurement
+service. Linux retains an independent tray service, so you can rebuild or close
+the interface while acquisition and recording continue.
 
 ![ThoughtStream feedback panel with delta and resistance graphs](docs/validation/thoughtstream-shading-2026-09-16.png)
 
@@ -22,6 +22,9 @@ and recording your sensor data.
   identifiers, units, and quality flags for later analysis.
 - **A desktop sensor service:** automatic discovery, reconnection, a graphical
   ThoughtStream port chooser, and a tray icon with heart, breath, and thought symbols.
+- **Measurement service panel:** live sensor cards, enable/reconnect controls,
+  serial-port selection, and recording controls, using the same service whether
+  it runs inside the app or separately.
 - **Simulation:** explore the interface without connecting any sensors.
 
 The project is under active development. Linux/KDE is the primary validated desktop
@@ -43,6 +46,15 @@ manual selection. See the [ThoughtStream setup guide](docs/hardware/thoughtstrea
 for protocol details and Linux serial permissions.
 
 ## Build and open the desktop apps
+
+**Mac users:** download the Apple Silicon or Intel disk image, drag newKasina to
+Applications, and open it. Read the [Mac installation guide](docs/macos.md) for the
+first-open permission and Bluetooth setup. No developer tools are needed.
+
+**Windows users:** extract the Windows download and double-click `newKasina.exe`.
+It starts measurements inside the app. Development builds are not code-signed.
+
+The following instructions are for building from source.
 
 You need Rust **1.96 or newer** and a working Vulkan or OpenGL driver. On Linux,
 install development dependencies for ALSA, D-Bus/BlueZ, udev, Wayland/X11, GTK 3,
@@ -70,6 +82,10 @@ your user application directory, and does not require `sudo`. Then open:
 1. **newKasina Sensor Service** to start acquiring from physical devices.
 2. **newKasina** to open the interface.
 
+You can also open newKasina first and use **Measurement service → Start measurement service**
+to launch the Linux tray service. An existing server is reused. The panel shows
+its actual state and sends controls to it; closing the client leaves it running.
+
 The launchers use this checkout's release binaries. Rebuild after changing the code,
 then reopen the relevant program. Rerun the installer if you move the checkout.
 
@@ -91,8 +107,10 @@ port arguments in the normal desktop workflow.
 
 ### Recording
 
-Use **Settings → Session recording** or the service's tray menu to start and stop a
-session. Closing the app does not stop an active recording. On Linux, sessions live
+Use **Measurement service**, **Settings → Session recording**, or the service's
+tray menu to start and stop a session. Closing the app finalizes recording when
+it owns the built-in service. An independent tray service continues recording.
+On Linux, sessions live
 under `~/.local/share/newkasina/sessions`, with `metadata.json` and append-only
 `samples.jsonl` files. Interrupted recordings are recovered on service startup.
 
@@ -122,6 +140,12 @@ Focused acquisition modes are `polar`, `go-direct`, and `thoughtstream`.
 selects a recording directory. See each program's `--help` for the full options.
 The service listens on `127.0.0.1:18861` and uses a per-user authentication token.
 
+The client accepts `--service-mode embedded` to use the integrated workflow on
+Linux, or `--service-mode external` to connect without starting a service. The
+default `auto` mode starts inside the app on Windows/macOS and offers the tray
+launcher on Linux. Custom endpoints/token paths are connect-only. Every mode
+reuses an existing authenticated service and preserves its ownership.
+
 ## How the project fits together
 
 ```text
@@ -150,15 +174,16 @@ Polar H10 · Go Direct · ThoughtStream · Simulator
 
 ## Development checks
 
-GitHub Actions builds and tests Linux, Windows, and macOS on every push and pull
+GitHub Actions builds and tests Linux, Windows, and both Mac architectures on every push and pull
 request. Open a successful run in [Actions](https://github.com/brunoloff/newKasina/actions)
 and download the matching `newKasina` artifact at the bottom of its page (sign in
-to GitHub to download). Each archive contains the interface and sensor service,
-documentation, and the source revision. Artifacts are retained for 14 days.
+to GitHub to download). Mac artifacts contain a disk image with a self-contained
+app; Windows contains one executable; Linux retains the interface and tray service.
+Artifacts are retained for 14 days.
 
-These are development binaries, not signed installers. The Mac build's architecture
-appears in its artifact name; it does not automatically include both Intel and Apple
-Silicon. Building successfully does not establish physical sensor compatibility.
+These are development builds, without a trusted publisher signature. The Mac
+architecture appears in the artifact name: choose ARM64 for Apple Silicon or X64
+for Intel. Building successfully does not establish physical sensor compatibility.
 
 ```sh
 scripts/cargo-local fmt --all --check
@@ -178,6 +203,8 @@ For long device tests and repeatable rendering measurements, see the
 ## Further reading
 
 - [ThoughtStream panel and sound controls](docs/thoughtstream-panel.md)
+- [Mac installation and first-open guide](docs/macos.md)
+- [Measurement service and launch modes](docs/measurement-service.md)
 - [System tray and desktop service](docs/system-tray.md)
 - [Recording schema and recovery](docs/recordings.md)
 - [Process and IPC architecture](docs/adr/0001-process-and-ipc.md)
