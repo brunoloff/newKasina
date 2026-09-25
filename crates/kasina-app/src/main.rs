@@ -1,3 +1,7 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+mod service_host;
+mod service_panel;
 mod settings;
 mod thoughtstream;
 
@@ -11,14 +15,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use kasina_devices::simulated_values;
 use kasina_domain::quality;
 use kasina_protocol::v1::kasina_client::KasinaClient;
 use kasina_protocol::v1::{
-    RecordingState, RecordingStatus, Sample, SampleBatch, SamplesSinceRequest, ServiceInfo,
-    StartRecordingRequest, StatusSnapshot, StopRecordingRequest, StreamCursor, StreamKind,
-    SubscribeRequest,
+    DeviceCommand, RecordingState, RecordingStatus, Sample, SampleBatch, SamplesSinceRequest,
+    ServiceInfo, StartRecordingRequest, StatusSnapshot, StopRecordingRequest, StreamCursor,
+    StreamKind, SubscribeRequest, ThoughtStreamPortCommand, ThoughtStreamPorts,
 };
 use kasina_protocol::{AUTH_HEADER, client_hello};
 use kasina_render::{
@@ -50,6 +54,15 @@ struct Args {
     /// Override the standard service authentication-token path.
     #[arg(long)]
     token_path: Option<PathBuf>,
+    /// Service launch policy. Auto keeps Linux's separate tray workflow.
+    #[arg(long, value_enum, default_value_t = ServiceMode::Auto)]
+    service_mode: ServiceMode,
+    /// Run an isolated simulated GUI/service check, then exit. Never opens hardware.
+    #[arg(long, value_parser = benchmark_duration_seconds, requires = "smoke_test_output")]
+    smoke_test_seconds: Option<f64>,
+    /// JSON result of an isolated GUI/service check.
+    #[arg(long, requires = "smoke_test_seconds")]
+    smoke_test_output: Option<PathBuf>,
     /// Run the visualizer for this many measured seconds, write JSON, and exit.
     #[arg(long, value_parser = benchmark_duration_seconds)]
     render_benchmark_seconds: Option<f64>,
@@ -68,6 +81,13 @@ struct Args {
     /// Required application update rate; defaults to the declared display refresh rate.
     #[arg(long, value_parser = refresh_rate_hz)]
     performance_target_hz: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ServiceMode {
+    Auto,
+    External,
+    Embedded,
 }
 
 fn finite_number(value: &str) -> std::result::Result<f64, String> {
@@ -115,6 +135,11 @@ fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    let smoke_output = args.smoke_test_output.clone();
+    let smoke_persistence = args
+        .smoke_test_seconds
+        .map(|_| tempfile::tempdir())
+        .transpose()?;
     let surface_health = Arc::new(SurfaceHealth::default());
     let wgpu_options = eframe::WgpuConfiguration {
         on_surface_status: surface_status_handler(Arc::clone(&surface_health)),
@@ -127,6 +152,10 @@ fn main() -> Result<()> {
                 .with_inner_size([1_180.0, 780.0])
                 .with_min_inner_size([760.0, 500.0]),
             wgpu_options,
+            persist_window: smoke_persistence.is_none(),
+            persistence_path: smoke_persistence
+                .as_ref()
+                .map(|directory| directory.path().join("window.ron")),
             ..Default::default()
         },
         Box::new(move |creation_context| {
@@ -137,7 +166,14 @@ fn main() -> Result<()> {
             )?))
         }),
     )
-    .map_err(|error| anyhow!(error.to_string()))
+    .map_err(|error| anyhow!(error.to_string()))?;
+    if let Some(path) = smoke_output {
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        if report["success"] != true {
+            bail!("application smoke check failed: {}", report["detail"]);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -190,21 +226,29 @@ fn default_settings_path() -> Result<PathBuf> {
 #[derive(Debug)]
 enum ClientEvent {
     Connection(String),
+    Connected(bool),
     ServiceInfo(ServiceInfo),
     Status(StatusSnapshot),
     Samples(SampleBatch),
     Recording(RecordingStatus),
     RecordingError(String),
+    SerialPorts(ThoughtStreamPorts),
+    ServiceCommandComplete(Option<String>),
 }
 
 #[derive(Debug)]
 enum NetworkCommand {
     StartRecording { label: String, notes: String },
     StopRecording,
+    SetDeviceEnabled { device_id: String, enabled: bool },
+    ReconnectDevice { device_id: String },
+    RefreshSerialPorts,
+    SetThoughtStreamPort(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
+    Service,
     Dashboard,
     Raw,
     BreathKasina,
@@ -223,7 +267,7 @@ fn repaint_interval(
         None
     } else if matches!(view, View::BreathKasina | View::Visualizer) {
         Some(ANIMATION_INTERVAL)
-    } else if simulation_mode || view == View::ThoughtStream {
+    } else if simulation_mode || matches!(view, View::ThoughtStream | View::Service) {
         Some(SIMULATION_SAMPLE_INTERVAL)
     } else {
         None
@@ -342,6 +386,7 @@ fn frame_target_result(
 #[derive(Debug)]
 struct ClientModel {
     connection: String,
+    connected: bool,
     service_info: Option<ServiceInfo>,
     status: Option<StatusSnapshot>,
     samples: BTreeMap<i32, VecDeque<Sample>>,
@@ -356,6 +401,7 @@ impl Default for ClientModel {
     fn default() -> Self {
         Self {
             connection: "waiting for acquisition service".to_owned(),
+            connected: false,
             service_info: None,
             status: None,
             samples: BTreeMap::new(),
@@ -369,6 +415,22 @@ impl Default for ClientModel {
 }
 
 impl ClientModel {
+    fn apply_service_info(&mut self, info: ServiceInfo) {
+        if self
+            .service_info
+            .as_ref()
+            .is_some_and(|previous| previous.instance_id != info.instance_id)
+        {
+            self.samples.clear();
+            self.last_sequences.clear();
+            self.status = None;
+            self.recording = None;
+            self.explicit_gap_samples = 0;
+            self.inferred_gap_samples = 0;
+            self.duplicate_samples = 0;
+        }
+        self.service_info = Some(info);
+    }
     fn apply_batch(&mut self, batch: SampleBatch) {
         self.explicit_gap_samples = self.explicit_gap_samples.saturating_add(
             batch
@@ -816,6 +878,14 @@ fn expansion_speed_slider(ui: &mut egui::Ui, enabled: bool, multiplier: &mut f32
 
 struct KasinaApp {
     endpoint: String,
+    service_host: service_host::ServiceHost,
+    service_panel: service_panel::ServicePanel,
+    serial_ports: Option<ThoughtStreamPorts>,
+    service_notice: Option<String>,
+    service_command_pending: bool,
+    last_status_at: Option<Instant>,
+    smoke: Option<SmokeTest>,
+    _smoke_directory: Option<tempfile::TempDir>,
     view: View,
     events: Receiver<ClientEvent>,
     network_commands: tokio::sync::mpsc::UnboundedSender<NetworkCommand>,
@@ -860,14 +930,45 @@ struct KasinaApp {
     benchmark_status: Option<String>,
 }
 
+struct SmokeTest {
+    duration: Duration,
+    output: PathBuf,
+    frames: u64,
+    finished: bool,
+}
+
 impl KasinaApp {
     fn new(
         creation_context: &eframe::CreationContext<'_>,
-        args: Args,
+        mut args: Args,
         surface_health: Arc<SurfaceHealth>,
     ) -> Result<Self> {
+        let smoke_directory = args
+            .smoke_test_seconds
+            .map(|_| tempfile::tempdir())
+            .transpose()?;
+        let mut service_options = kasina_service::ServiceOptions::default();
+        if let Some(directory) = &smoke_directory {
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = reservation.local_addr()?.port();
+            args.endpoint = format!("http://127.0.0.1:{port}");
+            args.token_path = Some(directory.path().join("service-token"));
+            args.service_mode = ServiceMode::Embedded;
+            service_options = kasina_service::ServiceOptions {
+                port,
+                source: kasina_service::ServiceSource::Simulated,
+                token_path: args.token_path.clone(),
+                lock_path: Some(directory.path().join("service.lock")),
+                recordings_dir: Some(directory.path().join("sessions")),
+                device_settings_path: Some(directory.path().join("devices.json")),
+                ..service_options
+            };
+        }
         let token_path = args.token_path.clone().unwrap_or(default_token_path()?);
-        let settings_path = default_settings_path()?;
+        let settings_path = match &smoke_directory {
+            Some(directory) => directory.path().join("app-settings.json"),
+            None => default_settings_path()?,
+        };
         let (settings, settings_notice) = match AppSettings::load(&settings_path) {
             Ok(settings) => (settings, None),
             Err(error) => {
@@ -938,6 +1039,27 @@ impl KasinaApp {
         let (network_commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let ui_dropped_batches = Arc::new(AtomicU64::new(0));
+        let launch_mode = match args.service_mode {
+            ServiceMode::Embedded => service_host::LaunchMode::Embedded,
+            ServiceMode::Auto if !cfg!(target_os = "linux") => service_host::LaunchMode::Embedded,
+            _ => service_host::LaunchMode::Separate,
+        };
+        let allow_start = !matches!(args.service_mode, ServiceMode::External)
+            && ((args.endpoint == "http://127.0.0.1:18861" && args.token_path.is_none())
+                || smoke_directory.is_some());
+        let service_host = service_host::ServiceHost::new(
+            service_host::HostConfig {
+                mode: launch_mode,
+                options: service_options,
+                endpoint: args.endpoint.clone(),
+                token_path: token_path.clone(),
+                allow_start,
+                auto_start: launch_mode == service_host::LaunchMode::Embedded
+                    && args.render_benchmark_seconds.is_none()
+                    && !settings.simulation_mode,
+            },
+            creation_context.egui_ctx.clone(),
+        )?;
         let network_thread = Some(spawn_network_thread(
             args.endpoint.clone(),
             token_path,
@@ -960,8 +1082,26 @@ impl KasinaApp {
         });
         Ok(Self {
             endpoint: args.endpoint,
+            service_host,
+            service_panel: service_panel::ServicePanel::default(),
+            serial_ports: None,
+            service_notice: None,
+            service_command_pending: false,
+            last_status_at: None,
+            smoke: args.smoke_test_seconds.map(|seconds| SmokeTest {
+                duration: Duration::from_secs_f64(seconds),
+                output: args
+                    .smoke_test_output
+                    .clone()
+                    .expect("required smoke output"),
+                frames: 0,
+                finished: false,
+            }),
+            _smoke_directory: smoke_directory,
             view: if benchmark.is_some() {
                 View::Visualizer
+            } else if args.smoke_test_seconds.is_some() || !cfg!(target_os = "linux") {
+                View::Service
             } else if settings.visible_tabs.breath_kasina {
                 View::BreathKasina
             } else {
@@ -1015,8 +1155,24 @@ impl KasinaApp {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 ClientEvent::Connection(connection) => self.model.connection = connection,
-                ClientEvent::ServiceInfo(info) => self.model.service_info = Some(info),
+                ClientEvent::Connected(connected) => {
+                    self.model.connected = connected;
+                    if connected {
+                        self.service_notice = None;
+                    }
+                    if !connected {
+                        self.last_status_at = None;
+                        self.service_command_pending = false;
+                        self.recording_command_pending = false;
+                        self.serial_ports = None;
+                    }
+                }
+                ClientEvent::ServiceInfo(info) => {
+                    self.service_host.observed(info.instance_id.clone());
+                    self.model.apply_service_info(info);
+                }
                 ClientEvent::Status(status) => {
+                    self.last_status_at = Some(Instant::now());
                     if let Some(recording) = status.recording.clone() {
                         self.model.recording = Some(recording);
                     }
@@ -1034,12 +1190,19 @@ impl KasinaApp {
                 }
                 ClientEvent::Recording(recording) => {
                     self.recording_command_pending = false;
+                    self.service_notice = Some(recording.detail.clone());
                     self.recording_notice = Some(recording.detail.clone());
                     self.model.recording = Some(recording);
                 }
                 ClientEvent::RecordingError(error) => {
                     self.recording_command_pending = false;
+                    self.service_notice = Some(error.clone());
                     self.recording_notice = Some(error);
+                }
+                ClientEvent::SerialPorts(ports) => self.serial_ports = Some(ports),
+                ClientEvent::ServiceCommandComplete(notice) => {
+                    self.service_command_pending = false;
+                    self.service_notice = notice;
                 }
             }
         }
@@ -1125,9 +1288,18 @@ impl KasinaApp {
     fn navigation(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("navigation")
             .resizable(false)
-            .default_size(135.0)
+            .default_size(162.0)
             .show(ui, |ui| {
                 ui.add_space(8.0);
+                if ui
+                    .selectable_label(self.view == View::Service, "Measurement service")
+                    .clicked()
+                {
+                    self.view = View::Service;
+                }
+                ui.add_space(5.0);
+                ui.separator();
+                ui.add_space(5.0);
                 let visibility = &self.settings.visible_tabs;
                 let mut tabs = Vec::with_capacity(7);
                 if visibility.dashboard {
@@ -1157,13 +1329,234 @@ impl KasinaApp {
             });
     }
 
+    fn service_connected(&self) -> bool {
+        self.model.connected
+            && self
+                .last_status_at
+                .is_some_and(|time| time.elapsed() < Duration::from_secs(4))
+    }
+
+    fn check_smoke_test(&mut self, context: &egui::Context) {
+        let Some(smoke) = self.smoke.as_mut() else {
+            return;
+        };
+        if smoke.finished {
+            return;
+        }
+        smoke.frames += 1;
+        context.request_repaint_after(Duration::from_millis(50));
+        let host = self.service_host.status();
+        let samples = self
+            .model
+            .samples
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>();
+        let instance = self
+            .model
+            .service_info
+            .as_ref()
+            .map(|info| info.instance_id.as_str());
+        let success = self.started.elapsed() >= smoke.duration
+            && smoke.frames >= 2
+            && samples > 0
+            && self.model.connected
+            && host.phase == service_host::Phase::Owned
+            && instance == host.instance_id.as_deref();
+        let timeout = self.started.elapsed() > smoke.duration + Duration::from_secs(20);
+        if !success && !timeout && host.phase != service_host::Phase::Failed {
+            return;
+        }
+        let report = serde_json::json!({
+            "success": success,
+            "samples_received": samples,
+            "ui_frames": smoke.frames,
+            "service_instance": instance,
+            "embedded_instance": host.instance_id,
+            "platform": std::env::consts::OS,
+            "detail": if success { "The UI received live samples from its isolated embedded service".to_owned() } else { host.notice.unwrap_or_else(|| self.model.connection.clone()) },
+        });
+        match serde_json::to_vec_pretty(&report)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| fs::write(&smoke.output, bytes).map_err(anyhow::Error::from))
+        {
+            Ok(()) => smoke.finished = true,
+            Err(error) => {
+                tracing::error!(%error, "write smoke result");
+                smoke.finished = true;
+            }
+        }
+        context.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn measurement_service(&mut self, ui: &mut egui::Ui) {
+        use service_host::Phase;
+        use service_panel::{ServiceAction, ServiceMode as PanelMode};
+        let host = self.service_host.status();
+        let connected = self.service_connected();
+        let owned = host.phase == Phase::Owned
+            && host.instance_id.as_deref()
+                == self
+                    .model
+                    .service_info
+                    .as_ref()
+                    .map(|info| info.instance_id.as_str());
+        let mode = if matches!(host.phase, Phase::Stopping) {
+            PanelMode::Stopping
+        } else if connected {
+            if owned {
+                PanelMode::Embedded
+            } else {
+                PanelMode::External
+            }
+        } else {
+            match host.phase {
+                Phase::Starting | Phase::Owned => PanelMode::Starting,
+                Phase::Failed => PanelMode::Failed,
+                _ => PanelMode::Offline,
+            }
+        };
+        let controls_available = self
+            .model
+            .service_info
+            .as_ref()
+            .is_some_and(|info| info.protocol_minor >= 3);
+        let device_controls = self
+            .model
+            .status
+            .as_ref()
+            .into_iter()
+            .flat_map(|status| &status.devices)
+            .filter(|device| device.connection_control_available)
+            .filter_map(|device| {
+                device
+                    .device
+                    .as_ref()
+                    .map(|info| service_panel::DeviceControl {
+                        id: info.id.clone(),
+                        enabled: device.connection_enabled,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let serial = self
+            .serial_ports
+            .as_ref()
+            .map(|ports| service_panel::SerialSettings {
+                automatic: ports.selected_port.is_empty(),
+                selected_path: (!ports.selected_port.is_empty())
+                    .then(|| ports.selected_port.clone()),
+                ports: ports
+                    .ports
+                    .iter()
+                    .map(|port| service_panel::SerialChoice {
+                        path: port.name.clone(),
+                        label: port.label.clone(),
+                    })
+                    .collect(),
+                detail: String::new(),
+            });
+        let notice = self
+            .service_notice
+            .as_deref()
+            .or(host.notice.as_deref())
+            .or_else(|| {
+                (!connected && (host.phase != Phase::Offline || !self.service_host.allow_start))
+                    .then_some(self.model.connection.as_str())
+            });
+        if self.settings.simulation_mode {
+            ui.label(egui::RichText::new("Your signal panels are in demo mode. This page shows the actual measurement service.").small().color(egui::Color32::from_rgb(245, 191, 105)));
+        }
+        let actions = self.service_panel.ui(
+            ui,
+            service_panel::ServicePanelInput {
+                mode,
+                connected,
+                status: self.model.status.as_ref(),
+                notice,
+                controls_available,
+                device_controls: &device_controls,
+                serial: serial.as_ref(),
+                busy: self.service_command_pending
+                    || self.recording_command_pending
+                    || matches!(mode, PanelMode::Starting | PanelMode::Stopping),
+                can_start: self.service_host.allow_start
+                    && !connected
+                    && host.phase != Phase::Owned,
+            },
+        );
+        for action in actions {
+            self.service_notice = None;
+            let command = match action {
+                ServiceAction::StartService => {
+                    self.service_host.start();
+                    continue;
+                }
+                ServiceAction::StopService if owned => {
+                    self.service_host.stop();
+                    continue;
+                }
+                ServiceAction::StopService => continue,
+                ServiceAction::OpenRecordings => {
+                    if let Some(recording) = &self.model.recording
+                        && !recording.directory.is_empty()
+                        && let Err(error) = open_recordings_folder(&recording.directory)
+                    {
+                        self.service_notice = Some(format!("Could not open recordings: {error}"));
+                    }
+                    continue;
+                }
+                ServiceAction::SetDeviceEnabled { device_id, enabled } => {
+                    NetworkCommand::SetDeviceEnabled { device_id, enabled }
+                }
+                ServiceAction::ReconnectDevice { device_id } => {
+                    NetworkCommand::ReconnectDevice { device_id }
+                }
+                ServiceAction::RefreshSerialPorts => NetworkCommand::RefreshSerialPorts,
+                ServiceAction::SetThoughtStreamPort(port) => {
+                    NetworkCommand::SetThoughtStreamPort(port)
+                }
+                ServiceAction::StartRecording { label } => {
+                    self.recording_command_pending = true;
+                    NetworkCommand::StartRecording {
+                        label: if label.trim().is_empty() {
+                            "Biofeedback session".to_owned()
+                        } else {
+                            label
+                        },
+                        notes: String::new(),
+                    }
+                }
+                ServiceAction::StopRecording => {
+                    self.recording_command_pending = true;
+                    NetworkCommand::StopRecording
+                }
+            };
+            if !connected {
+                self.service_notice =
+                    Some("The service disconnected. Reconnect and try again.".to_owned());
+                self.recording_command_pending = false;
+                continue;
+            }
+            self.service_command_pending = !self.recording_command_pending;
+            if self.network_commands.send(command).is_err() {
+                self.service_command_pending = false;
+                self.recording_command_pending = false;
+                self.service_notice = Some("The service connection is unavailable.".to_owned());
+            }
+        }
+    }
+
     fn dashboard(&self, ui: &mut egui::Ui) {
         let model = self.active_model();
         ui.heading("Live biofeedback");
         ui.label(if self.settings.simulation_mode {
             "Displaying deterministic synthetic signals generated inside the app."
         } else {
-            "Sensor acquisition stays in kasina-service when this window closes."
+            if self.service_host.status().phase == service_host::Phase::Owned {
+                "Measurements run in this app and stop cleanly when it closes."
+            } else {
+                "Measurements come from the independent sensor service."
+            }
         });
         ui.add_space(12.0);
         egui::Grid::new("summary_grid")
@@ -2345,6 +2738,7 @@ impl eframe::App for KasinaApp {
             self.thoughtstream.deactivate(now);
         }
         egui::CentralPanel::default().show(ui, |ui| match self.view {
+            View::Service => self.measurement_service(ui),
             View::Dashboard => self.dashboard(ui),
             View::Raw => self.raw_signals(ui),
             View::BreathKasina => self.breath_kasina(ui),
@@ -2360,12 +2754,14 @@ impl eframe::App for KasinaApp {
         let ui_cpu_time = ui_started.elapsed();
         self.ui_cpu_stats.record(ui_cpu_time, 0);
         self.record_benchmark_frame(ui.ctx(), now, frame_interval, ui_cpu_time);
+        self.check_smoke_test(ui.ctx());
     }
 }
 
 impl Drop for KasinaApp {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.service_host.finish();
         let _detached = self.network_thread.take();
         let final_settings = self
             .settings_notice
@@ -2373,6 +2769,22 @@ impl Drop for KasinaApp {
             .then(|| self.settings.clone().sanitized());
         self.settings_writer.finish(final_settings);
     }
+}
+
+fn open_recordings_folder(directory: &str) -> Result<()> {
+    let path = std::path::Path::new(directory);
+    if !path.is_dir() {
+        bail!("The recording folder is not available");
+    }
+    let program = if cfg!(target_os = "windows") {
+        "explorer.exe"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program).arg(path).spawn()?;
+    Ok(())
 }
 
 fn metric_label(ui: &mut egui::Ui, label: &str, sample: Option<&Sample>, scale: f64) {
@@ -2499,6 +2911,7 @@ async fn network_supervisor(
     mut commands: tokio::sync::mpsc::UnboundedReceiver<NetworkCommand>,
 ) {
     let mut cursors = BTreeMap::new();
+    let mut service_instance = None;
     let mut retry = Duration::from_millis(250);
     while !cancellation.is_cancelled() {
         send_event(
@@ -2509,6 +2922,7 @@ async fn network_supervisor(
         let mut session_state = NetworkSessionState {
             cursors: &mut cursors,
             commands: &mut commands,
+            service_instance: &mut service_instance,
         };
         let result = connected_session(
             &endpoint,
@@ -2523,6 +2937,20 @@ async fn network_supervisor(
         if cancellation.is_cancelled() {
             break;
         }
+        send_event(&sender, ClientEvent::Connected(false), &repaint);
+        let mut discarded = false;
+        while commands.try_recv().is_ok() {
+            discarded = true;
+        }
+        if discarded {
+            send_event(
+                &sender,
+                ClientEvent::ServiceCommandComplete(Some(
+                    "The service disconnected; pending controls were cancelled.".to_owned(),
+                )),
+                &repaint,
+            );
+        }
         let detail = match result {
             Ok(()) => "service stream ended".to_owned(),
             Err(error) => {
@@ -2533,7 +2961,11 @@ async fn network_supervisor(
         send_event(&sender, ClientEvent::Connection(detail), &repaint);
         tokio::select! {
             () = cancellation.cancelled() => break,
-            () = tokio::time::sleep(retry) => {}
+            () = tokio::time::sleep(retry) => {},
+            Some(_) = commands.recv() => {
+                send_event(&sender, ClientEvent::ServiceCommandComplete(Some("The service is offline. Try again after it reconnects.".to_owned())), &repaint);
+                send_event(&sender, ClientEvent::RecordingError("The service is offline. Try again after it reconnects.".to_owned()), &repaint);
+            }
         }
         retry = (retry * 2).min(Duration::from_secs(5));
     }
@@ -2542,6 +2974,7 @@ async fn network_supervisor(
 struct NetworkSessionState<'a> {
     cursors: &'a mut BTreeMap<i32, u64>,
     commands: &'a mut tokio::sync::mpsc::UnboundedReceiver<NetworkCommand>,
+    service_instance: &'a mut Option<String>,
 }
 
 async fn connected_session(
@@ -2565,31 +2998,48 @@ async fn connected_session(
         .await
         .context("connect loopback RPC")?;
     let mut client = KasinaClient::new(channel);
-    let info = client
-        .get_service_info(authenticated_request(
+    let info = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.get_service_info(authenticated_request(
             client_hello("kasina-app", env!("CARGO_PKG_VERSION")),
             token,
-        )?)
-        .await?
-        .into_inner();
-    send_event(sender, ClientEvent::ServiceInfo(info), repaint);
+        )?),
+    )
+    .await
+    .context("The service handshake timed out")??
+    .into_inner();
+    if info.protocol_major != kasina_protocol::PROTOCOL_MAJOR {
+        bail!("The measurement service needs a compatible app version");
+    }
+    // The UI must receive the instance identity before any history from it. A full
+    // queue restarts this handshake without advancing its instance or cursors.
+    send_required_event(sender, ClientEvent::ServiceInfo(info.clone()), repaint)?;
+    if session.service_instance.as_deref() != Some(info.instance_id.as_str()) {
+        session.cursors.clear();
+        *session.service_instance = Some(info.instance_id.clone());
+    }
+    let supports_controls = info.protocol_minor >= 3;
 
     let streams = all_streams();
     // Establish the live receiver before taking the history snapshot. Samples produced
     // during the snapshot are then present in both paths and de-duplicated by cursor,
     // instead of being lost in a history/subscription race.
-    let mut sample_stream = client
-        .subscribe_samples(authenticated_request(
+    let mut sample_stream = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.subscribe_samples(authenticated_request(
             SubscribeRequest {
                 client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
                 streams: streams.clone(),
             },
             token,
-        )?)
-        .await?
-        .into_inner();
-    let history = client
-        .get_samples_since(authenticated_request(
+        )?),
+    )
+    .await
+    .context("The service sample subscription timed out")??
+    .into_inner();
+    let history = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.get_samples_since(authenticated_request(
             SamplesSinceRequest {
                 client: Some(client_hello("kasina-app", env!("CARGO_PKG_VERSION"))),
                 cursors: streams
@@ -2601,16 +3051,20 @@ async fn connected_session(
                     .collect(),
             },
             token,
-        )?)
-        .await?
-        .into_inner();
+        )?),
+    )
+    .await
+    .context("The service history request timed out")??
+    .into_inner();
     publish_batch(history, sender, dropped_batches, repaint, session.cursors)?;
-    if let Ok(recording) = client
-        .get_recording_status(authenticated_request(
+    if let Ok(Ok(recording)) = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.get_recording_status(authenticated_request(
             client_hello("kasina-app", env!("CARGO_PKG_VERSION")),
             token,
-        )?)
-        .await
+        )?),
+    )
+    .await
     {
         send_event(
             sender,
@@ -2621,6 +3075,10 @@ async fn connected_session(
     let mut status_client = client.clone();
     let mut status_tick = tokio::time::interval(Duration::from_millis(500));
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ports_tick = tokio::time::interval(Duration::from_secs(5));
+    let mut control_tasks = tokio::task::JoinSet::new();
+    ports_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    send_required_event(sender, ClientEvent::Connected(true), repaint)?;
     send_event(
         sender,
         ClientEvent::Connection("connected; receiving live samples".to_owned()),
@@ -2636,16 +3094,33 @@ async fn connected_session(
                 publish_batch(batch, sender, dropped_batches, repaint, session.cursors)?;
             }
             _ = status_tick.tick() => {
-                match status_client.get_status(authenticated_request(
+                match tokio::time::timeout(Duration::from_secs(3), status_client.get_status(authenticated_request(
                     client_hello("kasina-app", env!("CARGO_PKG_VERSION")),
                     token,
-                )?).await {
+                )?)).await.context("The service stopped responding")? {
                     Ok(status) => send_event(sender, ClientEvent::Status(status.into_inner()), repaint),
-                    Err(error) => warn!(%error, "status refresh failed"),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            _ = ports_tick.tick(), if supports_controls => {
+                if let Ok(ports) = tokio::time::timeout(Duration::from_secs(3), client.list_thought_stream_ports(authenticated_request(client_hello("kasina-app", env!("CARGO_PKG_VERSION")), token)?)).await
+                    && let Ok(ports) = ports {
+                    send_event(sender, ClientEvent::SerialPorts(ports.into_inner()), repaint);
                 }
             }
             Some(command) = session.commands.recv(), if !session.commands.is_closed() => {
-                handle_network_command(&mut client, command, token, sender, repaint).await;
+                let mut control_client = client.clone();
+                let control_sender = sender.clone();
+                let control_repaint = repaint.clone();
+                let control_token = token.to_owned();
+                control_tasks.spawn(async move {
+                    handle_network_command(&mut control_client, command, &control_token, &control_sender, &control_repaint).await;
+                });
+            }
+            Some(result) = control_tasks.join_next(), if !control_tasks.is_empty() => {
+                if let Err(error) = result {
+                    send_event(sender, ClientEvent::ServiceCommandComplete(Some(format!("A service control failed: {error}"))), repaint);
+                }
             }
         }
     }
@@ -2670,6 +3145,26 @@ async fn handle_network_command(
     sender: &SyncSender<ClientEvent>,
     repaint: &egui::Context,
 ) {
+    if !matches!(
+        &command,
+        NetworkCommand::StartRecording { .. } | NetworkCommand::StopRecording
+    ) {
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            handle_service_command(client, command, token, sender, repaint),
+        )
+        .await;
+        let notice = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("Could not update measurements: {error}")),
+            Err(_) => Some(
+                "The service did not respond to that control. Check its connection and try again."
+                    .to_owned(),
+            ),
+        };
+        send_event(sender, ClientEvent::ServiceCommandComplete(notice), repaint);
+        return;
+    }
     let result = match command {
         NetworkCommand::StartRecording { label, notes } => client
             .start_recording(
@@ -2697,6 +3192,7 @@ async fn handle_network_command(
             )
             .await
             .map(tonic::Response::into_inner),
+        _ => unreachable!("service controls handled above"),
     };
     match result {
         Ok(recording) => send_event(sender, ClientEvent::Recording(recording), repaint),
@@ -2706,6 +3202,66 @@ async fn handle_network_command(
             repaint,
         ),
     }
+}
+
+async fn handle_service_command(
+    client: &mut KasinaClient<tonic::transport::Channel>,
+    command: NetworkCommand,
+    token: &str,
+    sender: &SyncSender<ClientEvent>,
+    repaint: &egui::Context,
+) -> Result<()> {
+    let hello = || client_hello("kasina-app", env!("CARGO_PKG_VERSION"));
+    match command {
+        NetworkCommand::SetDeviceEnabled { device_id, enabled } => {
+            client
+                .set_device_connection(authenticated_request(
+                    DeviceCommand {
+                        client: Some(hello()),
+                        device_id,
+                        connect: enabled,
+                    },
+                    token,
+                )?)
+                .await?;
+        }
+        NetworkCommand::ReconnectDevice { device_id } => {
+            for connect in [false, true] {
+                client
+                    .set_device_connection(authenticated_request(
+                        DeviceCommand {
+                            client: Some(hello()),
+                            device_id: device_id.clone(),
+                            connect,
+                        },
+                        token,
+                    )?)
+                    .await?;
+            }
+        }
+        NetworkCommand::RefreshSerialPorts => {
+            let ports = client
+                .list_thought_stream_ports(authenticated_request(hello(), token)?)
+                .await?
+                .into_inner();
+            send_event(sender, ClientEvent::SerialPorts(ports), repaint);
+        }
+        NetworkCommand::SetThoughtStreamPort(port) => {
+            let ports = client
+                .set_thought_stream_port(authenticated_request(
+                    ThoughtStreamPortCommand {
+                        client: Some(hello()),
+                        port: port.unwrap_or_default(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            send_event(sender, ClientEvent::SerialPorts(ports), repaint);
+        }
+        _ => bail!("not a measurement control"),
+    }
+    Ok(())
 }
 
 fn publish_batch(
@@ -2746,6 +3302,21 @@ fn publish_batch(
 fn send_event(sender: &SyncSender<ClientEvent>, event: ClientEvent, repaint: &egui::Context) {
     if sender.try_send(event).is_ok() {
         repaint.request_repaint();
+    }
+}
+
+fn send_required_event(
+    sender: &SyncSender<ClientEvent>,
+    event: ClientEvent,
+    repaint: &egui::Context,
+) -> Result<()> {
+    match sender.try_send(event) {
+        Ok(()) => {
+            repaint.request_repaint();
+            Ok(())
+        }
+        Err(TrySendError::Full(_)) => bail!("UI event queue reached backpressure limit"),
+        Err(TrySendError::Disconnected(_)) => bail!("UI event receiver closed"),
     }
 }
 
@@ -2804,6 +3375,67 @@ mod tests {
         assert_eq!(model.duplicate_samples, 1);
         assert_eq!(model.inferred_gap_samples, 1);
         assert_eq!(model.last_sequences[&(StreamKind::HeartRate as i32)], 3);
+    }
+
+    #[test]
+    fn restarted_service_accepts_new_sequences_without_mixing_old_history() {
+        let mut model = ClientModel::default();
+        let info = |instance: &str| ServiceInfo {
+            instance_id: instance.to_owned(),
+            ..Default::default()
+        };
+        model.apply_service_info(info("first"));
+        model.apply_batch(SampleBatch {
+            samples: vec![sample(StreamKind::HeartRate, 50)],
+            ..Default::default()
+        });
+        model.apply_service_info(info("first"));
+        assert_eq!(model.latest(StreamKind::HeartRate).unwrap().sequence, 50);
+        model.apply_service_info(info("restarted"));
+        model.apply_batch(SampleBatch {
+            samples: vec![sample(StreamKind::HeartRate, 1)],
+            ..Default::default()
+        });
+        assert_eq!(model.latest(StreamKind::HeartRate).unwrap().sequence, 1);
+        assert_eq!(model.samples[&(StreamKind::HeartRate as i32)].len(), 1);
+        assert_eq!(model.duplicate_samples, 0);
+    }
+
+    #[test]
+    fn full_ui_queue_rejects_required_handshake_events_until_they_can_be_delivered() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let repaint = egui::Context::default();
+        sender.try_send(ClientEvent::Connected(false)).unwrap();
+        sender.try_send(ClientEvent::Connected(false)).unwrap();
+        let info = ServiceInfo {
+            instance_id: "restarted".to_owned(),
+            ..Default::default()
+        };
+        assert!(
+            send_required_event(&sender, ClientEvent::ServiceInfo(info.clone()), &repaint).is_err()
+        );
+        assert!(send_required_event(&sender, ClientEvent::Connected(true), &repaint).is_err());
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientEvent::Connected(false)
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientEvent::Connected(false)
+        ));
+
+        // A retried handshake delivers identity before connected state, rather than
+        // silently proceeding with the previous instance's UI history.
+        send_required_event(&sender, ClientEvent::ServiceInfo(info), &repaint).unwrap();
+        send_required_event(&sender, ClientEvent::Connected(true), &repaint).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientEvent::ServiceInfo(info) if info.instance_id == "restarted"
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientEvent::Connected(true)
+        ));
     }
 
     #[test]
