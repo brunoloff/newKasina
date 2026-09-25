@@ -21,6 +21,10 @@ use tokio_serial::{SerialPort, SerialStream};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS pseudo-terminals cannot apply the real serial driver's IOSSIOSPEED baud rate"
+)]
 async fn serial_packets_reach_history_subscriptions_and_recordings_across_client_restart() {
     tokio::time::timeout(Duration::from_secs(10), exercise_serial_pipeline())
         .await

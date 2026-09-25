@@ -3,6 +3,20 @@
 Run helpers from the repository root. Normal desktop use is described in the
 [README](../README.md); these commands support repeatable device and rendering tests.
 
+## Cross-platform CI
+
+The GitHub Actions matrix runs formatting, Clippy, tests, and release builds on
+Linux, Windows, and macOS. Successful runs upload development binaries for both
+the interface and the measurement service.
+
+The two ThoughtStream tests that reopen pseudo-terminals through the production
+serial driver run on Linux. They are explicitly ignored on macOS because the
+`serialport` backend sets the baud rate with `IOSSIOSPEED`, which macOS
+pseudo-terminals reject. Windows does not provide this Unix pseudo-terminal
+fixture. Packet decoding, async in-memory stream tests, recording, and service
+restart tests still run across platforms. Physical USB/Bluetooth checks remain
+necessary on each supported desktop; a successful CI build does not replace them.
+
 ## Device soak tests
 
 For an eight-hour hardware run with append-only diagnostic snapshots every ten seconds:

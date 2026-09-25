@@ -499,6 +499,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS pseudo-terminals cannot apply the real serial driver's IOSSIOSPEED baud rate"
+    )]
     async fn selecting_a_port_interrupts_backoff_and_switches_an_active_session() {
         use tokio_serial::{SerialPort, SerialStream};
 
