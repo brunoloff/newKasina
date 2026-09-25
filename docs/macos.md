@@ -81,8 +81,9 @@ deployment target and dynamic-library paths, verifies the ad-hoc signature, and
 creates and verifies the DMG. Non-system libraries from the build machine cause
 packaging to fail rather than producing a download that depends on Homebrew.
 
-The packaged application is launched through macOS LaunchServices with an
-isolated simulated service. The smoke check requires rendered UI frames and
+The final disk image is mounted read-only, and its app is copied into a temporary
+Applications folder and verified again. That installed copy is launched through
+macOS LaunchServices with an isolated simulated service. The smoke check requires rendered UI frames and
 samples received from that exact service instance, writes a JSON report, and
 exits. It never opens physical sensors or uses the user's saved settings.
 

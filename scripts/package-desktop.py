@@ -235,14 +235,38 @@ def smoke_test(staging, destination):
     report.unlink(missing_ok=True)
     arguments = ["--smoke-test-seconds", "3", "--smoke-test-output", str(report)]
     if native_platform() == "macOS":
-        app = staging / "newKasina.app"
-        verify_mac_app(app)
-        # Exercise Finder/LaunchServices instead of launching an unbundled binary.
-        command = ["open", "-W", "-n", str(app), "--args", *arguments]
+        # Test the actual download: mount it read-only and install a copy before
+        # asking LaunchServices to open it, just like dragging into Applications.
+        dmg = destination / f"{package_name()}.dmg"
+        with tempfile.TemporaryDirectory(prefix="newkasina-dmg-smoke-") as temporary:
+            workspace = Path(temporary)
+            mountpoint = workspace / "disk-image"
+            mountpoint.mkdir()
+            installed = workspace / "Applications"
+            installed.mkdir()
+            app = installed / "newKasina.app"
+            attached = False
+            try:
+                run("hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen",
+                    "-mountpoint", mountpoint, dmg)
+                attached = True
+                # ditto preserves the executable modes, extended attributes,
+                # resource forks, and signature sealed in the downloaded app.
+                run("ditto", mountpoint / "newKasina.app", app)
+            finally:
+                if attached or mountpoint.is_mount():
+                    try:
+                        run("hdiutil", "detach", mountpoint)
+                    except subprocess.CalledProcessError:
+                        # This is our own read-only temporary mount; no app is
+                        # launched from it, and no writes can be lost.
+                        run("hdiutil", "detach", "-force", mountpoint)
+            verify_mac_app(app)
+            # Keep the installed copy alive until the application has exited.
+            run("open", "-W", "-n", app, "--args", *arguments, timeout=60)
     else:
         executable = "newKasina.exe" if native_platform() == "Windows" else "kasina-app"
-        command = [str(staging / executable), *arguments]
-    run(*command, timeout=60)
+        run(staging / executable, *arguments, timeout=60)
     result = json.loads(report.read_text(encoding="utf-8"))
     print(json.dumps(result, indent=2))
     if not result.get("success") or result.get("samples_received", 0) <= 0 or result.get("ui_frames", 0) <= 0:

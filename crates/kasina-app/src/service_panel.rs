@@ -607,6 +607,14 @@ fn connection_options(
                 ui.add_space(6.0);
                 ui.label(RichText::new(&serial.detail).size(12.0).color(muted(ui)));
             }
+            if cfg!(target_os = "macos") {
+                ui.add_space(8.0);
+                ui.label(RichText::new("If ThoughtStream is plugged in but missing from the list, its Silicon Labs USB driver may need installing. After installation, reconnect the cable and refresh the list.").size(12.0).color(muted(ui)));
+                ui.hyperlink_to(
+                    "Get the macOS CP210x USB driver",
+                    "https://www.silabs.com/software-and-tools/usb-to-uart-bridge-vcp-drivers",
+                );
+            }
             if input.connected && !input.controls_available {
                 ui.label(RichText::new("Update the measurement service to choose a USB connection here.").size(12.0).color(muted(ui)));
             }
