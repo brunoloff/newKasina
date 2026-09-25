@@ -1032,7 +1032,12 @@ mod tests {
         let gray = icon_rgba(off);
         assert_eq!(gray.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
         assert_eq!(&gray[0..4], &[0, 0, 0, 0]);
-        assert!(gray.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]));
+        assert!(
+            gray.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0] == p[1] && p[1] == p[2])
+        );
         for (state, active_point, color, inactive_points) in [
             (
                 VisualState {

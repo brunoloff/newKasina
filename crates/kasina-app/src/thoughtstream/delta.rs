@@ -410,7 +410,9 @@ mod tests {
     use super::*;
     fn mesh_area(mesh: &egui::Mesh) -> f32 {
         mesh.indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|indices| {
                 let a = mesh.vertices[indices[0] as usize].pos;
                 let b = mesh.vertices[indices[1] as usize].pos;
