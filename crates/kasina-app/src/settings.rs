@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, bail};
 use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala, OrganicKaleidoscope, PaperDisk};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 9;
+const SETTINGS_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -18,6 +18,7 @@ pub(crate) struct TabVisibility {
     pub raw_signals: bool,
     pub breath_kasina: bool,
     pub thoughtstream: bool,
+    pub aided_counting: bool,
     pub gpu_stress_test: bool,
     pub diagnostics: bool,
 }
@@ -29,6 +30,7 @@ impl Default for TabVisibility {
             raw_signals: false,
             breath_kasina: true,
             thoughtstream: true,
+            aided_counting: true,
             gpu_stress_test: false,
             diagnostics: false,
         }
@@ -92,6 +94,7 @@ pub(crate) struct AppSettings {
     pub schema_version: u32,
     pub simulation_mode: bool,
     pub thoughtstream: crate::thoughtstream::ThoughtStreamSettings,
+    pub aided_counting: kasina_counting::engine::Settings,
     pub visible_tabs: TabVisibility,
     pub active_preset_id: u64,
     pub next_preset_id: u64,
@@ -120,6 +123,7 @@ impl AppSettings {
     #[must_use]
     pub fn sanitized(mut self) -> Self {
         self.thoughtstream.sanitize();
+        self.aided_counting.sanitize();
         let source_schema = self.schema_version;
         if source_schema < 4 {
             let value_was_radians_per_second = source_schema < 3;
@@ -256,6 +260,7 @@ impl Default for AppSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             simulation_mode: false,
             thoughtstream: Default::default(),
+            aided_counting: Default::default(),
             visible_tabs: TabVisibility::default(),
             active_preset_id: 1,
             next_preset_id: 7,
@@ -429,6 +434,24 @@ fn write_atomically(path: &Path, settings: &AppSettings) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn schema_nine_gains_counting_without_changing_existing_preferences() {
+        let mut encoded = serde_json::to_value(AppSettings::default()).unwrap();
+        encoded["schema_version"] = serde_json::json!(9);
+        encoded.as_object_mut().unwrap().remove("aided_counting");
+        encoded["visible_tabs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("aided_counting");
+        encoded["visible_tabs"]["thoughtstream"] = serde_json::json!(false);
+        let migrated: AppSettings = serde_json::from_value(encoded).unwrap();
+        let migrated = migrated.sanitized();
+        assert!(migrated.visible_tabs.aided_counting);
+        assert!(!migrated.visible_tabs.thoughtstream);
+        assert_eq!(migrated.aided_counting.companions, 2);
+        assert!(migrated.aided_counting.speakers);
+    }
 
     #[test]
     fn defaults_show_only_breath_and_include_all_visual_styles() {

@@ -11,6 +11,7 @@ members = [
     "crates/kasina-service",
     "crates/kasina-render",
     "crates/kasina-audio",
+    "crates/kasina-counting",
     "crates/kasina-app",
 ]
 

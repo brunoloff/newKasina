@@ -117,3 +117,10 @@ rsvg-convert -w 1024 -h 1024 packaging/linux/icons/org.newkasina.NewKasina.svg \
 resources on any platform. The same packaging script produces a Windows ZIP
 containing one double-clickable `newKasina.exe`, and a Linux tarball retaining
 both `kasina-app` and `kasina-service`.
+
+### Aided breath counting microphone
+
+The app includes its English speech model. Start an aided breath-counting session
+to request microphone access; the microphone is not opened on app launch. If
+access was denied, enable newKasina under System Settings → Privacy & Security →
+Microphone, then restart the session. Recognition stays on the Mac.

@@ -28,6 +28,8 @@
     <string>13.0</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>newKasina uses Bluetooth to connect to your heart-rate monitor and breathing sensor for live biofeedback. Your measurements stay on this Mac.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>newKasina listens for the English numbers you speak during aided breath counting. Recognition happens on this Mac; microphone audio is never uploaded or saved. The microphone closes when guidance ends.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>

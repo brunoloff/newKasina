@@ -6,6 +6,8 @@ No external Python modules, signing credentials, or packaging frameworks are nee
 """
 
 import argparse
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -63,6 +65,7 @@ def check_resources():
     assert metadata["CFBundleExecutable"] == "newKasina"
     assert metadata["CFBundlePackageType"] == "APPL"
     assert metadata["NSBluetoothAlwaysUsageDescription"].strip()
+    assert metadata["NSMicrophoneUsageDescription"].strip()
     assert metadata["LSMinimumSystemVersion"] == "13.0"
     assert metadata["NSHighResolutionCapable"] is True
     # Validate the PNG signature and dimensions without an imaging dependency.
@@ -72,6 +75,24 @@ def check_resources():
     assert int.from_bytes(png[20:24], "big") == 1024
     assert (MAC_RESOURCES / "Read me first.html").is_file()
     print("Desktop packaging resources are valid.")
+
+
+def bundle_speech_model(resources):
+    spec = importlib.util.spec_from_file_location("speech_model", ROOT / "scripts/fetch-speech-model.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    model = module.fetch()
+    destination = resources / "models"
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(model, destination / model.name)
+    shutil.copy2(ROOT / "crates/kasina-counting/assets/NOTICE.md", destination)
+
+
+def verify_speech_model(resources):
+    spec = json.loads((ROOT / "crates/kasina-counting/assets/model.json").read_text())
+    model = resources / "models" / spec["filename"]
+    assert model.stat().st_size == spec["bytes"]
+    assert hashlib.sha256(model.read_bytes()).hexdigest() == spec["sha256"]
 
 
 def build_icon(resources, temporary):
@@ -95,6 +116,8 @@ def verify_mac_app(app):
     assert executable.is_file() and os.access(executable, os.X_OK)
     assert (contents / "Resources" / metadata["CFBundleIconFile"]).is_file()
     assert metadata["NSBluetoothAlwaysUsageDescription"].strip()
+    assert metadata["NSMicrophoneUsageDescription"].strip()
+    verify_speech_model(contents / "Resources")
     run("plutil", "-lint", contents / "Info.plist")
     expected = {"ARM64": "arm64", "X64": "x86_64"}[architecture()]
     assert expected in output("lipo", "-archs", executable).split()
@@ -133,6 +156,7 @@ def build_mac(binary_dir, staging, destination):
     shutil.copy2(MAC_RESOURCES / "Read me first.html", resources)
     with tempfile.TemporaryDirectory(prefix="newkasina-icon-") as temporary:
         build_icon(resources, Path(temporary))
+    bundle_speech_model(resources)
     # Ad-hoc signing seals resources and supports Apple Silicon. It is not
     # Developer ID signing or notarization, and does not bypass Gatekeeper.
     run("codesign", "--force", "--sign", "-", "--timestamp=none", app)
@@ -147,6 +171,8 @@ def build_mac(binary_dir, staging, destination):
 
 
 def build_other(binary_dir, staging, destination):
+    bundle_speech_model(staging)
+    verify_speech_model(staging)
     if native_platform() == "Windows":
         verify_windows_executable(binary_dir / "kasina-app.exe")
         shutil.copy2(binary_dir / "kasina-app.exe", staging / "newKasina.exe")
@@ -271,6 +297,8 @@ def smoke_test(staging, destination):
     print(json.dumps(result, indent=2))
     if not result.get("success") or result.get("samples_received", 0) <= 0 or result.get("ui_frames", 0) <= 0:
         raise RuntimeError("Packaged app did not successfully render and receive simulated samples")
+    if not result.get("speech_model_found") or result.get("counting_panel_frames", 0) < 2 or result.get("microphone_opened"):
+        raise RuntimeError("Packaged counting panel/model check failed, or unexpectedly activated audio")
     if not result.get("service_instance") or result["service_instance"] != result.get("embedded_instance"):
         raise RuntimeError("Packaged app did not connect to its own isolated measurement service")
 

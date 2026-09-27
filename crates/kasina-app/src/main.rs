@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod counting;
 mod service_host;
 mod service_panel;
 mod settings;
@@ -253,6 +254,7 @@ enum View {
     Raw,
     BreathKasina,
     ThoughtStream,
+    AidedCounting,
     Visualizer,
     Diagnostics,
     Settings,
@@ -267,7 +269,12 @@ fn repaint_interval(
         None
     } else if matches!(view, View::BreathKasina | View::Visualizer) {
         Some(ANIMATION_INTERVAL)
-    } else if simulation_mode || matches!(view, View::ThoughtStream | View::Service) {
+    } else if simulation_mode
+        || matches!(
+            view,
+            View::ThoughtStream | View::Service | View::AidedCounting
+        )
+    {
         Some(SIMULATION_SAMPLE_INTERVAL)
     } else {
         None
@@ -896,6 +903,7 @@ struct KasinaApp {
     simulation: SimulationState,
     breath_kasina: BreathKasinaState,
     thoughtstream: thoughtstream::ThoughtStreamPanel,
+    counting: counting::CountingPanel,
     settings: AppSettings,
     settings_path: PathBuf,
     settings_writer: SettingsWriter,
@@ -934,6 +942,7 @@ struct SmokeTest {
     duration: Duration,
     output: PathBuf,
     frames: u64,
+    counting_frames: u64,
     finished: bool,
 }
 
@@ -1095,6 +1104,7 @@ impl KasinaApp {
                     .clone()
                     .expect("required smoke output"),
                 frames: 0,
+                counting_frames: 0,
                 finished: false,
             }),
             _smoke_directory: smoke_directory,
@@ -1116,6 +1126,7 @@ impl KasinaApp {
             simulation: SimulationState::new(now),
             breath_kasina: BreathKasinaState::new(now),
             thoughtstream: thoughtstream::ThoughtStreamPanel::new(now),
+            counting: counting::CountingPanel::new(),
             settings,
             settings_path,
             settings_writer,
@@ -1279,6 +1290,7 @@ impl KasinaApp {
                     model.latest(StreamKind::RespirationForce),
                     1.0,
                 );
+                self.counting.indicator(ui);
                 if recording_active {
                     ui.separator();
                     ui.colored_label(egui::Color32::from_rgb(240, 65, 75), "● REC");
@@ -1316,6 +1328,9 @@ impl KasinaApp {
                 if visibility.thoughtstream {
                     tabs.push((View::ThoughtStream, "ThoughtStream"));
                 }
+                if visibility.aided_counting {
+                    tabs.push((View::AidedCounting, "Aided breath counting"));
+                }
                 if visibility.gpu_stress_test {
                     tabs.push((View::Visualizer, "GPU stress test"));
                 }
@@ -1346,6 +1361,12 @@ impl KasinaApp {
             return;
         }
         smoke.frames += 1;
+        if self.view == View::AidedCounting {
+            smoke.counting_frames += 1;
+        }
+        if smoke.frames >= 10 {
+            self.view = View::AidedCounting;
+        }
         context.request_repaint_after(Duration::from_millis(50));
         let host = self.service_host.status();
         let samples = self
@@ -1361,6 +1382,7 @@ impl KasinaApp {
             .map(|info| info.instance_id.as_str());
         let success = self.started.elapsed() >= smoke.duration
             && smoke.frames >= 2
+            && smoke.counting_frames >= 2
             && samples > 0
             && self.model.connected
             && host.phase == service_host::Phase::Owned
@@ -1373,6 +1395,9 @@ impl KasinaApp {
             "success": success,
             "samples_received": samples,
             "ui_frames": smoke.frames,
+            "counting_panel_frames": smoke.counting_frames,
+            "speech_model_found": self.counting.has_model(),
+            "microphone_opened": self.counting.active(),
             "service_instance": instance,
             "embedded_instance": host.instance_id,
             "platform": std::env::consts::OS,
@@ -1908,6 +1933,13 @@ impl KasinaApp {
                     .checkbox(
                         &mut self.settings.visible_tabs.thoughtstream,
                         "ThoughtStream",
+                    )
+                    .changed();
+                ui.end_row();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.visible_tabs.aided_counting,
+                        "Aided breath counting",
                     )
                     .changed();
                 ui.end_row();
@@ -2696,6 +2728,9 @@ impl eframe::App for KasinaApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.update_simulation(Instant::now());
+        if self.view == View::AidedCounting {
+            self.counting.shortcut(context);
+        }
         if context.input(|input| input.key_pressed(egui::Key::F11)) {
             self.fullscreen = !self.fullscreen;
             context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
@@ -2705,6 +2740,9 @@ impl eframe::App for KasinaApp {
             repaint_interval(self.view, viewport_visible, self.settings.simulation_mode)
         {
             context.request_repaint_after(interval);
+        }
+        if self.counting.active() {
+            context.request_repaint_after(Duration::from_millis(100));
         }
         self.poll_benchmark_writer(context);
         self.persist_settings_if_due(context, Instant::now());
@@ -2749,6 +2787,11 @@ impl eframe::App for KasinaApp {
                     self.mark_settings_changed(ui.ctx());
                 }
             }
+            View::AidedCounting => {
+                if self.counting.ui(ui, &mut self.settings.aided_counting) {
+                    self.mark_settings_changed(ui.ctx());
+                }
+            }
             View::Visualizer => self.visualizer(ui),
             View::Diagnostics => self.diagnostics(ui),
             View::Settings => self.settings(ui),
@@ -2762,6 +2805,7 @@ impl eframe::App for KasinaApp {
 
 impl Drop for KasinaApp {
     fn drop(&mut self) {
+        self.counting.stop();
         self.cancellation.cancel();
         self.service_host.finish();
         let _detached = self.network_thread.take();

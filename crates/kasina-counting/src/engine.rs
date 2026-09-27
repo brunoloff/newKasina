@@ -1,0 +1,413 @@
+use serde::{Deserialize, Serialize};
+
+/// Breath-cycle lengths at the beginning, midpoint and end of the settling curve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub companions: usize,
+    pub duration_minutes: f64,
+    pub extension_minutes: f64,
+    pub settling_minutes: f64,
+    pub cycle_seconds: [f64; 3],
+    pub pace: [f64; 4],
+    pub volume: f32,
+    pub microphone_threshold: f32,
+    pub speakers: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            companions: 2,
+            duration_minutes: 10.0,
+            extension_minutes: 3.0,
+            settling_minutes: 15.0,
+            cycle_seconds: [5.0, 7.0, 9.0],
+            pace: [0.85, 1.05, 1.22, 0.96],
+            volume: 0.55,
+            microphone_threshold: 0.008,
+            speakers: true,
+        }
+    }
+}
+
+impl Settings {
+    pub fn sanitize(&mut self) {
+        fn bounded(value: f64, fallback: f64, low: f64, high: f64) -> f64 {
+            if value.is_finite() {
+                value.clamp(low, high)
+            } else {
+                fallback
+            }
+        }
+        let default = Self::default();
+        self.companions = self.companions.clamp(1, 4);
+        self.duration_minutes =
+            bounded(self.duration_minutes, default.duration_minutes, 0.1, 180.0);
+        self.extension_minutes =
+            bounded(self.extension_minutes, default.extension_minutes, 0.1, 30.0);
+        self.settling_minutes =
+            bounded(self.settling_minutes, default.settling_minutes, 0.5, 120.0);
+        for (value, fallback) in self.cycle_seconds.iter_mut().zip(default.cycle_seconds) {
+            *value = bounded(*value, fallback, 3.0, 30.0);
+        }
+        for (value, fallback) in self.pace.iter_mut().zip(default.pace) {
+            *value = bounded(*value, fallback, 0.65, 1.5);
+        }
+        self.volume = bounded(self.volume as f64, default.volume as f64, 0.0, 1.0) as f32;
+        self.microphone_threshold = bounded(
+            self.microphone_threshold as f64,
+            default.microphone_threshold as f64,
+            0.001,
+            0.08,
+        ) as f32;
+    }
+
+    pub fn cycle_at(&self, elapsed_seconds: f64, companion: usize) -> f64 {
+        let progress = (elapsed_seconds / (self.settling_minutes * 60.0)).clamp(0.0, 1.0);
+        let (a, b, t) = if progress < 0.5 {
+            (self.cycle_seconds[0], self.cycle_seconds[1], progress * 2.0)
+        } else {
+            (
+                self.cycle_seconds[1],
+                self.cycle_seconds[2],
+                (progress - 0.5) * 2.0,
+            )
+        };
+        let smooth = t * t * (3.0 - 2.0 * t);
+        (a + (b - a) * smooth) * self.pace[companion.min(3)]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Phase {
+    #[default]
+    Ready,
+    Counting,
+    Quiet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaker {
+    You,
+    Companion(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    Count { number: u8, speaker: Speaker },
+    Bell,
+}
+
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub phase: Phase,
+    pub last_number: u8,
+    pub last_speaker: Option<Speaker>,
+    pub elapsed_seconds: f64,
+    pub remaining_seconds: f64,
+    pub breath_phase: [f64; 4],
+    pub cycle_seconds: [f64; 4],
+    pub turns: u64,
+}
+
+#[derive(Debug)]
+pub struct Engine {
+    settings: Settings,
+    phase: Phase,
+    started: f64,
+    deadline: f64,
+    last_tick: f64,
+    last_number: u8,
+    last_speaker: Option<Speaker>,
+    phases: [f64; 4],
+    pending: [Option<f64>; 4],
+    variation: [f64; 4],
+    random: u64,
+    next_voice_at: f64,
+    recent_virtual: Vec<(u8, f64)>,
+    turns: u64,
+}
+
+impl Engine {
+    pub fn new(mut settings: Settings) -> Self {
+        settings.sanitize();
+        Self {
+            settings,
+            phase: Phase::Ready,
+            started: 0.0,
+            deadline: 0.0,
+            last_tick: 0.0,
+            last_number: 0,
+            last_speaker: None,
+            phases: [0.72, 0.30, 0.51, 0.06],
+            pending: [None; 4],
+            variation: [1.0; 4],
+            random: 0x9327_185d_67b0_891f,
+            next_voice_at: 0.0,
+            recent_virtual: Vec::new(),
+            turns: 0,
+        }
+    }
+
+    pub fn start(&mut self, now: f64) {
+        *self = Self::new(self.settings.clone());
+        self.phase = Phase::Counting;
+        self.started = now;
+        self.last_tick = now;
+        self.deadline = now + self.settings.duration_minutes * 60.0;
+        self.next_voice_at = now + 1.0;
+    }
+
+    pub fn stop(&mut self) {
+        self.phase = Phase::Ready;
+        self.pending = [None; 4];
+    }
+
+    pub fn extend(&mut self, now: f64) {
+        if self.phase == Phase::Ready {
+            return;
+        }
+        if self.phase == Phase::Quiet || now >= self.deadline {
+            self.phase = Phase::Counting;
+            self.last_tick = now;
+            self.pending = [None; 4];
+            self.phases = [0.72, 0.30, 0.51, 0.06];
+            self.next_voice_at = now + 1.0;
+        }
+        self.deadline = self.deadline.max(now) + self.settings.extension_minutes * 60.0;
+    }
+
+    /// The caller processes the bell before audio or recognition events at the deadline.
+    pub fn tick(&mut self, now: f64, voice_busy: bool) -> Option<Event> {
+        if self.phase != Phase::Counting {
+            return None;
+        }
+        if now >= self.deadline {
+            self.phase = Phase::Quiet;
+            self.pending = [None; 4];
+            return Some(Event::Bell);
+        }
+        let dt = (now - self.last_tick).max(0.0);
+        self.last_tick = now;
+        // After suspension, resume the current rhythms without a burst of old counts.
+        if dt > 1.0 {
+            self.pending = [None; 4];
+            self.next_voice_at = now + 0.8;
+        }
+        for index in 0..self.settings.companions {
+            let cycle = self.settings.cycle_at(now - self.started, index) * self.variation[index];
+            self.phases[index] += dt.min(1.0) / cycle;
+            if self.phases[index] >= 1.0 {
+                self.phases[index] %= 1.0;
+                self.pending[index].get_or_insert(now);
+                self.random ^= self.random << 13;
+                self.random ^= self.random >> 7;
+                self.random ^= self.random << 17;
+                self.variation[index] = 0.97 + (self.random % 1000) as f64 * 0.00006;
+            }
+        }
+        self.recent_virtual.retain(|(_, time)| now - time < 2.5);
+        if voice_busy || now < self.next_voice_at {
+            return None;
+        }
+        let index = (0..self.settings.companions)
+            .filter(|index| self.pending[*index].is_some())
+            .min_by(|a, b| {
+                self.pending[*a]
+                    .unwrap()
+                    .total_cmp(&self.pending[*b].unwrap())
+            })?;
+        self.pending[index] = None;
+        let number = self.last_number % 10 + 1;
+        self.commit(number, Speaker::Companion(index), now);
+        self.recent_virtual.push((number, now));
+        Some(Event::Count {
+            number,
+            speaker: Speaker::Companion(index),
+        })
+    }
+
+    /// A recognized human number takes precedence and can gently repair a lost count.
+    pub fn heard(&mut self, number: u8, utterance_started: f64, now: f64) -> Option<Event> {
+        if self.phase != Phase::Counting
+            || now >= self.deadline
+            || !(1..=10).contains(&number)
+            || utterance_started < self.started
+            || now - utterance_started > 4.0
+        {
+            return None;
+        }
+        // Even residual room echo must not count a companion's utterance twice.
+        if self.recent_virtual.iter().any(|(spoken, time)| {
+            *spoken == number && utterance_started >= *time - 0.15 && now - time < 2.5
+        }) {
+            return None;
+        }
+        if number == self.last_number {
+            return None;
+        }
+        self.commit(number, Speaker::You, now);
+        Some(Event::Count {
+            number,
+            speaker: Speaker::You,
+        })
+    }
+
+    pub fn manual_count(&mut self, now: f64) -> Option<Event> {
+        if self.phase != Phase::Counting || now >= self.deadline {
+            return None;
+        }
+        let number = self.last_number % 10 + 1;
+        self.commit(number, Speaker::You, now);
+        Some(Event::Count {
+            number,
+            speaker: Speaker::You,
+        })
+    }
+
+    pub fn reset_count(&mut self) {
+        self.last_number = 0;
+        self.last_speaker = None;
+        // Keep recent spoken numbers in the echo guard while their room echo decays.
+    }
+
+    fn commit(&mut self, number: u8, speaker: Speaker, now: f64) {
+        self.last_number = number;
+        self.last_speaker = Some(speaker);
+        self.turns += 1;
+        self.next_voice_at = now + 0.75;
+    }
+
+    pub fn snapshot(&self, now: f64) -> Snapshot {
+        Snapshot {
+            phase: self.phase,
+            last_number: self.last_number,
+            last_speaker: self.last_speaker,
+            elapsed_seconds: if self.phase == Phase::Ready {
+                0.0
+            } else {
+                (now - self.started).max(0.0)
+            },
+            remaining_seconds: if self.phase == Phase::Counting {
+                (self.deadline - now).max(0.0)
+            } else {
+                0.0
+            },
+            breath_phase: self.phases,
+            cycle_seconds: std::array::from_fn(|i| self.settings.cycle_at(now - self.started, i)),
+            turns: self.turns,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn human_and_companions_share_counter_and_wrap() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        for time in 1..=10 {
+            engine.tick(time as f64, true);
+            engine.manual_count(time as f64);
+        }
+        assert_eq!(engine.snapshot(10.0).last_number, 10);
+        assert!(matches!(
+            engine.tick(11.0, false),
+            Some(Event::Count { number: 1, .. })
+        ));
+    }
+    #[test]
+    fn deadline_wins_over_a_pending_voice_and_bell_is_once() {
+        let settings = Settings {
+            duration_minutes: 0.1,
+            ..Settings::default()
+        };
+        let mut engine = Engine::new(settings);
+        engine.start(0.0);
+        for n in 1..60 {
+            engine.tick(n as f64 / 10.0, true);
+        }
+        assert_eq!(engine.tick(6.0, true), Some(Event::Bell));
+        assert_eq!(engine.tick(7.0, false), None);
+        assert_eq!(engine.heard(3, 5.8, 6.1), None);
+        assert_eq!(engine.manual_count(7.0), None);
+    }
+    #[test]
+    fn extension_preserves_count_and_settling_progress() {
+        let settings = Settings {
+            duration_minutes: 0.1,
+            ..Settings::default()
+        };
+        let mut engine = Engine::new(settings);
+        engine.start(10.0);
+        engine.manual_count(11.0);
+        engine.tick(16.0, true);
+        engine.extend(100.0);
+        let view = engine.snapshot(100.0);
+        assert_eq!(view.last_number, 1);
+        assert_eq!(view.elapsed_seconds, 90.0);
+        assert_eq!(view.remaining_seconds, 180.0);
+        assert_eq!(engine.tick(100.0, false), None);
+    }
+    #[test]
+    fn echo_and_stale_recognition_never_advance_counter() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        let mut spoken = None;
+        for tick in 1..100 {
+            let now = tick as f64 * 0.05;
+            if let Some(Event::Count { number, .. }) = engine.tick(now, false) {
+                spoken = Some((number, now));
+                break;
+            }
+        }
+        let (number, time) = spoken.unwrap();
+        assert_eq!(engine.heard(number, time + 0.1, time + 0.7), None);
+        assert_eq!(engine.heard(7, time, time + 5.0), None);
+        assert_eq!(
+            engine.heard(7, time + 1.0, time + 1.5),
+            Some(Event::Count {
+                number: 7,
+                speaker: Speaker::You
+            })
+        );
+    }
+    #[test]
+    fn independent_rhythms_are_not_round_robin() {
+        let settings = Settings {
+            companions: 2,
+            pace: [0.65, 1.5, 1.0, 1.0],
+            cycle_seconds: [4.0; 3],
+            ..Settings::default()
+        };
+        let mut engine = Engine::new(settings);
+        engine.start(0.0);
+        let mut speakers = Vec::new();
+        for tick in 1..3000 {
+            if let Some(Event::Count { speaker, .. }) = engine.tick(tick as f64 * 0.02, false) {
+                speakers.push(speaker);
+            }
+        }
+        assert!(
+            speakers
+                .windows(2)
+                .any(|pair| pair == [Speaker::Companion(0); 2])
+        );
+    }
+    #[test]
+    fn bad_saved_settings_are_safe_and_curve_has_exact_knots() {
+        let mut settings = Settings {
+            companions: 9,
+            duration_minutes: f64::NAN,
+            ..Settings::default()
+        };
+        settings.sanitize();
+        assert_eq!(settings.companions, 4);
+        assert_eq!(settings.duration_minutes, 10.0);
+        assert_eq!(settings.cycle_at(0.0, 0), 5.0 * 0.85);
+        assert_eq!(settings.cycle_at(450.0, 0), 7.0 * 0.85);
+        assert_eq!(settings.cycle_at(900.0, 0), 9.0 * 0.85);
+    }
+}

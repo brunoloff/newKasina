@@ -217,3 +217,10 @@ For long device tests and repeatable rendering measurements, see the
 - [Polar H10 hardware validation](docs/hardware/polar-h10-smoke.md)
 - [Go Direct protocol audit](docs/hardware/godirect-protocol-audit.md)
 - [Implementation plan](PLAN.md)
+
+## Aided breath counting
+
+Practice with 1–4 virtual companions sharing a spoken 1–10 count. Configure their
+breathing curves, session duration, and extra time. English speech recognition and
+speaker echo cancellation run locally; desktop downloads include the model.
+See [Aided breath counting](docs/aided-breath-counting.md) for controls and setup.
