@@ -13,6 +13,7 @@ pub struct Settings {
     pub volume: f32,
     pub microphone_threshold: f32,
     pub speakers: bool,
+    pub shared_counts: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +28,7 @@ impl Default for Settings {
             volume: 0.55,
             microphone_threshold: 0.008,
             speakers: true,
+            shared_counts: false,
         }
     }
 }
@@ -299,6 +301,7 @@ impl Engine {
                     .unwrap()
                     .total_cmp(&self.pending[*b].unwrap())
             })?;
+        let first_index = index;
         let first_due = self.pending[index].unwrap();
         if now - first_due < COMPANION_GROUP_SECONDS {
             return None;
@@ -307,7 +310,9 @@ impl Engine {
         for index in 0..self.settings.companions {
             if self.pending[index].is_some_and(|due| due - first_due <= COMPANION_GROUP_SECONDS) {
                 self.pending[index] = None;
-                speakers.insert(Speaker::Companion(index));
+                if self.settings.shared_counts || index == first_index {
+                    speakers.insert(Speaker::Companion(index));
+                }
             }
         }
         let number = self.last_number % 10 + 1;
@@ -333,6 +338,17 @@ impl Engine {
         {
             return None;
         }
+        if !self.settings.shared_counts {
+            // The first accepted number owns the turn, even when a conflicting
+            // recognition result arrives later. Wrong numbers cannot resync it.
+            if number != self.last_number % 10 + 1
+                || self.recent_counts.iter().any(|recent| {
+                    (utterance_started - recent.started).abs() <= HUMAN_OVERLAP_SECONDS
+                })
+            {
+                return None;
+            }
+        }
         // Recognition arrives after playback. Match the actual voice onset, and
         // update its original round (including a ten already moved down).
         if let Some(recent) = self.recent_counts.iter().rev().find(|recent| {
@@ -340,8 +356,10 @@ impl Engine {
                 && (utterance_started - recent.started).abs() <= HUMAN_OVERLAP_SECONDS
                 && now - recent.started <= 4.5
         }) {
-            return (independent_voice && self.history.join(recent.round, number, Speaker::You))
-                .then_some(Event::Joined { number });
+            return (self.settings.shared_counts
+                && independent_voice
+                && self.history.join(recent.round, number, Speaker::You))
+            .then_some(Event::Joined { number });
         }
         // Even residual room echo must not count a companion's utterance twice.
         if self.recent_virtual.iter().any(|(spoken, time)| {
@@ -352,6 +370,14 @@ impl Engine {
         if number == self.last_number {
             return None;
         }
+        if !self.settings.shared_counts {
+            for due in &mut self.pending {
+                if due.is_some_and(|time| (time - utterance_started).abs() <= HUMAN_OVERLAP_SECONDS)
+                {
+                    *due = None;
+                }
+            }
+        }
         self.commit(number, Speaker::You.into(), now);
         Some(Event::Count {
             number,
@@ -361,6 +387,9 @@ impl Engine {
 
     pub fn manual_count(&mut self, now: f64) -> Option<Event> {
         if self.phase != Phase::Counting || now >= self.deadline {
+            return None;
+        }
+        if !self.settings.shared_counts && self.last_number != 0 && now < self.next_voice_at {
             return None;
         }
         let number = self.last_number % 10 + 1;
@@ -424,9 +453,65 @@ impl Engine {
 mod tests {
     use super::*;
     #[test]
+    fn shared_counts_are_opt_in_in_new_and_saved_settings() {
+        assert!(!Settings::default().shared_counts);
+        let legacy: Settings = serde_json::from_str(r#"{"companions":3}"#).unwrap();
+        assert!(!legacy.shared_counts);
+        let shared = Settings {
+            shared_counts: true,
+            ..Settings::default()
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&shared).unwrap()).unwrap();
+        assert!(restored.shared_counts);
+    }
+
+    #[test]
+    fn single_count_mode_keeps_first_speaker_and_rejects_conflicting_numbers() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        engine.last_tick = 1.1;
+        engine.phases = [0.0; 4];
+        // Companion one finishes first, even though companion zero is first in the array.
+        engine.pending = [Some(1.1), Some(1.0), None, None];
+        assert_eq!(
+            engine.tick(1.3, false),
+            Some(Event::Count {
+                number: 1,
+                speakers: Speaker::Companion(1).into(),
+            })
+        );
+        let first = engine.snapshot(1.3).history;
+        for number in 1..=10 {
+            assert_eq!(engine.heard(number, 1.4, 2.0, true), None);
+        }
+        assert_eq!(engine.manual_count(1.4), None);
+        assert_eq!(engine.snapshot(2.0).history, first);
+        assert!(engine.pending.iter().all(Option::is_none));
+        assert_eq!(engine.heard(7, 2.5, 3.0, true), None);
+        assert!(matches!(
+            engine.heard(2, 3.0, 3.5, true),
+            Some(Event::Count { number: 2, .. })
+        ));
+        assert_eq!(engine.snapshot(3.5).history.rows[0][0].len(), 1);
+    }
+
+    #[test]
+    fn human_first_discards_companions_from_the_same_turn() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        engine.pending = [Some(1.1), Some(2.0), None, None];
+        assert!(engine.heard(1, 1.0, 1.5, true).is_some());
+        assert_eq!(engine.pending[0], None);
+        assert_eq!(engine.pending[1], Some(2.0));
+        assert_eq!(engine.snapshot(1.5).last_speakers, Speaker::You.into());
+    }
+
+    #[test]
     fn nearby_companion_breaths_share_one_number() {
         let mut engine = Engine::new(Settings {
             companions: 3,
+            shared_counts: true,
             ..Settings::default()
         });
         engine.start(0.0);
@@ -458,7 +543,10 @@ mod tests {
 
     #[test]
     fn human_overlap_joins_a_completed_ten_without_advancing_or_duplicating() {
-        let mut engine = Engine::new(Settings::default());
+        let mut engine = Engine::new(Settings {
+            shared_counts: true,
+            ..Settings::default()
+        });
         engine.start(0.0);
         let mut companions = Speakers::from(Speaker::Companion(0));
         companions.insert(Speaker::Companion(1));
@@ -487,7 +575,10 @@ mod tests {
 
     #[test]
     fn a_later_repetition_is_not_simultaneous_and_shared_colors_roll_down() {
-        let mut engine = Engine::new(Settings::default());
+        let mut engine = Engine::new(Settings {
+            shared_counts: true,
+            ..Settings::default()
+        });
         engine.start(0.0);
         engine.commit(1, Speaker::Companion(2).into(), 1.0);
         engine.recent_virtual.push((1, 1.0));
@@ -535,7 +626,10 @@ mod tests {
 
     #[test]
     fn history_handles_recognition_resync_reset_resume_and_new_sessions() {
-        let mut engine = Engine::new(Settings::default());
+        let mut engine = Engine::new(Settings {
+            shared_counts: true,
+            ..Settings::default()
+        });
         engine.start(0.0);
         engine.manual_count(1.0);
         // A resynchronizing number must not assign invented speakers to skipped dots.
@@ -616,7 +710,10 @@ mod tests {
     }
     #[test]
     fn echo_and_stale_recognition_never_advance_counter() {
-        let mut engine = Engine::new(Settings::default());
+        let mut engine = Engine::new(Settings {
+            shared_counts: true,
+            ..Settings::default()
+        });
         engine.start(0.0);
         let mut spoken = None;
         for tick in 1..100 {

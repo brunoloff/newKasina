@@ -25,6 +25,7 @@ pub struct Status {
     pub output: String,
     pub level: f32,
     pub recognizing: bool,
+    pub listening_paused: bool,
     pub notice: String,
     pub error: Option<String>,
 }
@@ -37,6 +38,7 @@ impl Default for Status {
             output: String::new(),
             level: 0.0,
             recognizing: false,
+            listening_paused: false,
             notice: "Ready when you are".into(),
             error: None,
         }
@@ -131,6 +133,7 @@ fn worker(
                 let mut state = status.lock().unwrap_or_else(|p| p.into_inner());
                 state.loading = false;
                 state.recognizing = false;
+                state.listening_paused = false;
                 state.level = 0.0;
                 state.snapshot.phase = Phase::Ready;
                 state.notice = "Ready when you are".into();
@@ -160,6 +163,8 @@ fn session(
     }
     let mut audio = Audio::open().context("Open counting audio")?;
     let mut aec = echo_canceller()?;
+    let use_speakers = settings.speakers && !settings.shared_counts;
+    let mut listen_after = 0.0_f64;
     let (jobs, receive_jobs) = mpsc::sync_channel::<(u64, f64, bool, Vec<f32>)>(1);
     let (results, receive_results) = mpsc::channel();
     let cancel = cancelled.clone();
@@ -193,6 +198,9 @@ fn session(
             let now = origin.elapsed().as_secs_f64();
             if cancelled.load(Ordering::Relaxed) {
                 break;
+            }
+            if !settings.shared_counts && audio.busy() {
+                listen_after = listen_after.max(now + 0.5);
             }
             // Deadline is checked before recognition and before any new number is queued.
             if let Some(Event::Bell) = engine.tick(now, true) {
@@ -254,7 +262,7 @@ fn session(
                 match frame {
                     Frame::Render(frame) => {
                         evidence.render(&frame);
-                        if settings.speakers {
+                        if use_speakers {
                             aec.handle_render_frame(&frame)
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                         }
@@ -265,8 +273,8 @@ fn session(
                         if now - captured.saturating_duration_since(origin).as_secs_f64() > 0.3 {
                             continue;
                         }
-                        let independent = !settings.speakers || evidence.independent(&frame);
-                        let cleaned = if settings.speakers {
+                        let independent = !use_speakers || evidence.independent(&frame);
+                        let cleaned = if use_speakers {
                             let Some(cleaned) = capture_frame(&mut aec, &frame, independent)?
                             else {
                                 continue;
@@ -275,6 +283,13 @@ fn session(
                         } else {
                             frame
                         };
+                        if !settings.shared_counts
+                            && captured.saturating_duration_since(origin).as_secs_f64()
+                                < listen_after
+                        {
+                            detector = VoiceDetector::new(settings.microphone_threshold);
+                            continue;
+                        }
                         if let Some(utterance) = detector.push(
                             &cleaned,
                             captured.saturating_duration_since(origin).as_secs_f64(),
@@ -324,11 +339,20 @@ fn session(
                 now,
                 audio.busy() || detector.busy() || in_flight || now < quiet_until,
             ) {
-                audio.play(&voices::together(speakers, number)?, settings.volume);
+                let clip = voices::together(speakers, number)?;
+                if !settings.shared_counts {
+                    listen_after = now + clip.len() as f64 / 16000.0 + 0.5;
+                    recognition_floor = listen_after;
+                    detector = VoiceDetector::new(settings.microphone_threshold);
+                }
+                audio.play(&clip, settings.volume);
             }
             {
                 let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
                 state.snapshot = engine.snapshot(now);
+                state.listening_paused = !settings.shared_counts
+                    && now < listen_after
+                    && state.snapshot.phase == Phase::Counting;
                 state.level = detector.level;
                 state.recognizing = in_flight;
             }

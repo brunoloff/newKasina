@@ -19,18 +19,25 @@ number and everyone who counted it. Unheard numbers stay neutral if recognition 
 Resetting clears only the current row; adding time preserves the history, while
 starting a new session clears it.
 
-When people count the same number together, its circle has equal colored slices,
-one per person. Repeated recognition never adds a second slice for the same
-person or advances the shared count. Companions finishing within a quarter-second
-count together, with their voices mixed. Your recognized number can join a
-companion's count when your voice starts within 0.45 seconds of it; recognition
-may finish later, even after a completed ten has moved to the next row. A later
-repetition of the same number is ignored. “You” represents the microphone user;
-this does not identify multiple real people sharing a microphone.
+**Allow shared counts** is off by default. With it off, only the first person in
+a turn is registered; competing counts are discarded, and spoken numbers must
+follow the current 1–10 sequence. Microphone counting pauses during companion
+playback and for half a second afterward to avoid recognizing their voices as
+yours. Wait until their voice finishes before adding your next count.
+
+Enable **Allow shared counts** before starting a session to get equal colored
+slices for people counting together. **Headphones are required** for this mode;
+the yellow warning remains next to its checkbox. Listening stays open during
+companion playback. This mode uses headphone audio handling, overriding the
+speaker echo-cancellation setting. Each person gets one slice, and a shared count
+advances only once. Companions finishing within a quarter-second count together.
+Your voice can join the same number within 0.45 seconds of its start, even if
+recognition finishes after its row moves down. “You” represents one microphone
+user; this does not identify multiple real people sharing a microphone.
 
 **I counted** or **Space** adds the next number manually. Space works while the
-counting tab is open. **Reset to 1** means the next count will be one. A recognized
-number also repairs the shared counter if a previous count was missed.
+counting tab is open. **Reset to 1** means the next count will be one. In shared mode a recognized
+number can also repair the counter if a previous count was missed.
 
 At the deadline, the companions stop, a bell rings once, and the microphone
 closes. **+ X min together** adds the configured extra time; it works during a
@@ -43,15 +50,10 @@ Closing the app stops all counting audio and microphone capture.
 
 Speaker mode is enabled by default. The app sends its actual output signal to
 local acoustic echo cancellation before detecting and recognizing your speech.
-Companions wait while speech is detected or recognition is pending. To accept a
-shared count in speaker mode, the app also checks for voice energy distinct from
-its recent output; echo alone should not earn a “You” slice. During detected
-independent speech it preserves the linear echo-subtracted signal, avoiding the
-stronger suppression that can erase overlapping syllables. Other repetitions of
-recent companion numbers remain guarded against room echo. These checks reduce
-self-counting; very loud speakers, room reverberation, other apps'
-audio, and simultaneous speech can still cause missed or incorrect recognition.
-These conditions need testing with your own room and microphone.
+Companions wait while speech is detected or recognition is pending. Shared
+counting must be used with headphones: echo cancellation alone did not reliably
+separate the user's voice from companion playback on speakers. Keep shared
+counting off when using speakers so playback cannot become a microphone count.
 
 The default microphone and output selected in system sound settings are opened
 when you start. To change devices, end the session, change system settings, and

@@ -143,6 +143,13 @@ impl CountingPanel {
             });
             ui.add_space(16.0);
             ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(editable, egui::Checkbox::new(&mut settings.shared_counts, "Allow shared counts")).changed() && settings.shared_counts {
+                    settings.speakers = false;
+                }
+                ui.label(RichText::new("Headphones required for shared counts").color(Color32::from_rgb(244, 200, 94)));
+            });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
                 if running || state.loading {
                     if ui.add_sized([138.0,40.0],egui::Button::new("Stop session")).clicked() {self.runtime.send(Command::Stop);}
                 } else if state.snapshot.phase==Phase::Ready {
@@ -195,7 +202,7 @@ impl CountingPanel {
                 ui.add_space(12.0);
                 egui::CollapsingHeader::new("Sound & microphone").show(ui,|ui| {
                     ui.add(egui::Slider::new(&mut settings.volume,0.0..=1.0).text("Voice & bell volume"));
-                    ui.checkbox(&mut settings.speakers,"Using speakers · cancel companion echo");
+                    ui.add_enabled(!settings.shared_counts, egui::Checkbox::new(&mut settings.speakers,"Using speakers · cancel companion echo"));
                     ui.add(egui::Slider::new(&mut settings.microphone_threshold,0.001..=0.08).logarithmic(true).text("Speech threshold"));
                     ui.small("Lower the threshold for a quiet voice; raise it if room noise keeps the companions waiting.");
                     ui.small("Uses your system’s default microphone and speakers. Change devices in system sound settings before starting.");
@@ -217,6 +224,8 @@ impl CountingPanel {
                 .circle_filled(rect.center(), 3.0, if on { MINT } else { Color32::GRAY });
             ui.label(if state.loading {
                 "Preparing local speech recognition…"
+            } else if state.listening_paused {
+                "Companion speaking · listening resumes just after the voice"
             } else if state.recognizing {
                 "Listening · recognizing your number…"
             } else {
