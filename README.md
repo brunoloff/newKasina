@@ -178,8 +178,10 @@ Polar H10 · Go Direct · ThoughtStream · Simulator
 
 ## Development checks
 
-GitHub Actions builds and tests Linux, Windows, and both Mac architectures on every push and pull
-request. Open a successful run in [Actions](https://github.com/brunoloff/newKasina/actions)
+GitHub Actions builds and tests Linux on every push and pull request. Windows and
+both Mac architectures are opt-in: choose **Run workflow** in Actions and enable
+**Also build Windows and both Mac architectures** when those builds are needed.
+Open a successful run in [Actions](https://github.com/brunoloff/newKasina/actions)
 and download the matching `newKasina` artifact at the bottom of its page (sign in
 to GitHub to download). Mac artifacts contain a disk image with a self-contained
 app; Windows contains one executable; Linux retains the interface and tray service.

@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      all_platforms:
+        description: Also build Windows and both Mac architectures
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,16 +24,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            binary_dir: target/release
-          - os: windows-latest
-            binary_dir: target/x86_64-pc-windows-msvc/release
-            rust_target: x86_64-pc-windows-msvc
-          - os: macos-15
-            binary_dir: target/release
-          - os: macos-15-intel
-            binary_dir: target/release
+        include: >-
+          ${{ fromJSON(inputs.all_platforms &&
+          '[{"os":"ubuntu-latest","binary_dir":"target/release"},
+            {"os":"windows-latest","binary_dir":"target/x86_64-pc-windows-msvc/release","rust_target":"x86_64-pc-windows-msvc"},
+            {"os":"macos-15","binary_dir":"target/release"},
+            {"os":"macos-15-intel","binary_dir":"target/release"}]' ||
+          '[{"os":"ubuntu-latest","binary_dir":"target/release"}]') }}
     runs-on: ${{ matrix.os }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
