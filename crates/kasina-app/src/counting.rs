@@ -1,6 +1,6 @@
 use egui::{Color32, RichText, Stroke, pos2, vec2};
 use kasina_counting::{
-    engine::{Phase, Settings, Speaker},
+    engine::{Phase, Settings, Snapshot, Speaker},
     model,
     runtime::{Command, Controller, Status},
 };
@@ -11,6 +11,7 @@ use std::{
 };
 
 const MINT: Color32 = Color32::from_rgb(113, 220, 191);
+const YOU: Color32 = Color32::from_rgb(242, 153, 184);
 const INK: Color32 = Color32::from_rgb(23, 35, 39);
 const COLORS: [Color32; 4] = [
     MINT,
@@ -109,17 +110,9 @@ impl CountingPanel {
                     let number=if state.snapshot.last_number==0 {"—".into()} else {state.snapshot.last_number.to_string()};
                     ui.label(RichText::new(number).size(104.0).color(Color32::from_rgb(230,242,237)));
                     let speaker=match state.snapshot.last_speaker { Some(Speaker::You)=>"You".into(), Some(Speaker::Companion(index))=>NAMES[index].into(), None=>"Breathe naturally; join whenever you wish".to_owned() };
-                    ui.label(RichText::new(speaker).size(16.0).color(MINT));
+                    ui.label(RichText::new(speaker).size(16.0).color(state.snapshot.last_speaker.map_or(MINT, speaker_color)));
                     ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        let width=ui.available_width();
-                        let dot_space=22.0_f32.min(width/12.0);
-                        ui.add_space(((width-dot_space*10.0)/2.0).max(0.0));
-                        for count in 1..=10 {
-                            let (rect,_)=ui.allocate_exact_size(vec2(dot_space,14.0),egui::Sense::hover());
-                            ui.painter().circle_filled(rect.center(), if count==state.snapshot.last_number {4.5}else{2.5},if count==state.snapshot.last_number {MINT}else{Color32::from_rgb(61,85,83)});
-                        }
-                    });
+                    count_history(ui, &state.snapshot);
                 });
                 ui.add_space(24.0);
                 ui.columns(settings.companions,|columns| {
@@ -246,6 +239,71 @@ impl CountingPanel {
         });
     }
 }
+fn speaker_color(speaker: Speaker) -> Color32 {
+    match speaker {
+        Speaker::You => YOU,
+        Speaker::Companion(index) => COLORS[index],
+    }
+}
+
+fn count_history(ui: &mut egui::Ui, snapshot: &Snapshot) {
+    let spacing = 22.0_f32.min(ui.available_width() / 10.0);
+    let visible_rows = snapshot.history.completed_rows + 1;
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(spacing * 10.0, spacing * visible_rows as f32),
+        egui::Sense::hover(),
+    );
+    let radius = spacing * 0.20;
+    for (row_index, row) in snapshot.history.rows.iter().take(visible_rows).enumerate() {
+        for (column, speaker) in row.iter().enumerate() {
+            let center = rect.min
+                + vec2(
+                    (column as f32 + 0.5) * spacing,
+                    (row_index as f32 + 0.5) * spacing,
+                );
+            let color = speaker.map_or(Color32::from_rgb(61, 85, 83), speaker_color);
+            let latest_row = usize::from(snapshot.last_number == 10);
+            let latest = snapshot.last_number != 0
+                && row_index == latest_row
+                && column + 1 == usize::from(snapshot.last_number);
+            if latest {
+                ui.painter().circle_stroke(
+                    center,
+                    radius + 3.0,
+                    Stroke::new(1.0, color.gamma_multiply(0.45)),
+                );
+            }
+            ui.painter().circle_filled(
+                center,
+                if speaker.is_some() {
+                    radius
+                } else {
+                    radius * 0.6
+                },
+                color,
+            );
+            let name = match speaker {
+                Some(Speaker::You) => "You",
+                Some(Speaker::Companion(index)) => NAMES[*index],
+                None => "Not counted",
+            };
+            let round = if row_index == 0 {
+                "Current round".to_owned()
+            } else if row_index == 1 {
+                "Previous round".to_owned()
+            } else {
+                format!("{row_index} rounds ago")
+            };
+            ui.interact(
+                egui::Rect::from_center_size(center, vec2(spacing, spacing)),
+                ui.id().with(("count-history", row_index, column)),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(format!("{round} · {} · {name}", column + 1));
+        }
+    }
+}
+
 fn clock(seconds: f64) -> String {
     let total = seconds.ceil().max(0.0) as u64;
     format!("{}:{:02}", total / 60, total % 60)

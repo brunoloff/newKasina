@@ -99,11 +99,31 @@ pub enum Event {
     Bell,
 }
 
+/// The current round followed by up to nine completed rounds, newest first.
+/// Unheard/skipped numbers stay neutral rather than inventing a speaker for them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CountHistory {
+    pub rows: [[Option<Speaker>; 10]; 10],
+    pub completed_rows: usize,
+}
+
+impl CountHistory {
+    fn record(&mut self, number: u8, speaker: Speaker) {
+        self.rows[0][usize::from(number - 1)] = Some(speaker);
+        if number == 10 {
+            self.rows.rotate_right(1);
+            self.rows[0] = [None; 10];
+            self.completed_rows = (self.completed_rows + 1).min(9);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub phase: Phase,
     pub last_number: u8,
     pub last_speaker: Option<Speaker>,
+    pub history: CountHistory,
     pub elapsed_seconds: f64,
     pub remaining_seconds: f64,
     pub breath_phase: [f64; 4],
@@ -120,6 +140,7 @@ pub struct Engine {
     last_tick: f64,
     last_number: u8,
     last_speaker: Option<Speaker>,
+    history: CountHistory,
     phases: [f64; 4],
     pending: [Option<f64>; 4],
     variation: [f64; 4],
@@ -140,6 +161,7 @@ impl Engine {
             last_tick: 0.0,
             last_number: 0,
             last_speaker: None,
+            history: CountHistory::default(),
             phases: [0.72, 0.30, 0.51, 0.06],
             pending: [None; 4],
             variation: [1.0; 4],
@@ -269,12 +291,14 @@ impl Engine {
     pub fn reset_count(&mut self) {
         self.last_number = 0;
         self.last_speaker = None;
+        self.history.rows[0] = [None; 10];
         // Keep recent spoken numbers in the echo guard while their room echo decays.
     }
 
     fn commit(&mut self, number: u8, speaker: Speaker, now: f64) {
         self.last_number = number;
         self.last_speaker = Some(speaker);
+        self.history.record(number, speaker);
         self.turns += 1;
         self.next_voice_at = now + 0.75;
     }
@@ -284,6 +308,7 @@ impl Engine {
             phase: self.phase,
             last_number: self.last_number,
             last_speaker: self.last_speaker,
+            history: self.history.clone(),
             elapsed_seconds: if self.phase == Phase::Ready {
                 0.0
             } else {
@@ -305,6 +330,61 @@ impl Engine {
 mod tests {
     use super::*;
     #[test]
+    fn history_tracks_speakers_and_keeps_only_nine_completed_rounds() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        assert_eq!(engine.snapshot(0.0).history, CountHistory::default());
+        let mut expected = Vec::new();
+        for round in 0..12 {
+            let mut row = [None; 10];
+            for number in 1..=10 {
+                let speaker = if (round + number) % 3 == 0 {
+                    Speaker::You
+                } else {
+                    Speaker::Companion((round + number) % 4)
+                };
+                engine.commit(number as u8, speaker, (round * 10 + number) as f64);
+                row[number - 1] = Some(speaker);
+                if number < 10 {
+                    assert_eq!(engine.snapshot(0.0).history.rows[0], row);
+                }
+            }
+            expected.insert(0, row);
+            expected.truncate(9);
+            let history = engine.snapshot(0.0).history;
+            assert_eq!(history.rows[0], [None; 10]);
+            assert_eq!(history.completed_rows, expected.len());
+            assert_eq!(&history.rows[1..=expected.len()], expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn history_handles_recognition_resync_reset_resume_and_new_sessions() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        engine.manual_count(1.0);
+        // A resynchronizing number must not assign invented speakers to skipped dots.
+        engine.heard(10, 2.0, 2.5).unwrap();
+        let completed = engine.snapshot(2.5).history;
+        assert_eq!(completed.rows[1][0], Some(Speaker::You));
+        assert_eq!(completed.rows[1][9], Some(Speaker::You));
+        assert_eq!(&completed.rows[1][1..9], &[None; 8]);
+        assert!(engine.heard(10, 2.6, 2.9).is_none());
+        assert_eq!(engine.snapshot(2.9).history, completed);
+        engine.manual_count(3.0);
+        engine.reset_count();
+        assert_eq!(engine.snapshot(3.0).history, completed);
+        engine.manual_count(4.0);
+        let before_bell = engine.snapshot(4.0).history;
+        assert_eq!(engine.tick(600.0, true), Some(Event::Bell));
+        engine.extend(610.0);
+        assert_eq!(engine.snapshot(610.0).history, before_bell);
+        engine.stop();
+        engine.start(620.0);
+        assert_eq!(engine.snapshot(620.0).history, CountHistory::default());
+    }
+
+    #[test]
     fn human_and_companions_share_counter_and_wrap() {
         let mut engine = Engine::new(Settings::default());
         engine.start(0.0);
@@ -313,10 +393,14 @@ mod tests {
             engine.manual_count(time as f64);
         }
         assert_eq!(engine.snapshot(10.0).last_number, 10);
-        assert!(matches!(
-            engine.tick(11.0, false),
-            Some(Event::Count { number: 1, .. })
-        ));
+        let Some(Event::Count { number: 1, speaker }) = engine.tick(11.0, false) else {
+            panic!("Expected a companion to wrap to one");
+        };
+        assert_eq!(engine.snapshot(11.0).history.rows[0][0], Some(speaker));
+        assert_eq!(
+            engine.snapshot(11.0).history.rows[1],
+            [Some(Speaker::You); 10]
+        );
     }
     #[test]
     fn deadline_wins_over_a_pending_voice_and_bell_is_once() {

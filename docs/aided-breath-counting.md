@@ -11,6 +11,14 @@ pattern has three editable points (start, halfway, settled), joined by smooth
 curves over a configurable settling time. Small cycle-to-cycle variations keep
 them from becoming a metronome. Their rings show their own rhythms.
 
+The dot matrix keeps the current round at the top and up to nine completed rounds
+below it. Each count takes its speaker's color (your counts are rose; companions
+match their rings). Ten moves the completed row down and clears the top row;
+the oldest row drops away once the matrix is full. Hover over a dot to see its
+number and speaker. Unheard numbers stay neutral if recognition skips ahead.
+Resetting clears only the current row; adding time preserves the history, while
+starting a new session clears it.
+
 **I counted** or **Space** adds the next number manually. Space works while the
 counting tab is open. **Reset to 1** means the next count will be one. A recognized
 number also repairs the shared counter if a previous count was missed.
