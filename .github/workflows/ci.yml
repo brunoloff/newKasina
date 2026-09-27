@@ -43,6 +43,11 @@ jobs:
         run: |
           "CARGO_BUILD_TARGET=${{ matrix.rust_target }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Match the speech engine's C/C++ runtime to Rust's bundled runtime.
+          "CMAKE_POLICY_DEFAULT_CMP0091=NEW" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_C_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /MT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /MT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
