@@ -53,10 +53,28 @@ jobs:
         if: runner.os == 'Linux'
         run: >-
           sudo apt-get update && sudo apt-get install -y
-          cmake libasound2-dev libdbus-1-dev libudev-dev libwayland-dev
+          cmake libclang-dev libasound2-dev libdbus-1-dev libudev-dev libwayland-dev
           libgtk-3-dev libayatana-appindicator3-dev
           libx11-dev libxcursor-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-0 libxrandr-dev
           xvfb mesa-vulkan-drivers libgl1-mesa-dri
+      - name: Locate libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $clangDir = "C:\Program Files\LLVM\bin"
+          if (!(Test-Path "$clangDir\libclang.dll")) { choco install llvm --yes --no-progress }
+          if (!(Test-Path "$clangDir\libclang.dll")) { throw "LLVM libclang.dll is missing" }
+          "LIBCLANG_PATH=$clangDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Locate libclang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          clang_lib="$(dirname "$(xcrun --find clang)")/../lib"
+          test -f "$clang_lib/libclang.dylib"
+          echo "LIBCLANG_PATH=$clang_lib" >> "$GITHUB_ENV"
+      # The upstream build does not track its binding-generation environment.
+      # Keep other cached crates, but never reuse a copied Linux ABI on Windows/macOS.
+      - name: Regenerate native speech bindings after cache restore
+        run: cargo clean -p whisper-rs-sys
       - name: Validate packaging resources
         run: python scripts/package-desktop.py --check
       - run: cargo fmt --all --check

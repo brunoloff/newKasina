@@ -7,7 +7,7 @@ No external Python modules, signing credentials, or packaging frameworks are nee
 
 import argparse
 import hashlib
-import importlib.util
+import runpy
 import json
 import os
 from pathlib import Path
@@ -78,10 +78,8 @@ def check_resources():
 
 
 def bundle_speech_model(resources):
-    spec = importlib.util.spec_from_file_location("speech_model", ROOT / "scripts/fetch-speech-model.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    model = module.fetch()
+    downloader = runpy.run_path(str(ROOT / "scripts/fetch-speech-model.py"))
+    model = downloader["fetch"]()
     destination = resources / "models"
     destination.mkdir(parents=True, exist_ok=True)
     shutil.copy2(model, destination / model.name)

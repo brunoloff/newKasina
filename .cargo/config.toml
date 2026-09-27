@@ -1,7 +1,6 @@
 [env]
 # Portable CPU binaries, including builds produced on newer CI machines.
 GGML_NATIVE = "OFF"
-WHISPER_DONT_GENERATE_BINDINGS = "1"
 # Keep the x86_64 baseline usable on CPUs without AVX2 (Apple Silicon uses NEON).
 GGML_AVX = "OFF"
 GGML_AVX2 = "OFF"

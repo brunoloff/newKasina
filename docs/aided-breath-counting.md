@@ -57,7 +57,9 @@ scripts/cargo-local run -p kasina-app
 The one-time download goes to Hugging Face; SHA-256 and size are checked before
 loading. The model manifest and licensing notice are under
 `crates/kasina-counting/assets`. Building the speech engine requires CMake and a
-C++ compiler; no Python, eSpeak, or external speech executable is required to run
+C++ compiler and libclang (LLVM). Native bindings must be generated for the host
+platform; the speech dependency’s pre-generated Linux bindings cannot be used
+on Windows. No Python, eSpeak, or external speech executable is required to run
 the packaged app. The generated companion recordings are compiled into the app.
 
 The reusable `kasina-counting` crate owns the session engine, audio capture and
