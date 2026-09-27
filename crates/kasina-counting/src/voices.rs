@@ -61,6 +61,24 @@ pub fn number(voice: usize, number: u8) -> Result<Vec<f32>> {
         .map(|sample| sample as f32 / 32768.0)
         .collect())
 }
+/// Mix companions on the same number at equal gain, with headroom for all voices.
+pub fn together(speakers: crate::engine::Speakers, count: u8) -> Result<Vec<f32>> {
+    let clips = speakers
+        .iter()
+        .filter_map(|speaker| match speaker {
+            crate::engine::Speaker::Companion(index) => Some(number(index, count)),
+            crate::engine::Speaker::You => None,
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut mixed = vec![0.0; clips.iter().map(Vec::len).max().unwrap_or(0)];
+    let gain = 1.0 / clips.len().max(1) as f32;
+    for clip in clips {
+        for (out, sample) in mixed.iter_mut().zip(clip) {
+            *out += sample * gain;
+        }
+    }
+    Ok(mixed)
+}
 pub fn bell() -> Vec<f32> {
     (0..48000)
         .map(|i| {

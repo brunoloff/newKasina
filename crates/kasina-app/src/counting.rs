@@ -1,6 +1,6 @@
 use egui::{Color32, RichText, Stroke, pos2, vec2};
 use kasina_counting::{
-    engine::{Phase, Settings, Snapshot, Speaker},
+    engine::{Phase, Settings, Snapshot, Speaker, Speakers},
     model,
     runtime::{Command, Controller, Status},
 };
@@ -109,8 +109,9 @@ impl CountingPanel {
                 ui.vertical_centered(|ui| {
                     let number=if state.snapshot.last_number==0 {"—".into()} else {state.snapshot.last_number.to_string()};
                     ui.label(RichText::new(number).size(104.0).color(Color32::from_rgb(230,242,237)));
-                    let speaker=match state.snapshot.last_speaker { Some(Speaker::You)=>"You".into(), Some(Speaker::Companion(index))=>NAMES[index].into(), None=>"Breathe naturally; join whenever you wish".to_owned() };
-                    ui.label(RichText::new(speaker).size(16.0).color(state.snapshot.last_speaker.map_or(MINT, speaker_color)));
+                    let speakers = state.snapshot.last_speakers;
+                    let speaker = if speakers.is_empty() { "Breathe naturally; join whenever you wish".to_owned() } else { speaker_names(speakers) };
+                    ui.label(RichText::new(speaker).size(16.0).color(if speakers.len() == 1 { speaker_color(speakers.iter().next().unwrap()) } else { Color32::from_rgb(230,242,237) }));
                     ui.add_space(10.0);
                     count_history(ui, &state.snapshot);
                 });
@@ -246,46 +247,94 @@ fn speaker_color(speaker: Speaker) -> Color32 {
     }
 }
 
+fn speaker_names(speakers: Speakers) -> String {
+    speakers
+        .iter()
+        .map(|speaker| match speaker {
+            Speaker::You => "You",
+            Speaker::Companion(index) => NAMES[index],
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn count_circle(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    speakers: Speakers,
+    latest: bool,
+) {
+    if latest {
+        painter.circle_stroke(
+            center,
+            radius + 3.0,
+            Stroke::new(1.0, Color32::from_rgb(163, 192, 187)),
+        );
+    }
+    if speakers.is_empty() {
+        painter.circle_filled(center, radius, Color32::from_rgb(42, 61, 63));
+        painter.circle_stroke(
+            center,
+            radius,
+            Stroke::new(0.8, Color32::from_rgb(61, 85, 83)),
+        );
+    } else if speakers.len() == 1 {
+        painter.circle_filled(
+            center,
+            radius,
+            speaker_color(speakers.iter().next().unwrap()),
+        );
+    } else {
+        let angle = std::f32::consts::TAU / speakers.len() as f32;
+        for (slice, speaker) in speakers.iter().enumerate() {
+            let start = -std::f32::consts::FRAC_PI_2 + slice as f32 * angle;
+            let steps = (64 / speakers.len()).max(8);
+            let mut points = vec![center];
+            points.extend((0..=steps).map(|step| {
+                let theta = start + angle * step as f32 / steps as f32;
+                center + radius * vec2(theta.cos(), theta.sin())
+            }));
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                speaker_color(speaker),
+                Stroke::NONE,
+            ));
+        }
+        for slice in 0..speakers.len() {
+            let theta = -std::f32::consts::FRAC_PI_2 + slice as f32 * angle;
+            painter.line_segment(
+                [center, center + radius * vec2(theta.cos(), theta.sin())],
+                Stroke::new(0.7, INK),
+            );
+        }
+    }
+}
+
 fn count_history(ui: &mut egui::Ui, snapshot: &Snapshot) {
-    let spacing = 22.0_f32.min(ui.available_width() / 10.0);
+    let spacing = 30.0_f32.min(ui.available_width() / 10.0);
     let visible_rows = snapshot.history.completed_rows + 1;
     let (rect, _) = ui.allocate_exact_size(
         vec2(spacing * 10.0, spacing * visible_rows as f32),
         egui::Sense::hover(),
     );
-    let radius = spacing * 0.20;
+    let radius = spacing / 3.0;
     for (row_index, row) in snapshot.history.rows.iter().take(visible_rows).enumerate() {
-        for (column, speaker) in row.iter().enumerate() {
+        for (column, speakers) in row.iter().enumerate() {
             let center = rect.min
                 + vec2(
                     (column as f32 + 0.5) * spacing,
                     (row_index as f32 + 0.5) * spacing,
                 );
-            let color = speaker.map_or(Color32::from_rgb(61, 85, 83), speaker_color);
             let latest_row = usize::from(snapshot.last_number == 10);
             let latest = snapshot.last_number != 0
                 && row_index == latest_row
                 && column + 1 == usize::from(snapshot.last_number);
-            if latest {
-                ui.painter().circle_stroke(
-                    center,
-                    radius + 3.0,
-                    Stroke::new(1.0, color.gamma_multiply(0.45)),
-                );
-            }
-            ui.painter().circle_filled(
-                center,
-                if speaker.is_some() {
-                    radius
-                } else {
-                    radius * 0.6
-                },
-                color,
-            );
-            let name = match speaker {
-                Some(Speaker::You) => "You",
-                Some(Speaker::Companion(index)) => NAMES[*index],
-                None => "Not counted",
+            count_circle(ui.painter(), center, radius, *speakers, latest);
+            let name = if speakers.is_empty() {
+                "Not counted".into()
+            } else {
+                speaker_names(*speakers)
             };
             let round = if row_index == 0 {
                 "Current round".to_owned()

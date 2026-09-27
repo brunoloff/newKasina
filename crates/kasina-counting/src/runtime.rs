@@ -1,11 +1,10 @@
 use crate::{
     audio::{Audio, Frame},
-    dsp::VoiceDetector,
-    engine::{Engine, Event, Phase, Settings, Snapshot, Speaker},
+    dsp::{EchoEvidence, VoiceDetector, capture_frame, echo_canceller},
+    engine::{Engine, Event, Phase, Settings, Snapshot},
     speech::Recognizer,
     voices,
 };
-use aec3::{nodes::audio::AudioFormat, pipelines::linear};
 use anyhow::{Context, Result};
 use std::{
     path::PathBuf,
@@ -160,28 +159,24 @@ fn session(
         return Ok(());
     }
     let mut audio = Audio::open().context("Open counting audio")?;
-    let format = AudioFormat::ten_ms(16000, 1);
-    let mut aec = linear::builder(format, format)
-        .initial_delay_ms(60)
-        .enable_gain_controller2(false)
-        .build()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let (jobs, receive_jobs) = mpsc::sync_channel::<(u64, f64, Vec<f32>)>(1);
+    let mut aec = echo_canceller()?;
+    let (jobs, receive_jobs) = mpsc::sync_channel::<(u64, f64, bool, Vec<f32>)>(1);
     let (results, receive_results) = mpsc::channel();
     let cancel = cancelled.clone();
     let inference = thread::spawn(move || {
-        while let Ok((generation, started, samples)) = receive_jobs.recv() {
+        while let Ok((generation, started, independent, samples)) = receive_jobs.recv() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let result = recognizer.recognize(&samples, cancel.clone());
-            let _ = results.send((generation, started, result));
+            let _ = results.send((generation, started, independent, result));
         }
     });
     let origin = Instant::now();
     let mut engine = Engine::new(settings.clone());
     engine.start(0.0);
     let mut detector = VoiceDetector::new(settings.microphone_threshold);
+    let mut evidence = EchoEvidence::default();
     let mut in_flight = false;
     let mut generation = 0_u64;
     let mut recognition_floor = 0.0;
@@ -220,6 +215,7 @@ fn session(
                         if engine.snapshot(now).phase == Phase::Quiet {
                             audio.open_microphone()?;
                             audio.clear();
+                            evidence = EchoEvidence::default();
                             aec.reset_aec3()
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                             detector = VoiceDetector::new(settings.microphone_threshold);
@@ -257,6 +253,7 @@ fn session(
             while let Ok(frame) = audio.frames.try_recv() {
                 match frame {
                     Frame::Render(frame) => {
+                        evidence.render(&frame);
                         if settings.speakers {
                             aec.handle_render_frame(&frame)
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -268,22 +265,26 @@ fn session(
                         if now - captured.saturating_duration_since(origin).as_secs_f64() > 0.3 {
                             continue;
                         }
-                        let mut cleaned = frame;
-                        if settings.speakers
-                            && !aec
-                                .process_capture_frame(&frame, &mut cleaned)
-                                .map_err(|e| anyhow::anyhow!(e.to_string()))?
-                        {
-                            continue;
-                        }
+                        let independent = !settings.speakers || evidence.independent(&frame);
+                        let cleaned = if settings.speakers {
+                            let Some(cleaned) = capture_frame(&mut aec, &frame, independent)?
+                            else {
+                                continue;
+                            };
+                            cleaned
+                        } else {
+                            frame
+                        };
                         if let Some(utterance) = detector.push(
                             &cleaned,
                             captured.saturating_duration_since(origin).as_secs_f64(),
+                            independent,
                         ) && !in_flight
                             && jobs
                                 .try_send((
                                     generation,
                                     utterance.started.max(0.0),
+                                    utterance.independent_voice,
                                     utterance.samples,
                                 ))
                                 .is_ok()
@@ -297,7 +298,9 @@ fn session(
                     }
                 }
             }
-            while let Ok((result_generation, started, result)) = receive_results.try_recv() {
+            while let Ok((result_generation, started, independent, result)) =
+                receive_results.try_recv()
+            {
                 if result_generation != generation {
                     continue;
                 }
@@ -308,7 +311,7 @@ fn session(
                     continue;
                 }
                 if let Some(number) = result.number {
-                    if engine.heard(number, started, now).is_some() {
+                    if engine.heard(number, started, now, independent).is_some() {
                         shared.lock().unwrap_or_else(|p| p.into_inner()).notice =
                             format!("Heard you count {number}");
                     }
@@ -317,14 +320,11 @@ fn session(
                         "Count not clear · say a number again, or press Space".into();
                 }
             }
-            if let Some(Event::Count {
-                number,
-                speaker: Speaker::Companion(index),
-            }) = engine.tick(
+            if let Some(Event::Count { number, speakers }) = engine.tick(
                 now,
                 audio.busy() || detector.busy() || in_flight || now < quiet_until,
             ) {
-                audio.play(&voices::number(index, number)?, settings.volume);
+                audio.play(&voices::together(speakers, number)?, settings.volume);
             }
             {
                 let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());

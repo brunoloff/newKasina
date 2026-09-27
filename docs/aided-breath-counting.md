@@ -11,13 +11,22 @@ pattern has three editable points (start, halfway, settled), joined by smooth
 curves over a configurable settling time. Small cycle-to-cycle variations keep
 them from becoming a metronome. Their rings show their own rhythms.
 
-The dot matrix keeps the current round at the top and up to nine completed rounds
+The circle matrix keeps the current round at the top and up to nine completed rounds
 below it. Each count takes its speaker's color (your counts are rose; companions
 match their rings). Ten moves the completed row down and clears the top row;
-the oldest row drops away once the matrix is full. Hover over a dot to see its
-number and speaker. Unheard numbers stay neutral if recognition skips ahead.
+the oldest row drops away once the matrix is full. Hover over a circle to see its
+number and everyone who counted it. Unheard numbers stay neutral if recognition skips ahead.
 Resetting clears only the current row; adding time preserves the history, while
 starting a new session clears it.
+
+When people count the same number together, its circle has equal colored slices,
+one per person. Repeated recognition never adds a second slice for the same
+person or advances the shared count. Companions finishing within a quarter-second
+count together, with their voices mixed. Your recognized number can join a
+companion's count when your voice starts within 0.45 seconds of it; recognition
+may finish later, even after a completed ten has moved to the next row. A later
+repetition of the same number is ignored. “You” represents the microphone user;
+this does not identify multiple real people sharing a microphone.
 
 **I counted** or **Space** adds the next number manually. Space works while the
 counting tab is open. **Reset to 1** means the next count will be one. A recognized
@@ -34,9 +43,13 @@ Closing the app stops all counting audio and microphone capture.
 
 Speaker mode is enabled by default. The app sends its actual output signal to
 local acoustic echo cancellation before detecting and recognizing your speech.
-Companions wait while speech is detected or recognition is pending. A further
-counter check rejects recently spoken companion numbers returning as room echo.
-This reduces self-counting; very loud speakers, room reverberation, other apps'
+Companions wait while speech is detected or recognition is pending. To accept a
+shared count in speaker mode, the app also checks for voice energy distinct from
+its recent output; echo alone should not earn a “You” slice. During detected
+independent speech it preserves the linear echo-subtracted signal, avoiding the
+stronger suppression that can erase overlapping syllables. Other repetitions of
+recent companion numbers remain guarded against room echo. These checks reduce
+self-counting; very loud speakers, room reverberation, other apps'
 audio, and simultaneous speech can still cause missed or incorrect recognition.
 These conditions need testing with your own room and microphone.
 
@@ -82,6 +95,9 @@ Automated checks do not open sound devices:
 scripts/cargo-local test -p kasina-counting
 scripts/cargo-local run -p kasina-counting --example recognize-fixtures -- \
   target/speech-models/ggml-tiny.en-q5_1.bin
+# After downloading the model, test overlapping voices and pure echo offline:
+scripts/cargo-local test -p kasina-counting \
+  recognizes_same_number_during_simulated_speaker_playback -- --ignored
 ```
 
 The tests cover timing, wrapping, independent rhythms, expiry and resumption,
