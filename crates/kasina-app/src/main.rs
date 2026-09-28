@@ -247,7 +247,8 @@ enum NetworkCommand {
     SetThoughtStreamPort(Option<String>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum View {
     Service,
     Dashboard,
@@ -258,6 +259,47 @@ enum View {
     Visualizer,
     Diagnostics,
     Settings,
+}
+
+impl View {
+    const ALL: [Self; 9] = [
+        Self::Service,
+        Self::Dashboard,
+        Self::Raw,
+        Self::BreathKasina,
+        Self::ThoughtStream,
+        Self::AidedCounting,
+        Self::Visualizer,
+        Self::Diagnostics,
+        Self::Settings,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Service => "Measurement service",
+            Self::Dashboard => "Dashboard",
+            Self::Raw => "Raw signals",
+            Self::BreathKasina => "Breath kasina",
+            Self::ThoughtStream => "ThoughtStream",
+            Self::AidedCounting => "Aided breath counting",
+            Self::Visualizer => "GPU stress test",
+            Self::Diagnostics => "Diagnostics",
+            Self::Settings => "Settings",
+        }
+    }
+
+    fn visible(self, tabs: &settings::TabVisibility) -> bool {
+        match self {
+            Self::Service | Self::Settings => true,
+            Self::Dashboard => tabs.dashboard,
+            Self::Raw => tabs.raw_signals,
+            Self::BreathKasina => tabs.breath_kasina,
+            Self::ThoughtStream => tabs.thoughtstream,
+            Self::AidedCounting => tabs.aided_counting,
+            Self::Visualizer => tabs.gpu_stress_test,
+            Self::Diagnostics => tabs.diagnostics,
+        }
+    }
 }
 
 fn repaint_interval(
@@ -1110,12 +1152,10 @@ impl KasinaApp {
             _smoke_directory: smoke_directory,
             view: if benchmark.is_some() {
                 View::Visualizer
-            } else if args.smoke_test_seconds.is_some() || !cfg!(target_os = "linux") {
+            } else if args.smoke_test_seconds.is_some() {
                 View::Service
-            } else if settings.visible_tabs.breath_kasina {
-                View::BreathKasina
             } else {
-                View::Settings
+                settings.tab_startup.resolve(&settings.visible_tabs)
             },
             events,
             network_commands,
@@ -1300,6 +1340,7 @@ impl KasinaApp {
     }
 
     fn navigation(&mut self, ui: &mut egui::Ui) {
+        let previous = self.view;
         egui::Panel::left("navigation")
             .resizable(false)
             .default_size(162.0)
@@ -1344,6 +1385,10 @@ impl KasinaApp {
                     }
                 }
             });
+        if self.view != previous {
+            self.settings.tab_startup.last = self.view;
+            self.mark_settings_changed(ui.ctx());
+        }
     }
 
     fn service_connected(&self) -> bool {
@@ -1900,7 +1945,43 @@ impl KasinaApp {
         ui.separator();
         ui.add_space(12.0);
 
-        ui.heading("Visible tabs");
+        ui.heading("Tabs");
+        ui.label("When the app opens");
+        ui.horizontal(|ui| {
+            changed |= ui
+                .radio_value(
+                    &mut self.settings.tab_startup.restore_last,
+                    false,
+                    "Open a fixed tab",
+                )
+                .changed();
+            changed |= ui
+                .radio_value(
+                    &mut self.settings.tab_startup.restore_last,
+                    true,
+                    "Resume the last tab",
+                )
+                .changed();
+        });
+        if !self.settings.tab_startup.restore_last {
+            egui::ComboBox::from_id_salt("startup_tab")
+                .selected_text(self.settings.tab_startup.fixed.label())
+                .show_ui(ui, |ui| {
+                    for view in View::ALL {
+                        if view.visible(&self.settings.visible_tabs) {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.settings.tab_startup.fixed,
+                                    view,
+                                    view.label(),
+                                )
+                                .changed();
+                        }
+                    }
+                });
+        }
+        ui.weak("If the chosen tab is hidden, Measurement service opens instead.");
+        ui.add_space(10.0);
         ui.label("Choose the tools that appear in the left tab bar.");
         egui::Grid::new("visible_tabs_settings")
             .num_columns(2)
@@ -2805,6 +2886,9 @@ impl eframe::App for KasinaApp {
 
 impl Drop for KasinaApp {
     fn drop(&mut self) {
+        if self.smoke.is_none() && self.benchmark.is_none() {
+            self.settings.tab_startup.last = self.view;
+        }
         self.counting.stop();
         self.cancellation.cancel();
         self.service_host.finish();

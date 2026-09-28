@@ -9,7 +9,45 @@ use anyhow::{Context as _, Result, bail};
 use kasina_render::{AuroraVortex, KasinaVisual, LuminousMandala, OrganicKaleidoscope, PaperDisk};
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 10;
+const SETTINGS_SCHEMA_VERSION: u32 = 11;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TabStartup {
+    pub restore_last: bool,
+    pub fixed: crate::View,
+    pub last: crate::View,
+}
+
+impl Default for TabStartup {
+    fn default() -> Self {
+        let initial = if cfg!(target_os = "linux") {
+            crate::View::BreathKasina
+        } else {
+            crate::View::Service
+        };
+        Self {
+            restore_last: false,
+            fixed: initial,
+            last: initial,
+        }
+    }
+}
+
+impl TabStartup {
+    pub fn resolve(&self, visible: &TabVisibility) -> crate::View {
+        let selected = if self.restore_last {
+            self.last
+        } else {
+            self.fixed
+        };
+        if selected.visible(visible) {
+            selected
+        } else {
+            crate::View::Service
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -96,6 +134,7 @@ pub(crate) struct AppSettings {
     pub thoughtstream: crate::thoughtstream::ThoughtStreamSettings,
     pub aided_counting: kasina_counting::engine::Settings,
     pub visible_tabs: TabVisibility,
+    pub tab_startup: TabStartup,
     pub active_preset_id: u64,
     pub next_preset_id: u64,
     pub presets: Vec<KasinaPreset>,
@@ -262,6 +301,7 @@ impl Default for AppSettings {
             thoughtstream: Default::default(),
             aided_counting: Default::default(),
             visible_tabs: TabVisibility::default(),
+            tab_startup: TabStartup::default(),
             active_preset_id: 1,
             next_preset_id: 7,
             presets: vec![
@@ -436,6 +476,42 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn startup_tabs_restore_visible_choices_and_handle_legacy_settings() {
+        use crate::View;
+        let mut settings = AppSettings::default();
+        settings.tab_startup.fixed = View::ThoughtStream;
+        settings.tab_startup.last = View::AidedCounting;
+        assert_eq!(
+            settings.tab_startup.resolve(&settings.visible_tabs),
+            View::ThoughtStream
+        );
+        settings.tab_startup.restore_last = true;
+        assert_eq!(
+            settings.tab_startup.resolve(&settings.visible_tabs),
+            View::AidedCounting
+        );
+        settings.visible_tabs.aided_counting = false;
+        assert_eq!(
+            settings.tab_startup.resolve(&settings.visible_tabs),
+            View::Service
+        );
+        settings.tab_startup.restore_last = false;
+        settings.visible_tabs.thoughtstream = false;
+        assert_eq!(
+            settings.tab_startup.resolve(&settings.visible_tabs),
+            View::Service
+        );
+
+        let mut legacy = serde_json::to_value(&settings).unwrap();
+        legacy["schema_version"] = serde_json::json!(10);
+        legacy.as_object_mut().unwrap().remove("tab_startup");
+        let restored: AppSettings = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.tab_startup.restore_last);
+        assert_eq!(restored.tab_startup.fixed, TabStartup::default().fixed);
+        assert!(!restored.visible_tabs.thoughtstream);
+    }
+
+    #[test]
     fn schema_nine_gains_counting_without_changing_existing_preferences() {
         let mut encoded = serde_json::to_value(AppSettings::default()).unwrap();
         encoded["schema_version"] = serde_json::json!(9);
@@ -535,10 +611,19 @@ mod tests {
         let mut settings = AppSettings::default();
         write_atomically(&path, &settings).unwrap();
         settings.visible_tabs.diagnostics = true;
+        settings.tab_startup.restore_last = true;
+        settings.tab_startup.fixed = crate::View::ThoughtStream;
+        settings.tab_startup.last = crate::View::Diagnostics;
         write_atomically(&path, &settings).unwrap();
 
         let loaded = AppSettings::load(&path).unwrap();
         assert!(loaded.visible_tabs.diagnostics);
+        assert!(loaded.tab_startup.restore_last);
+        assert_eq!(loaded.tab_startup.fixed, crate::View::ThoughtStream);
+        assert_eq!(
+            loaded.tab_startup.resolve(&loaded.visible_tabs),
+            crate::View::Diagnostics
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
