@@ -8,8 +8,14 @@ counter: 1 through 10, then 1 again. Breathe at your own comfortable pace.
 The companions have separate breathing rhythms; their turns are not round-robin.
 Each has a different generated voice and a cycle-length multiplier. The breathing
 pattern has three editable points (start, halfway, settled), joined by smooth
-curves over a configurable settling time. Small cycle-to-cycle variations keep
-them from becoming a metronome. Their rings show their own rhythms. Correcting
+curves over a configurable settling time. Each companion has a **Standard deviation**
+setting in seconds: each new breath duration is sampled from a Gaussian centered
+on the current curve value multiplied by that companion's pace. For example,
+a mean of 6 seconds with a deviation of 0.5 seconds gives about 68% of breaths
+between 5.5 and 6.5 seconds. Zero (the default) disables random variation.
+Draws below 0.5 seconds are resampled, so large deviations produce a truncated
+Gaussian rather than impossible negative durations. The sampled duration stays
+fixed for that breath; their rings and displayed seconds show that actual sample. Correcting
 the count, including saying a lower number, keeps those rhythms running: a
 companion already waiting can take the next turn as soon as recognition finishes,
 while others still wait for their next outbreath. Recognition time counts toward

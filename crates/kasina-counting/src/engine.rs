@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::hash::BuildHasher;
 
 /// Breath-cycle lengths at the beginning, midpoint and end of the settling curve.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -10,6 +11,7 @@ pub struct Settings {
     pub settling_minutes: f64,
     pub cycle_seconds: [f64; 3],
     pub pace: [f64; 4],
+    pub standard_deviation_seconds: [f64; 4],
     pub volume: f32,
     pub microphone_threshold: f32,
     pub speakers: bool,
@@ -25,6 +27,7 @@ impl Default for Settings {
             settling_minutes: 15.0,
             cycle_seconds: [5.0, 7.0, 9.0],
             pace: [0.85, 1.05, 1.22, 0.96],
+            standard_deviation_seconds: [0.0; 4],
             volume: 0.55,
             microphone_threshold: 0.008,
             speakers: true,
@@ -55,6 +58,9 @@ impl Settings {
         }
         for (value, fallback) in self.pace.iter_mut().zip(default.pace) {
             *value = bounded(*value, fallback, 0.65, 1.5);
+        }
+        for value in &mut self.standard_deviation_seconds {
+            *value = bounded(*value, 0.0, 0.0, 30.0);
         }
         self.volume = bounded(self.volume as f64, default.volume as f64, 0.0, 1.0) as f32;
         self.microphone_threshold = bounded(
@@ -235,7 +241,7 @@ pub struct Engine {
     history: CountHistory,
     phases: [f64; 4],
     pending: [Option<f64>; 4],
-    variation: [f64; 4],
+    breath_seconds: [f64; 4],
     random: u64,
     next_voice_at: f64,
     recent_virtual: Vec<(u8, f64)>,
@@ -245,6 +251,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(mut settings: Settings) -> Self {
         settings.sanitize();
+        let breath_seconds = std::array::from_fn(|i| settings.cycle_at(0.0, i));
         Self {
             settings,
             phase: Phase::Ready,
@@ -256,8 +263,10 @@ impl Engine {
             history: CountHistory::default(),
             phases: [0.72, 0.30, 0.51, 0.06],
             pending: [None; 4],
-            variation: [1.0; 4],
-            random: 0x9327_185d_67b0_891f,
+            breath_seconds,
+            random: std::collections::hash_map::RandomState::new()
+                .hash_one("companion breathing")
+                .max(1),
             next_voice_at: 0.0,
             recent_virtual: Vec::new(),
             turns: 0,
@@ -271,6 +280,39 @@ impl Engine {
         self.last_tick = now;
         self.deadline = now + self.settings.duration_minutes * 60.0;
         self.next_voice_at = now + 1.0;
+        self.sample_all_cycles(0.0);
+    }
+
+    fn sample_all_cycles(&mut self, elapsed: f64) {
+        for index in 0..4 {
+            self.breath_seconds[index] = self.sample_cycle(elapsed, index);
+        }
+    }
+
+    fn uniform(&mut self) -> f64 {
+        self.random ^= self.random << 13;
+        self.random ^= self.random >> 7;
+        self.random ^= self.random << 17;
+        // Nonzero, 53-bit uniform input for the Box-Muller transform.
+        ((self.random >> 11) as f64 + 0.5) / (1_u64 << 53) as f64
+    }
+
+    fn sample_cycle(&mut self, elapsed: f64, index: usize) -> f64 {
+        let mean = self.settings.cycle_at(elapsed, index);
+        let deviation = self.settings.standard_deviation_seconds[index];
+        if deviation == 0.0 {
+            return mean;
+        }
+        // Truncate below half a second by resampling, rather than piling
+        // impossible negative/near-zero draws up at a clamped minimum.
+        loop {
+            let normal = (-2.0 * self.uniform().ln()).sqrt()
+                * (std::f64::consts::TAU * self.uniform()).cos();
+            let seconds = mean + deviation * normal;
+            if seconds >= 0.5 {
+                return seconds;
+            }
+        }
     }
 
     pub fn stop(&mut self) {
@@ -291,6 +333,7 @@ impl Engine {
             self.last_tick = now;
             self.pending = [None; 4];
             self.phases = [0.72, 0.30, 0.51, 0.06];
+            self.sample_all_cycles(now - self.started);
             self.next_voice_at = now + 1.0;
         }
         self.deadline = self.deadline.max(now) + self.settings.extension_minutes * 60.0;
@@ -319,16 +362,12 @@ impl Engine {
             if self.pending[index].is_some() {
                 continue;
             }
-            let cycle = self.settings.cycle_at(now - self.started, index) * self.variation[index];
+            let cycle = self.breath_seconds[index];
             self.phases[index] += dt.min(1.0) / cycle;
             if self.phases[index] >= 1.0 {
                 self.phases[index] %= 1.0;
                 self.pending[index] = Some(now - self.phases[index] * cycle);
                 self.phases[index] = 1.0;
-                self.random ^= self.random << 13;
-                self.random ^= self.random >> 7;
-                self.random ^= self.random << 17;
-                self.variation[index] = 0.97 + (self.random % 1000) as f64 * 0.00006;
             }
         }
         self.recent_virtual.retain(|(_, time)| now - time < 2.5);
@@ -354,6 +393,7 @@ impl Engine {
             {
                 self.pending[index] = None;
                 self.phases[index] = 0.0;
+                self.breath_seconds[index] = self.sample_cycle(now - self.started, index);
                 speakers.insert(Speaker::Companion(index));
             }
         }
@@ -474,7 +514,7 @@ impl Engine {
                 0.0
             },
             breath_phase: self.phases,
-            cycle_seconds: std::array::from_fn(|i| self.settings.cycle_at(now - self.started, i)),
+            cycle_seconds: self.breath_seconds,
             turns: self.turns,
         }
     }
@@ -483,6 +523,71 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gaussian_samples_match_each_companions_mean_and_standard_deviation() {
+        let mut engine = Engine::new(Settings {
+            cycle_seconds: [10.0; 3],
+            pace: [1.0; 4],
+            standard_deviation_seconds: [0.0, 0.3, 1.0, 2.0],
+            ..Settings::default()
+        });
+        engine.random = 0x9327_185d_67b0_891f;
+        for (index, deviation) in [0.0, 0.3, 1.0, 2.0].into_iter().enumerate() {
+            let samples: Vec<_> = (0..30_000)
+                .map(|_| engine.sample_cycle(0.0, index))
+                .collect();
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+            let sd = (samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                / samples.len() as f64)
+                .sqrt();
+            assert!((mean - 10.0).abs() < 0.04, "mean: {mean}");
+            assert!((sd - deviation).abs() < 0.04, "standard deviation: {sd}");
+            if deviation == 0.0 {
+                assert!(samples.iter().all(|sample| *sample == 10.0));
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_duration_is_held_until_the_next_breath_and_extreme_draws_are_safe() {
+        let mut engine = Engine::new(Settings {
+            companions: 1,
+            standard_deviation_seconds: [30.0; 4],
+            ..Settings::default()
+        });
+        engine.start(0.0);
+        engine.random = 12345;
+        for _ in 0..1000 {
+            let seconds = engine.sample_cycle(0.0, 0);
+            assert!(seconds.is_finite() && seconds >= 0.5);
+        }
+        let first = engine.snapshot(0.0).cycle_seconds;
+        for frame in 1..=100 {
+            engine.tick(frame as f64 / 100.0, true);
+            assert_eq!(engine.snapshot(frame as f64 / 100.0).cycle_seconds, first);
+        }
+        engine.pending[0] = Some(0.0);
+        assert!(engine.tick(1.1, false).is_some());
+        assert_ne!(engine.snapshot(1.1).cycle_seconds[0], first[0]);
+        assert_eq!(&engine.snapshot(1.1).cycle_seconds[1..], &first[1..]);
+    }
+
+    #[test]
+    fn deviation_settings_are_backward_compatible_saved_and_sanitized() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.standard_deviation_seconds, [0.0; 4]);
+        let mut settings = Settings {
+            standard_deviation_seconds: [0.0, 0.3, 1.0, 2.0],
+            ..Settings::default()
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored, settings);
+        settings.standard_deviation_seconds = [f64::NAN, -1.0, f64::INFINITY, 40.0];
+        settings.sanitize();
+        assert_eq!(settings.standard_deviation_seconds, [0.0, 0.0, 0.0, 30.0]);
+    }
+
     #[test]
     fn delayed_companion_starts_a_full_breath_after_speaking_without_catching_up() {
         for shared_counts in [false, true] {
@@ -505,7 +610,7 @@ mod tests {
             ));
             assert_eq!(engine.phases[0], 0.0);
             // Even after a long delay, there is no second count until another
-            // whole breath has elapsed (jitter can shorten it by at most 3%).
+            // whole breath has elapsed.
             for frame in 1501..1790 {
                 assert_eq!(engine.tick(frame as f64 / 100.0, false), None);
             }

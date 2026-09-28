@@ -196,8 +196,14 @@ impl CountingPanel {
                     });
                     ui.add_space(8.0);
                     for (index,name) in NAMES.iter().enumerate().take(settings.companions) {
-                        ui.horizontal(|ui|{ui.colored_label(COLORS[index],*name);ui.add(egui::Slider::new(&mut settings.pace[index],0.65..=1.5).text("cycle length ×"));});
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(COLORS[index], *name);
+                            ui.add(egui::Slider::new(&mut settings.pace[index], 0.65..=1.5).text("cycle length ×"));
+                            ui.label("Standard deviation");
+                            ui.add(egui::DragValue::new(&mut settings.standard_deviation_seconds[index]).range(0.0..=30.0).speed(0.05).suffix(" s"));
+                        });
                     }
+                    ui.weak("A new Gaussian duration is drawn each breath. 0 s means no random variation; draws below 0.5 s are retried.");
                 });
                 ui.add_space(12.0);
                 egui::CollapsingHeader::new("Sound & microphone").show(ui,|ui| {
