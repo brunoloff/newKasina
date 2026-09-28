@@ -13,7 +13,10 @@ them from becoming a metronome. Their rings show their own rhythms. Correcting
 the count, including saying a lower number, keeps those rhythms running: a
 companion already waiting can take the next turn as soon as recognition finishes,
 while others still wait for their next outbreath. Recognition time counts toward
-the gap between turns; it does not start an extra pause.
+the gap between turns; it does not start an extra pause. A companion held up by
+speech waits at the end of its breath and starts a fresh cycle when it actually
+counts, rather than catching up on missed cycles. Separate voice clips have at
+least 350 milliseconds of silence between them.
 
 The circle matrix reserves a fixed ten-row space from the start. The current
 round is at the top, with completed rounds below it. Once the space is full,

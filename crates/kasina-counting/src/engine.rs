@@ -314,11 +314,17 @@ impl Engine {
             self.next_voice_at = now + 0.8;
         }
         for index in 0..self.settings.companions {
+            // Hold at the end of this breath until its count can be spoken.
+            // Advancing another cycle while queued creates catch-up bursts.
+            if self.pending[index].is_some() {
+                continue;
+            }
             let cycle = self.settings.cycle_at(now - self.started, index) * self.variation[index];
             self.phases[index] += dt.min(1.0) / cycle;
             if self.phases[index] >= 1.0 {
                 self.phases[index] %= 1.0;
-                self.pending[index].get_or_insert(now - self.phases[index] * cycle);
+                self.pending[index] = Some(now - self.phases[index] * cycle);
+                self.phases[index] = 1.0;
                 self.random ^= self.random << 13;
                 self.random ^= self.random >> 7;
                 self.random ^= self.random << 17;
@@ -347,6 +353,7 @@ impl Engine {
                 && (self.settings.shared_counts || index == first_index)
             {
                 self.pending[index] = None;
+                self.phases[index] = 0.0;
                 speakers.insert(Speaker::Companion(index));
             }
         }
@@ -476,6 +483,43 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_companion_starts_a_full_breath_after_speaking_without_catching_up() {
+        for shared_counts in [false, true] {
+            let mut engine = Engine::new(Settings {
+                companions: 1,
+                cycle_seconds: [3.0; 3],
+                pace: [1.0; 4],
+                shared_counts,
+                ..Settings::default()
+            });
+            engine.start(0.0);
+            // Simulate fifteen seconds of microphone/recognizer activity.
+            for frame in 1..=1500 {
+                assert_eq!(engine.tick(frame as f64 / 100.0, true), None);
+            }
+            assert_eq!(engine.phases[0], 1.0, "wait at the end of the breath");
+            assert!(matches!(
+                engine.tick(15.0, false),
+                Some(Event::Count { number: 1, .. })
+            ));
+            assert_eq!(engine.phases[0], 0.0);
+            // Even after a long delay, there is no second count until another
+            // whole breath has elapsed (jitter can shorten it by at most 3%).
+            for frame in 1501..1790 {
+                assert_eq!(engine.tick(frame as f64 / 100.0, false), None);
+            }
+            let mut next = None;
+            for frame in 1790..1850 {
+                if let Some(event) = engine.tick(frame as f64 / 100.0, false) {
+                    next = Some(event);
+                    break;
+                }
+            }
+            assert!(matches!(next, Some(Event::Count { number: 2, .. })));
+        }
+    }
+
     #[test]
     fn recognized_backward_count_releases_a_waiting_companion_without_another_pause() {
         let mut engine = Engine::new(Settings::default());

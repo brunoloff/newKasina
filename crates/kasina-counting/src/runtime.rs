@@ -185,7 +185,7 @@ fn session(
     let mut in_flight = false;
     let mut generation = 0_u64;
     let mut recognition_floor = 0.0;
-    let mut quiet_until = 0.0;
+    let mut playback_ready_at = 0.0;
     {
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
         state.loading = false;
@@ -319,14 +319,12 @@ fn session(
                     continue;
                 }
                 in_flight = false;
-                quiet_until = now + 0.25;
                 let result = result.context("Recognize spoken number")?;
                 if started < recognition_floor {
                     continue;
                 }
                 if let Some(number) = result.number {
                     if engine.heard(number, started, now, independent).is_some() {
-                        quiet_until = now;
                         shared.lock().unwrap_or_else(|p| p.into_inner()).notice =
                             format!("Heard you count {number}");
                     }
@@ -337,9 +335,13 @@ fn session(
             }
             if let Some(Event::Count { number, speakers }) = engine.tick(
                 now,
-                audio.busy() || detector.busy() || in_flight || now < quiet_until,
+                audio.busy() || detector.busy() || in_flight || now < playback_ready_at,
             ) {
                 let clip = voices::together(speakers, number)?;
+                // A finished clip needs an audible pause before another queued
+                // companion starts; the engine's onset cooldown alone is shorter
+                // than some of the recorded words.
+                playback_ready_at = now + clip.len() as f64 / 16000.0 + 0.35;
                 if !settings.shared_counts {
                     listen_after = now + clip.len() as f64 / 16000.0 + 0.5;
                     recognition_floor = listen_after;
