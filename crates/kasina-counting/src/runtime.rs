@@ -1,6 +1,6 @@
 use crate::{
     audio::{Audio, Frame},
-    dsp::{EchoEvidence, VoiceDetector, capture_frame, echo_canceller},
+    dsp::{EchoEvidence, Utterance, VoiceDetector, capture_frame, echo_canceller},
     engine::{Engine, Event, Phase, Settings, Snapshot},
     speech::Recognizer,
     voices,
@@ -288,19 +288,20 @@ fn session(
                             detector = VoiceDetector::new(settings.microphone_threshold);
                             continue;
                         }
-                        if let Some(utterance) = detector.push(
+                        if let Some(utterance) = detect_count(
+                            &mut detector,
+                            in_flight,
                             &cleaned,
                             captured.saturating_duration_since(origin).as_secs_f64(),
                             independent,
-                        ) && !in_flight
-                            && jobs
-                                .try_send((
-                                    generation,
-                                    utterance.started.max(0.0),
-                                    utterance.independent_voice,
-                                    utterance.samples,
-                                ))
-                                .is_ok()
+                        ) && jobs
+                            .try_send((
+                                generation,
+                                utterance.started.max(0.0),
+                                utterance.independent_voice,
+                                utterance.samples,
+                            ))
+                            .is_ok()
                         {
                             in_flight = true;
                         }
@@ -367,9 +368,96 @@ fn session(
     outcome
 }
 
+/// Only collect one spoken turn at a time. Audio still passes through the echo
+/// canceller during inference, but must not start a second, unsubmitted utterance
+/// that keeps ready companions blocked after the first result is displayed.
+fn detect_count(
+    detector: &mut VoiceDetector,
+    recognizing: bool,
+    frame: &[f32; 160],
+    captured: f64,
+    independent: bool,
+) -> Option<Utterance> {
+    if recognizing {
+        return None;
+    }
+    detector.push(frame, captured, independent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backward_count_releases_fast_companions_despite_noise_during_recognition() {
+        // Exercise the runtime's microphone gate, not just the counter engine.
+        // Recognition itself is simulated: no microphone or model is needed.
+        for shared_counts in [false, true] {
+            let settings = Settings {
+                companions: 1,
+                cycle_seconds: [3.0; 3],
+                pace: [0.65; 4], // 1.95 seconds per breath
+                shared_counts,
+                ..Settings::default()
+            };
+            let mut engine = Engine::new(settings.clone());
+            let mut detector = VoiceDetector::new(settings.microphone_threshold);
+            engine.start(0.0);
+            let mut now = 0.0;
+            loop {
+                now += 0.01;
+                if matches!(
+                    engine.tick(now, false),
+                    Some(Event::Count { number: 3, .. })
+                ) {
+                    break;
+                }
+                assert!(now < 10.0);
+            }
+            // Wait beyond the companion's voice/overlap window, then say "one".
+            for _ in 0..100 {
+                now += 0.01;
+                engine.tick(now, true);
+            }
+            for _ in 0..12 {
+                now += 0.01;
+                engine.tick(now, true);
+                assert!(detect_count(&mut detector, false, &[0.1; 160], now, true).is_none());
+            }
+            let mut utterance = None;
+            for _ in 0..28 {
+                now += 0.01;
+                engine.tick(now, true);
+                utterance = detect_count(&mut detector, false, &[0.0; 160], now, true);
+            }
+            let utterance = utterance.expect("the human count should reach recognition");
+            // Sustained room noise while inference runs used to start another
+            // utterance, even though no second recognition job could be submitted.
+            for _ in 0..100 {
+                now += 0.01;
+                engine.tick(now, true);
+                assert!(detect_count(&mut detector, true, &[0.1; 160], now, true).is_none());
+            }
+            assert!(matches!(
+                engine.heard(1, utterance.started, now, true),
+                Some(Event::Count { number: 1, .. })
+            ));
+            let history = engine.snapshot(now).history;
+            assert_eq!(history.completed_rows, 1);
+            assert!(history.missed[1][3..].iter().all(|missed| *missed));
+            assert!(
+                !detector.busy(),
+                "stale microphone activity must not block a ready companion"
+            );
+            assert!(
+                matches!(
+                    engine.tick(now, detector.busy()),
+                    Some(Event::Count { number: 2, .. })
+                ),
+                "a companion whose breath finished during recognition must count immediately"
+            );
+        }
+    }
+
     #[test]
     fn idle_controller_closes_without_opening_audio() {
         drop(Controller::new());
