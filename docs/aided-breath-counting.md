@@ -58,8 +58,10 @@ row. Once a newer number is accepted, stale recognition cannot repaint an older
 circle. “You” represents one microphone
 user; this does not identify multiple real people sharing a microphone.
 
-**I counted** or **Space** adds the next number manually. Space works while the
-counting tab is open. **Reset to 1** means the next count will be one. Recognized skips and backward counts update the ongoing row in either mode.
+**I counted** or **Enter** adds the next number manually. **Space** adds the
+configured extra time, including after the timer ends. Both shortcuts work while
+the counting tab is open, except when editing text; holding a key does not repeat
+the action. **Reset to 1** means the next count will be one. Recognized skips and backward counts update the ongoing row in either mode.
 
 At the deadline, the companions stop, a bell rings once, and the microphone
 closes. **+ X min together** adds the configured extra time; it works during a

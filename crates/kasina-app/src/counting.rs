@@ -54,10 +54,27 @@ impl CountingPanel {
         state.loading || state.snapshot.phase == Phase::Counting
     }
     pub fn shortcut(&self, context: &egui::Context) {
-        if self.runtime.status().snapshot.phase == Phase::Counting
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space))
-        {
-            self.runtime.send(Command::ManualCount);
+        if context.text_edit_focused() {
+            return;
+        }
+        let phase = self.runtime.status().snapshot.phase;
+        for (key, enabled, command) in [
+            (egui::Key::Space, phase != Phase::Ready, Command::Extend),
+            (
+                egui::Key::Enter,
+                phase == Phase::Counting,
+                Command::ManualCount,
+            ),
+        ] {
+            if enabled && context.input_mut(|input| {
+                let first_press = input.events.iter().any(|event| matches!(event,
+                    egui::Event::Key { key: pressed_key, pressed: true, repeat: false, modifiers, .. }
+                        if *pressed_key == key && modifiers.is_none()));
+                let consumed = input.consume_key(egui::Modifiers::NONE, key);
+                first_press && consumed
+            }) {
+                self.runtime.send(command);
+            }
         }
     }
     pub fn indicator(&self, ui: &mut egui::Ui) {
@@ -158,8 +175,8 @@ impl CountingPanel {
                     }
                 } else if ui.add_sized([138.0,40.0],egui::Button::new("End session")).clicked() {self.runtime.send(Command::Stop);}
                 if state.snapshot.phase!=Phase::Ready {
-                    if ui.add_sized([150.0,40.0],egui::Button::new(format!("+ {} min together",settings.extension_minutes))).clicked() {self.runtime.send(Command::Extend);}
-                    if ui.add_enabled(running,egui::Button::new("I counted · Space").min_size(vec2(145.0,40.0))).clicked() {self.runtime.send(Command::ManualCount);}
+                    if ui.add_sized([150.0,40.0],egui::Button::new(format!("+ {} min together · Space",settings.extension_minutes))).clicked() {self.runtime.send(Command::Extend);}
+                    if ui.add_enabled(running,egui::Button::new("I counted · Enter").min_size(vec2(145.0,40.0))).clicked() {self.runtime.send(Command::ManualCount);}
                     if ui.add_enabled(running,egui::Button::new("Reset to 1")).on_hover_text("The next person will say one.").clicked() {self.runtime.send(Command::ResetCount);}
                 }
             });

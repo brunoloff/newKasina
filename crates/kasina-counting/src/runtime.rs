@@ -330,7 +330,7 @@ fn session(
                     }
                 } else {
                     shared.lock().unwrap_or_else(|p| p.into_inner()).notice =
-                        "Count not clear · say a number again, or press Space".into();
+                        "Count not clear · say a number again, or press Enter".into();
                 }
             }
             if let Some(Event::Count { number, speakers }) = engine.tick(
