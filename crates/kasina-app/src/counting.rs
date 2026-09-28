@@ -340,7 +340,22 @@ fn count_history(ui: &mut egui::Ui, snapshot: &Snapshot) {
                 && row_index == latest_row
                 && column + 1 == usize::from(snapshot.last_number);
             count_circle(ui.painter(), center, radius, *speakers, latest);
-            let name = if speakers.is_empty() {
+            let missed = snapshot.history.missed[row_index][column];
+            if missed {
+                let warning = Color32::from_rgb(240, 126, 139);
+                ui.painter()
+                    .circle_stroke(center, radius, Stroke::new(1.4, warning));
+                ui.painter().text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "!",
+                    egui::FontId::proportional(radius * 1.6),
+                    warning,
+                );
+            }
+            let name = if missed {
+                "Skipped".into()
+            } else if speakers.is_empty() {
                 "Not counted".into()
             } else {
                 speaker_names(*speakers)

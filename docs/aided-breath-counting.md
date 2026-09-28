@@ -15,13 +15,18 @@ The circle matrix keeps the current round at the top and up to nine completed ro
 below it. Each count takes its speaker's color (your counts are rose; companions
 match their rings). Ten moves the completed row down and clears the top row;
 the oldest row drops away once the matrix is full. Hover over a circle to see its
-number and everyone who counted it. Unheard numbers stay neutral if recognition skips ahead.
+number and everyone who counted it. Skipped numbers get a red exclamation mark
+and red outline on a neutral background. Saying a smaller number closes the
+unfinished row, marking its remaining positions as skipped, and starts a new
+row with skipped markers before that number. Earlier colored circles are kept
+intact. After ten, the next number fills the already-fresh top row.
 Resetting clears only the current row; adding time preserves the history, while
 starting a new session clears it.
 
 **Allow shared counts** is off by default. With it off, only the first person in
-a turn is registered; competing counts are discarded, and spoken numbers must
-follow the current 1–10 sequence. Microphone counting pauses during companion
+a turn is registered; overlapping microphone counts are ignored. Waiting
+companions keep their turns and say the next number once the current voice ends.
+Later spoken skips or backward counts are shown explicitly in the matrix. Microphone counting pauses during companion
 playback and for half a second afterward to avoid recognizing their voices as
 yours. Wait until their voice finishes before adding your next count.
 
@@ -31,13 +36,14 @@ the yellow warning remains next to its checkbox. Listening stays open during
 companion playback. This mode uses headphone audio handling, overriding the
 speaker echo-cancellation setting. Each person gets one slice, and a shared count
 advances only once. Companions finishing within a quarter-second count together.
-Your voice can join the same number within 0.45 seconds of its start, even if
-recognition finishes after its row moves down. “You” represents one microphone
+Repeating the latest number adds your color once to that circle, including a ten
+that has just moved down. Repeats never advance the counter or archive a second
+row. Once a newer number is accepted, stale recognition cannot repaint an older
+circle. “You” represents one microphone
 user; this does not identify multiple real people sharing a microphone.
 
 **I counted** or **Space** adds the next number manually. Space works while the
-counting tab is open. **Reset to 1** means the next count will be one. In shared mode a recognized
-number can also repair the counter if a previous count was missed.
+counting tab is open. **Reset to 1** means the next count will be one. Recognized skips and backward counts update the ongoing row in either mode.
 
 At the deadline, the companions stop, a bell rings once, and the microphone
 closes. **+ X min together** adds the configured extra time; it works during a

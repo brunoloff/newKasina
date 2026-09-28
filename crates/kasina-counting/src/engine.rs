@@ -146,22 +146,41 @@ const COMPANION_GROUP_SECONDS: f64 = 0.25;
 const HUMAN_OVERLAP_SECONDS: f64 = 0.45;
 
 /// The current round followed by up to nine completed rounds, newest first.
-/// Unheard/skipped numbers stay neutral rather than inventing a speaker for them.
+/// Skipped positions are explicit markers; filled cells are never overwritten.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CountHistory {
     pub rows: [[Speakers; 10]; 10],
     pub completed_rows: usize,
+    pub missed: [[bool; 10]; 10],
+    current_number: u8,
     round: u64,
 }
 impl CountHistory {
+    fn advance(&mut self) {
+        self.rows.rotate_right(1);
+        self.missed.rotate_right(1);
+        self.rows[0] = [Speakers::default(); 10];
+        self.missed[0] = [false; 10];
+        self.current_number = 0;
+        self.completed_rows = (self.completed_rows + 1).min(9);
+        self.round += 1;
+    }
     fn record(&mut self, number: u8, speakers: Speakers) -> u64 {
+        if number < self.current_number {
+            self.missed[0][usize::from(self.current_number)..].fill(true);
+            self.advance();
+        }
         let round = self.round;
-        self.rows[0][usize::from(number - 1)] = speakers;
+        for column in usize::from(self.current_number)..usize::from(number - 1) {
+            self.missed[0][column] = true;
+        }
+        // A repeated current count merges participants, never replaces them.
+        for speaker in speakers.iter() {
+            self.rows[0][usize::from(number - 1)].insert(speaker);
+        }
+        self.current_number = number;
         if number == 10 {
-            self.rows.rotate_right(1);
-            self.rows[0] = [Speakers::default(); 10];
-            self.completed_rows = (self.completed_rows + 1).min(9);
-            self.round += 1;
+            self.advance();
         }
         round
     }
@@ -174,7 +193,6 @@ impl CountHistory {
 }
 #[derive(Debug)]
 struct RecentCount {
-    number: u8,
     started: f64,
     round: u64,
 }
@@ -308,11 +326,11 @@ impl Engine {
         }
         let mut speakers = Speakers::default();
         for index in 0..self.settings.companions {
-            if self.pending[index].is_some_and(|due| due - first_due <= COMPANION_GROUP_SECONDS) {
+            if self.pending[index].is_some_and(|due| due - first_due <= COMPANION_GROUP_SECONDS)
+                && (self.settings.shared_counts || index == first_index)
+            {
                 self.pending[index] = None;
-                if self.settings.shared_counts || index == first_index {
-                    speakers.insert(Speaker::Companion(index));
-                }
+                speakers.insert(Speaker::Companion(index));
             }
         }
         let number = self.last_number % 10 + 1;
@@ -338,45 +356,30 @@ impl Engine {
         {
             return None;
         }
-        if !self.settings.shared_counts {
-            // The first accepted number owns the turn, even when a conflicting
-            // recognition result arrives later. Wrong numbers cannot resync it.
-            if number != self.last_number % 10 + 1
-                || self.recent_counts.iter().any(|recent| {
-                    (utterance_started - recent.started).abs() <= HUMAN_OVERLAP_SECONDS
-                })
+        // Only the latest accepted count can gain participants. A delayed
+        // recognition result must not repaint an older cell or rewind a newer turn.
+        if let Some(recent) = self.recent_counts.last() {
+            if number == self.last_number {
+                return (self.settings.shared_counts
+                    && independent_voice
+                    && utterance_started >= recent.started - HUMAN_OVERLAP_SECONDS
+                    && self.history.join(recent.round, number, Speaker::You))
+                .then_some(Event::Joined { number });
+            }
+            if utterance_started < recent.started
+                || (!self.settings.shared_counts
+                    && utterance_started - recent.started <= HUMAN_OVERLAP_SECONDS)
             {
                 return None;
             }
         }
-        // Recognition arrives after playback. Match the actual voice onset, and
-        // update its original round (including a ten already moved down).
-        if let Some(recent) = self.recent_counts.iter().rev().find(|recent| {
-            recent.number == number
-                && (utterance_started - recent.started).abs() <= HUMAN_OVERLAP_SECONDS
-                && now - recent.started <= 4.5
-        }) {
-            return (self.settings.shared_counts
-                && independent_voice
-                && self.history.join(recent.round, number, Speaker::You))
-            .then_some(Event::Joined { number });
-        }
-        // Even residual room echo must not count a companion's utterance twice.
-        if self.recent_virtual.iter().any(|(spoken, time)| {
-            *spoken == number && utterance_started >= *time - 0.15 && now - time < 2.5
-        }) {
+        // Retain the playback guard across a manual reset as room echo decays.
+        if self
+            .recent_virtual
+            .iter()
+            .any(|(_, time)| (utterance_started - time).abs() <= HUMAN_OVERLAP_SECONDS)
+        {
             return None;
-        }
-        if number == self.last_number {
-            return None;
-        }
-        if !self.settings.shared_counts {
-            for due in &mut self.pending {
-                if due.is_some_and(|time| (time - utterance_started).abs() <= HUMAN_OVERLAP_SECONDS)
-                {
-                    *due = None;
-                }
-            }
         }
         self.commit(number, Speaker::You.into(), now);
         Some(Event::Count {
@@ -404,6 +407,8 @@ impl Engine {
         self.last_number = 0;
         self.recent_counts.clear();
         self.history.rows[0] = [Speakers::default(); 10];
+        self.history.missed[0] = [false; 10];
+        self.history.current_number = 0;
         // Keep recent spoken numbers in the echo guard while their room echo decays.
     }
 
@@ -413,7 +418,6 @@ impl Engine {
         self.recent_counts
             .retain(|count| now - count.started <= 4.5);
         self.recent_counts.push(RecentCount {
-            number,
             started: now,
             round,
         });
@@ -453,6 +457,100 @@ impl Engine {
 mod tests {
     use super::*;
     #[test]
+    fn skips_backtracking_and_ten_preserve_every_previously_filled_cell() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        assert!(engine.heard(3, 1.0, 1.2, true).is_some());
+        assert_eq!(
+            engine.history.missed[0],
+            [
+                true, true, false, false, false, false, false, false, false, false
+            ]
+        );
+        engine.commit(4, Speaker::Companion(1).into(), 3.0);
+        let previous = engine.history.rows[0];
+        assert!(engine.heard(2, 5.0, 5.2, true).is_some());
+        assert_eq!(engine.history.completed_rows, 1);
+        assert_eq!(engine.history.rows[1], previous);
+        assert_eq!(
+            engine.history.missed[1],
+            [true, true, false, false, true, true, true, true, true, true]
+        );
+        assert!(engine.history.missed[0][0]);
+        assert_eq!(engine.history.rows[0][1], Speaker::You.into());
+        assert!(engine.heard(10, 7.0, 7.2, true).is_some());
+        assert_eq!(engine.history.completed_rows, 2);
+        assert_eq!(engine.history.rows[2], previous);
+        assert_eq!(engine.history.rows[0], [Speakers::default(); 10]);
+        assert_eq!(engine.history.missed[0], [false; 10]);
+        assert!(engine.history.missed[1][2..9].iter().all(|missed| *missed));
+        // A normal restart after ten must not archive a second empty row.
+        assert!(engine.heard(1, 9.0, 9.2, true).is_some());
+        assert_eq!(engine.history.completed_rows, 2);
+    }
+
+    #[test]
+    fn queued_companions_count_every_next_number_in_single_count_mode() {
+        let mut engine = Engine::new(Settings {
+            companions: 4,
+            ..Settings::default()
+        });
+        engine.start(0.0);
+        engine.last_tick = 1.0;
+        engine.phases = [0.0; 4];
+        engine.pending = [Some(1.03), Some(1.02), Some(1.01), Some(1.0)];
+        for number in 1..=4 {
+            let Some(Event::Count {
+                number: spoken,
+                speakers,
+            }) = engine.tick(number as f64 + 0.3, false)
+            else {
+                panic!("A waiting companion's turn was lost");
+            };
+            assert_eq!(spoken, number);
+            assert_eq!(speakers, Speaker::Companion(4 - number as usize).into());
+        }
+    }
+
+    #[test]
+    fn varied_number_sequences_never_overwrite_history_or_mix_markers_and_speakers() {
+        let mut engine = Engine::new(Settings {
+            shared_counts: true,
+            duration_minutes: 180.0,
+            ..Settings::default()
+        });
+        engine.start(0.0);
+        let mut random = 93847_u64;
+        for turn in 1..=1000 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let number = (random >> 32) as u8 % 10 + 1;
+            let before = engine.history.clone();
+            let now = turn as f64 * 2.0;
+            engine.heard(number, now, now + 0.2, true);
+            let after = &engine.history;
+            let shift = (after.round - before.round) as usize;
+            for old_row in 0..10 - shift {
+                for column in 0..10 {
+                    if !before.rows[old_row][column].is_empty() {
+                        assert_eq!(
+                            before.rows[old_row][column],
+                            after.rows[old_row + shift][column]
+                        );
+                    }
+                }
+            }
+            for row in 0..=after.completed_rows {
+                for column in 0..10 {
+                    assert!(!after.missed[row][column] || after.rows[row][column].is_empty());
+                    if row > 0 {
+                        assert!(after.missed[row][column] || !after.rows[row][column].is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn shared_counts_are_opt_in_in_new_and_saved_settings() {
         assert!(!Settings::default().shared_counts);
         let legacy: Settings = serde_json::from_str(r#"{"companions":3}"#).unwrap();
@@ -487,22 +585,23 @@ mod tests {
         }
         assert_eq!(engine.manual_count(1.4), None);
         assert_eq!(engine.snapshot(2.0).history, first);
-        assert!(engine.pending.iter().all(Option::is_none));
-        assert_eq!(engine.heard(7, 2.5, 3.0, true), None);
+        assert_eq!(engine.pending[0], Some(1.1));
+        assert_eq!(engine.pending[1], None);
+        assert!(engine.heard(7, 2.5, 3.0, true).is_some());
         assert!(matches!(
-            engine.heard(2, 3.0, 3.5, true),
+            engine.heard(2, 3.6, 4.0, true),
             Some(Event::Count { number: 2, .. })
         ));
-        assert_eq!(engine.snapshot(3.5).history.rows[0][0].len(), 1);
+        assert_eq!(engine.snapshot(4.0).history.rows[1][0].len(), 1);
     }
 
     #[test]
-    fn human_first_discards_companions_from_the_same_turn() {
+    fn human_first_keeps_waiting_companions_for_later_turns() {
         let mut engine = Engine::new(Settings::default());
         engine.start(0.0);
         engine.pending = [Some(1.1), Some(2.0), None, None];
         assert!(engine.heard(1, 1.0, 1.5, true).is_some());
-        assert_eq!(engine.pending[0], None);
+        assert_eq!(engine.pending[0], Some(1.1));
         assert_eq!(engine.pending[1], Some(2.0));
         assert_eq!(engine.snapshot(1.5).last_speakers, Speaker::You.into());
     }
@@ -557,12 +656,12 @@ mod tests {
             None,
             "echo is not a second person"
         );
-        engine.manual_count(6.0);
         assert_eq!(
             engine.heard(10, 5.1, 6.1, true),
             Some(Event::Joined { number: 10 })
         );
-        let snapshot = engine.snapshot(6.1);
+        engine.manual_count(6.2);
+        let snapshot = engine.snapshot(6.2);
         assert_eq!(snapshot.last_number, 1);
         assert_eq!(snapshot.turns, 2);
         assert_eq!(snapshot.history.completed_rows, 1);
@@ -574,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_repetition_is_not_simultaneous_and_shared_colors_roll_down() {
+    fn repeating_the_latest_number_merges_once_and_shared_colors_roll_down() {
         let mut engine = Engine::new(Settings {
             shared_counts: true,
             ..Settings::default()
@@ -582,11 +681,11 @@ mod tests {
         engine.start(0.0);
         engine.commit(1, Speaker::Companion(2).into(), 1.0);
         engine.recent_virtual.push((1, 1.0));
-        assert_eq!(engine.heard(1, 1.8, 2.3, true), None);
         assert_eq!(
-            engine.heard(1, 1.1, 2.4, true),
+            engine.heard(1, 1.8, 2.3, true),
             Some(Event::Joined { number: 1 })
         );
+        assert_eq!(engine.heard(1, 1.1, 2.4, true), None);
         assert_eq!(engine.snapshot(2.4).last_speakers.len(), 2);
         let shared = engine.snapshot(2.4).history.rows[0][0];
         for number in 2..=10 {
