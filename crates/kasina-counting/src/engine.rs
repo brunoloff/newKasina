@@ -278,6 +278,10 @@ impl Engine {
         self.pending = [None; 4];
     }
 
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
     pub fn extend(&mut self, now: f64) {
         if self.phase == Phase::Ready {
             return;
@@ -395,6 +399,9 @@ impl Engine {
             return None;
         }
         self.commit(number, Speaker::You.into(), now);
+        // Recognition already waited for the utterance to end. Count that time
+        // toward turn spacing instead of adding a fresh pause after inference.
+        self.next_voice_at = (utterance_started + 0.75).max(now);
         Some(Event::Count {
             number,
             speakers: Speaker::You.into(),
@@ -469,6 +476,47 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recognized_backward_count_releases_a_waiting_companion_without_another_pause() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        engine.commit(7, Speaker::Companion(0).into(), 5.0);
+        engine.last_tick = 9.9;
+        engine.phases = [0.0; 4];
+        engine.pending[1] = Some(9.0);
+        assert!(engine.heard(2, 8.0, 9.9, true).is_some());
+        assert_eq!(engine.history.completed_rows, 1);
+        assert_eq!(
+            engine.tick(9.9, false),
+            Some(Event::Count {
+                number: 3,
+                speakers: Speaker::Companion(1).into(),
+            })
+        );
+    }
+
+    #[test]
+    fn backward_count_preserves_breath_phases_and_respects_active_speech() {
+        let mut engine = Engine::new(Settings::default());
+        engine.start(0.0);
+        engine.commit(7, Speaker::Companion(0).into(), 5.0);
+        engine.last_tick = 9.9;
+        engine.phases = [0.2, 0.3, 0.4, 0.5];
+        assert!(engine.heard(2, 8.0, 9.9, true).is_some());
+        assert_eq!(engine.tick(9.9, false), None, "No breath has finished yet");
+        assert_eq!(engine.phases, [0.2, 0.3, 0.4, 0.5]);
+        engine.pending[0] = Some(9.0);
+        assert_eq!(
+            engine.tick(9.9, true),
+            None,
+            "Do not interrupt active speech"
+        );
+        assert!(matches!(
+            engine.tick(9.9, false),
+            Some(Event::Count { number: 3, .. })
+        ));
+    }
+
     #[test]
     fn skips_backtracking_and_ten_preserve_every_previously_filled_cell() {
         let mut engine = Engine::new(Settings::default());

@@ -220,7 +220,7 @@ fn session(
                         return Ok(());
                     }
                     Command::Extend => {
-                        if engine.snapshot(now).phase == Phase::Quiet {
+                        if engine.phase() == Phase::Quiet {
                             audio.open_microphone()?;
                             audio.clear();
                             evidence = EchoEvidence::default();
@@ -267,9 +267,7 @@ fn session(
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                         }
                     }
-                    Frame::Capture(frame, captured)
-                        if engine.snapshot(now).phase == Phase::Counting =>
-                    {
+                    Frame::Capture(frame, captured) if engine.phase() == Phase::Counting => {
                         if now - captured.saturating_duration_since(origin).as_secs_f64() > 0.3 {
                             continue;
                         }
@@ -327,6 +325,7 @@ fn session(
                 }
                 if let Some(number) = result.number {
                     if engine.heard(number, started, now, independent).is_some() {
+                        quiet_until = now;
                         shared.lock().unwrap_or_else(|p| p.into_inner()).notice =
                             format!("Heard you count {number}");
                     }

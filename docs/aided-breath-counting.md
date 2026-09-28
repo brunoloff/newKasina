@@ -9,7 +9,11 @@ The companions have separate breathing rhythms; their turns are not round-robin.
 Each has a different generated voice and a cycle-length multiplier. The breathing
 pattern has three editable points (start, halfway, settled), joined by smooth
 curves over a configurable settling time. Small cycle-to-cycle variations keep
-them from becoming a metronome. Their rings show their own rhythms.
+them from becoming a metronome. Their rings show their own rhythms. Correcting
+the count, including saying a lower number, keeps those rhythms running: a
+companion already waiting can take the next turn as soon as recognition finishes,
+while others still wait for their next outbreath. Recognition time counts toward
+the gap between turns; it does not start an extra pause.
 
 The circle matrix reserves a fixed ten-row space from the start. The current
 round is at the top, with completed rounds below it. Once the space is full,
