@@ -11,11 +11,14 @@ pattern has three editable points (start, halfway, settled), joined by smooth
 curves over a configurable settling time. Small cycle-to-cycle variations keep
 them from becoming a metronome. Their rings show their own rhythms.
 
-The circle matrix keeps the current round at the top and up to nine completed rounds
-below it. Each count takes its speaker's color (your counts are rose; companions
-match their rings). Ten moves the completed row down and clears the top row;
-the oldest row drops away once the matrix is full. Hover over a circle to see its
-number and everyone who counted it. Skipped numbers get a red exclamation mark
+The circle matrix reserves a fixed ten-row space from the start. The current
+round is at the top, with completed rounds below it. Once the space is full,
+scroll inside the matrix to see earlier rounds; all rows remain available for
+the session. New rows keep the current round visible when you are at the top,
+or preserve your place when you are browsing older rows. Each count takes its
+speaker's color (your counts are rose; companions match their rings). Ten moves the completed row down and clears the top row.
+Older rows move below the visible area once the matrix is full. Hover over a
+circle to see its number and everyone who counted it. Skipped numbers get a red exclamation mark
 and red outline on a neutral background. Saying a smaller number closes the
 unfinished row, marking its remaining positions as skipped, and starts a new
 row with skipped markers before that number. Earlier colored circles are kept

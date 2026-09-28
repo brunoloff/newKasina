@@ -145,24 +145,33 @@ pub enum Event {
 const COMPANION_GROUP_SECONDS: f64 = 0.25;
 const HUMAN_OVERLAP_SECONDS: f64 = 0.45;
 
-/// The current round followed by up to nine completed rounds, newest first.
+/// The current round followed by the session's completed rounds, newest first.
 /// Skipped positions are explicit markers; filled cells are never overwritten.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CountHistory {
-    pub rows: [[Speakers; 10]; 10],
+    pub rows: Vec<[Speakers; 10]>,
     pub completed_rows: usize,
-    pub missed: [[bool; 10]; 10],
+    pub missed: Vec<[bool; 10]>,
     current_number: u8,
     round: u64,
 }
+impl Default for CountHistory {
+    fn default() -> Self {
+        Self {
+            rows: vec![[Speakers::default(); 10]],
+            missed: vec![[false; 10]],
+            completed_rows: 0,
+            current_number: 0,
+            round: 0,
+        }
+    }
+}
 impl CountHistory {
     fn advance(&mut self) {
-        self.rows.rotate_right(1);
-        self.missed.rotate_right(1);
-        self.rows[0] = [Speakers::default(); 10];
-        self.missed[0] = [false; 10];
+        self.rows.insert(0, [Speakers::default(); 10]);
+        self.missed.insert(0, [false; 10]);
         self.current_number = 0;
-        self.completed_rows = (self.completed_rows + 1).min(9);
+        self.completed_rows += 1;
         self.round += 1;
     }
     fn record(&mut self, number: u8, speakers: Speakers) -> u64 {
@@ -185,7 +194,11 @@ impl CountHistory {
         round
     }
     fn join(&mut self, round: u64, number: u8, speaker: Speaker) -> bool {
-        let Some(row) = self.round.checked_sub(round).filter(|row| *row < 10) else {
+        let Some(row) = self
+            .round
+            .checked_sub(round)
+            .filter(|row| (*row as usize) < self.rows.len())
+        else {
             return false;
         };
         self.rows[row as usize][usize::from(number - 1)].insert(speaker)
@@ -529,7 +542,7 @@ mod tests {
             engine.heard(number, now, now + 0.2, true);
             let after = &engine.history;
             let shift = (after.round - before.round) as usize;
-            for old_row in 0..10 - shift {
+            for old_row in 0..before.rows.len() {
                 for column in 0..10 {
                     if !before.rows[old_row][column].is_empty() {
                         assert_eq!(
@@ -695,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn history_tracks_speakers_and_keeps_only_nine_completed_rounds() {
+    fn history_keeps_all_completed_rounds_beyond_the_ten_row_viewport() {
         let mut engine = Engine::new(Settings::default());
         engine.start(0.0);
         assert_eq!(engine.snapshot(0.0).history, CountHistory::default());
@@ -715,7 +728,7 @@ mod tests {
                 }
             }
             expected.insert(0, row);
-            expected.truncate(9);
+
             let history = engine.snapshot(0.0).history;
             assert_eq!(history.rows[0], [Speakers::default(); 10]);
             assert_eq!(history.completed_rows, expected.len());

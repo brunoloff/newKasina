@@ -321,60 +321,95 @@ fn count_circle(
 }
 
 fn count_history(ui: &mut egui::Ui, snapshot: &Snapshot) {
-    let spacing = 30.0_f32.min(ui.available_width() / 10.0);
-    let visible_rows = snapshot.history.completed_rows + 1;
-    let (rect, _) = ui.allocate_exact_size(
-        vec2(spacing * 10.0, spacing * visible_rows as f32),
-        egui::Sense::hover(),
-    );
-    let radius = spacing / 3.0;
-    for (row_index, row) in snapshot.history.rows.iter().take(visible_rows).enumerate() {
-        for (column, speakers) in row.iter().enumerate() {
-            let center = rect.min
-                + vec2(
-                    (column as f32 + 0.5) * spacing,
-                    (row_index as f32 + 0.5) * spacing,
-                );
-            let latest_row = usize::from(snapshot.last_number == 10);
-            let latest = snapshot.last_number != 0
-                && row_index == latest_row
-                && column + 1 == usize::from(snapshot.last_number);
-            count_circle(ui.painter(), center, radius, *speakers, latest);
-            let missed = snapshot.history.missed[row_index][column];
-            if missed {
-                let warning = Color32::from_rgb(240, 126, 139);
-                ui.painter()
-                    .circle_stroke(center, radius, Stroke::new(1.4, warning));
-                ui.painter().text(
-                    center,
-                    egui::Align2::CENTER_CENTER,
-                    "!",
-                    egui::FontId::proportional(radius * 1.6),
-                    warning,
-                );
+    let spacing = 30.0_f32.min((ui.available_width() - 18.0).max(0.0) / 10.0);
+    let height = spacing * 10.0;
+    let total_rows = snapshot.history.rows.len();
+    let history_id = ui.id().with("count-history-viewport");
+    let previous = ui
+        .ctx()
+        .data(|data| data.get_temp::<(usize, f32)>(history_id));
+    ui.allocate_ui_with_layout(
+        vec2(spacing * 10.0 + 18.0, height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt("count-history-scroll")
+                .auto_shrink([false, false])
+                .min_scrolled_height(height)
+                .max_height(height);
+            if let Some((old_rows, offset)) = previous
+                && old_rows != total_rows
+            {
+                // Keep the current round visible at the top, or keep the historical
+                // row being read in place while new rows are inserted above it.
+                let offset = if total_rows > old_rows && offset > 1.0 {
+                    offset + (total_rows - old_rows) as f32 * spacing
+                } else {
+                    0.0
+                };
+                scroll = scroll.vertical_scroll_offset(offset);
             }
-            let name = if missed {
-                "Skipped".into()
-            } else if speakers.is_empty() {
-                "Not counted".into()
-            } else {
-                speaker_names(*speakers)
-            };
-            let round = if row_index == 0 {
-                "Current round".to_owned()
-            } else if row_index == 1 {
-                "Previous round".to_owned()
-            } else {
-                format!("{row_index} rounds ago")
-            };
-            ui.interact(
-                egui::Rect::from_center_size(center, vec2(spacing, spacing)),
-                ui.id().with(("count-history", row_index, column)),
-                egui::Sense::hover(),
-            )
-            .on_hover_text(format!("{round} · {} · {name}", column + 1));
-        }
-    }
+            let output = scroll.show_viewport(ui, |ui, viewport| {
+                let (rect, _) = ui.allocate_exact_size(
+                    vec2(spacing * 10.0, spacing * total_rows.max(10) as f32),
+                    egui::Sense::hover(),
+                );
+                let first = (viewport.min.y / spacing.max(1.0)).floor() as usize;
+                let end = ((viewport.max.y / spacing.max(1.0)).ceil() as usize + 1).min(total_rows);
+                let radius = spacing / 3.0;
+                for row_index in first..end {
+                    let row = &snapshot.history.rows[row_index];
+                    for (column, speakers) in row.iter().enumerate() {
+                        let center = rect.min
+                            + vec2(
+                                (column as f32 + 0.5) * spacing,
+                                (row_index as f32 + 0.5) * spacing,
+                            );
+                        let latest_row = usize::from(snapshot.last_number == 10);
+                        let latest = snapshot.last_number != 0
+                            && row_index == latest_row
+                            && column + 1 == usize::from(snapshot.last_number);
+                        count_circle(ui.painter(), center, radius, *speakers, latest);
+                        let missed = snapshot.history.missed[row_index][column];
+                        if missed {
+                            let warning = Color32::from_rgb(240, 126, 139);
+                            ui.painter()
+                                .circle_stroke(center, radius, Stroke::new(1.4, warning));
+                            ui.painter().text(
+                                center,
+                                egui::Align2::CENTER_CENTER,
+                                "!",
+                                egui::FontId::proportional(radius * 1.6),
+                                warning,
+                            );
+                        }
+                        let name = if missed {
+                            "Skipped".into()
+                        } else if speakers.is_empty() {
+                            "Not counted".into()
+                        } else {
+                            speaker_names(*speakers)
+                        };
+                        let round = if row_index == 0 {
+                            "Current round".to_owned()
+                        } else if row_index == 1 {
+                            "Previous round".to_owned()
+                        } else {
+                            format!("{row_index} rounds ago")
+                        };
+                        ui.interact(
+                            egui::Rect::from_center_size(center, vec2(spacing, spacing)),
+                            ui.id().with(("count-history", row_index, column)),
+                            egui::Sense::hover(),
+                        )
+                        .on_hover_text(format!("{round} · {} · {name}", column + 1));
+                    }
+                }
+            });
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(history_id, (total_rows, output.state.offset.y)));
+        },
+    );
 }
 
 fn clock(seconds: f64) -> String {
