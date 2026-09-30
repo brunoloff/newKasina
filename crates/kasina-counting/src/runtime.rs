@@ -337,7 +337,7 @@ fn session(
                 now,
                 audio.busy() || detector.busy() || in_flight || now < playback_ready_at,
             ) {
-                let clip = voices::together(speakers, number)?;
+                let clip = voices::together(speakers, number, &settings.voice_choices)?;
                 // A finished clip needs an audible pause before another queued
                 // companion starts; the engine's onset cooldown alone is shorter
                 // than some of the recorded words.

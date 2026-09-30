@@ -9,7 +9,8 @@ fn main() -> anyhow::Result<()> {
     let recognizer = Recognizer::load(&path)?;
     let mut correct = 0;
     let started = std::time::Instant::now();
-    for voice in 0..4 {
+    let total = voices::NAMES.len() * 10;
+    for voice in 0..voices::NAMES.len() {
         for number in 1..=10 {
             let result = recognizer.recognize(
                 &voices::number(voice, number)?,
@@ -38,9 +39,9 @@ fn main() -> anyhow::Result<()> {
         "noise accepted: {noise_result:?}"
     );
     println!(
-        "Recognized {correct}/40 fixtures; silence and noise rejected; {:.2}s total",
+        "Recognized {correct}/{total} fixtures; silence and noise rejected; {:.2}s total",
         started.elapsed().as_secs_f64()
     );
-    anyhow::ensure!(correct == 40, "some number fixtures were misrecognized");
+    anyhow::ensure!(correct == total, "some number fixtures were misrecognized");
     Ok(())
 }

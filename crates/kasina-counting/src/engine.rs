@@ -11,6 +11,7 @@ pub struct Settings {
     pub settling_minutes: f64,
     pub cycle_seconds: [f64; 3],
     pub pace: [f64; 4],
+    pub voice_choices: [usize; 4],
     pub standard_deviation_seconds: [f64; 4],
     pub volume: f32,
     pub microphone_threshold: f32,
@@ -27,6 +28,7 @@ impl Default for Settings {
             settling_minutes: 15.0,
             cycle_seconds: [5.0, 7.0, 9.0],
             pace: [0.85, 1.05, 1.22, 0.96],
+            voice_choices: [0, 1, 2, 3],
             standard_deviation_seconds: [0.0; 4],
             volume: 0.55,
             microphone_threshold: 0.008,
@@ -58,6 +60,9 @@ impl Settings {
         }
         for (value, fallback) in self.pace.iter_mut().zip(default.pace) {
             *value = bounded(*value, fallback, 0.65, 1.5);
+        }
+        for voice in &mut self.voice_choices {
+            *voice = (*voice).min(crate::voices::NAMES.len() - 1);
         }
         for value in &mut self.standard_deviation_seconds {
             *value = bounded(*value, 0.0, 0.0, 30.0);
@@ -523,6 +528,19 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn voice_choices_load_from_legacy_settings_and_round_trip() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.voice_choices, [0, 1, 2, 3]);
+        settings.voice_choices = [5, 4, 1, 0];
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.voice_choices, settings.voice_choices);
+        settings.voice_choices = [usize::MAX, 6, 2, 0];
+        settings.sanitize();
+        assert_eq!(settings.voice_choices, [5, 5, 2, 0]);
+    }
+
     #[test]
     fn gaussian_samples_match_each_companions_mean_and_standard_deviation() {
         let mut engine = Engine::new(Settings {

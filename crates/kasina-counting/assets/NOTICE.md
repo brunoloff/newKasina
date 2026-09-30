@@ -25,9 +25,20 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-The forty WAV files are generated speech from eSpeak NG (four English voice
-variants), not voice recordings of people. Reproduce them with
-scripts/generate-counting-voices.py. eSpeak NG and ffmpeg are build-time tools
-for asset authors; neither executable nor its engine is bundled. These generated
-count recordings and the synthesized bell are included under this project's
-MIT OR Apache-2.0 license. eSpeak NG source: https://github.com/espeak-ng/espeak-ng
+The sixty WAV files are prerecorded synthetic speech generated with Kokoro-82M
+v1.0 by hexgrad (model license: Apache-2.0), using kokoro-onnx 0.5.0 (MIT).
+The voice bank contains Michael, Heart, Puck, Sarah, Fenrir, and Bella; these
+are the model's stock voice presets, not custom clones. The model and TTS engine
+are not bundled or run by newKasina. Only the generated audio is included.
+
+Reproduce the clips with scripts/generate-counting-voices.py. The script pins
+the input model and voice-bank hashes, and voices/manifest.json records the
+output clip hashes. Python, ONNX Runtime, the model, and ffmpeg are asset-authoring
+tools only. The generated recordings and synthesized bell are included under
+this project's MIT OR Apache-2.0 license.
+
+Sources:
+- https://huggingface.co/hexgrad/Kokoro-82M
+- https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md
+- https://github.com/thewh1teagle/kokoro-onnx
+- https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.1

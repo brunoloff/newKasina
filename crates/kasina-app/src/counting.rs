@@ -215,6 +215,13 @@ impl CountingPanel {
                     for (index,name) in NAMES.iter().enumerate().take(settings.companions) {
                         ui.horizontal_wrapped(|ui| {
                             ui.colored_label(COLORS[index], *name);
+                            egui::ComboBox::from_id_salt(("companion_voice", index))
+                                .selected_text(kasina_counting::voices::NAMES[settings.voice_choices[index]])
+                                .show_ui(ui, |ui| {
+                                    for (voice, label) in kasina_counting::voices::NAMES.iter().enumerate() {
+                                        ui.selectable_value(&mut settings.voice_choices[index], voice, *label);
+                                    }
+                                });
                             ui.add(egui::Slider::new(&mut settings.pace[index], 0.65..=1.5).text("cycle length ×"));
                             ui.label("Standard deviation");
                             ui.add(egui::DragValue::new(&mut settings.standard_deviation_seconds[index]).range(0.0..=30.0).speed(0.05).suffix(" s"));

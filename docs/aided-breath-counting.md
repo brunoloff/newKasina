@@ -6,7 +6,11 @@ Speak an English number at the end of your own outbreath. Everyone shares one
 counter: 1 through 10, then 1 again. Breathe at your own comfortable pace.
 
 The companions have separate breathing rhythms; their turns are not round-robin.
-Each has a different generated voice and a cycle-length multiplier. The breathing
+Each companion has a voice selector and a cycle-length multiplier. Choose from
+six prerecorded Kokoro neural voices: Michael, Puck, and Fenrir (male), and
+Heart, Sarah, and Bella (female). All sixty English number clips are bundled in
+the app; no TTS model runs or downloads during a session. Choose voices before
+starting, in **Breathing pattern**. The breathing
 pattern has three editable points (start, halfway, settled), joined by smooth
 curves over a configurable settling time. Each companion has a **Standard deviation**
 setting in seconds: each new breath duration is sampled from a Gaussian centered
@@ -106,7 +110,7 @@ loading. The model manifest and licensing notice are under
 `crates/kasina-counting/assets`. Building the speech engine requires CMake and a
 C++ compiler and libclang (LLVM). Native bindings must be generated for the host
 platform; the speech dependency’s pre-generated Linux bindings cannot be used
-on Windows. No Python, eSpeak, or external speech executable is required to run
+on Windows. No Python, Kokoro model, or external speech executable is required to run
 the packaged app. The generated companion recordings are compiled into the app.
 
 The reusable `kasina-counting` crate owns the session engine, audio capture and
