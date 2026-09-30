@@ -7,8 +7,10 @@ counter: 1 through 10, then 1 again. Breathe at your own comfortable pace.
 
 The companions have separate breathing rhythms; their turns are not round-robin.
 Each companion has a voice selector and a cycle-length multiplier. Choose from
-six prerecorded Kokoro neural voices: Michael, Puck, and Fenrir (male), and
-Heart, Sarah, and Bella (female). All sixty English number clips are bundled in
+six prerecorded Qwen3-TTS voices: Warm male, Low male, Light male,
+Warm female, Soft female, and Clear female. Warm male and Warm female use
+the approved audition voices. Continuous counting takes are split into individual
+numbers, preserving a consistent speaker and relaxed delivery. All sixty English number clips are bundled in
 the app; no TTS model runs or downloads during a session. Choose voices before
 starting, in **Breathing pattern**. The breathing
 pattern has three editable points (start, halfway, settled), joined by smooth
@@ -110,7 +112,7 @@ loading. The model manifest and licensing notice are under
 `crates/kasina-counting/assets`. Building the speech engine requires CMake and a
 C++ compiler and libclang (LLVM). Native bindings must be generated for the host
 platform; the speech dependency’s pre-generated Linux bindings cannot be used
-on Windows. No Python, Kokoro model, or external speech executable is required to run
+on Windows. No Python, TTS model, or external speech executable is required to run
 the packaged app. The generated companion recordings are compiled into the app.
 
 The reusable `kasina-counting` crate owns the session engine, audio capture and

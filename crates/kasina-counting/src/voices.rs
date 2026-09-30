@@ -2,12 +2,12 @@ use anyhow::Result;
 use std::io::Cursor;
 /// Six prerecorded synthetic voices; indices remain stable in saved settings.
 pub const NAMES: [&str; 6] = [
-    "Michael · male · US",
-    "Heart · female · US",
-    "Puck · male · US",
-    "Sarah · female · US",
-    "Fenrir · male · US",
-    "Bella · female · US",
+    "Warm male",
+    "Warm female",
+    "Low male",
+    "Soft female",
+    "Light male",
+    "Clear female",
 ];
 const CLIPS: [[&[u8]; 10]; 6] = [
     [

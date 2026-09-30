@@ -25,20 +25,23 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-The sixty WAV files are prerecorded synthetic speech generated with Kokoro-82M
-v1.0 by hexgrad (model license: Apache-2.0), using kokoro-onnx 0.5.0 (MIT).
-The voice bank contains Michael, Heart, Puck, Sarah, Fenrir, and Bella; these
-are the model's stock voice presets, not custom clones. The model and TTS engine
-are not bundled or run by newKasina. Only the generated audio is included.
+The sixty WAV files are prerecorded synthetic speech generated with Qwen3-TTS
+by the Qwen team (Apache-2.0). The two approved synthetic audition recordings
+and four additional synthetic voice references are in voice-references/.
+Qwen3-TTS-12Hz-1.7B-VoiceDesign created those references;
+Qwen3-TTS-12Hz-1.7B-Base used them to generate consistent counting takes.
+No real person's voice recording was used as a reference.
 
-Reproduce the clips with scripts/generate-counting-voices.py. The script pins
-the input model and voice-bank hashes, and voices/manifest.json records the
-output clip hashes. Python, ONNX Runtime, the model, and ffmpeg are asset-authoring
-tools only. The generated recordings and synthesized bell are included under
-this project's MIT OR Apache-2.0 license.
+The model weights and TTS engine are not bundled or run by newKasina. Only the
+number clips are embedded in the app. Python, PyTorch, Qwen3-TTS, and ffmpeg are
+asset-authoring tools only. The generated recordings and synthesized bell are
+included under this project's MIT OR Apache-2.0 license.
+
+Reproduce the clips with scripts/generate-counting-voices.py. Immutable model
+revisions, reference hashes, take hashes, and final clip hashes are recorded in
+voices/manifest.json. The approved references must be preserved when regenerating.
 
 Sources:
-- https://huggingface.co/hexgrad/Kokoro-82M
-- https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md
-- https://github.com/thewh1teagle/kokoro-onnx
-- https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.1
+- https://github.com/QwenLM/Qwen3-TTS
+- https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+- https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base
