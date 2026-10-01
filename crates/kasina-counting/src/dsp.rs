@@ -84,7 +84,9 @@ impl EchoEvidence {
     pub fn render(&mut self, frame: &[f32; 160]) {
         self.render.extend(
             frame
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .map(|chunk| chunk.iter().sum::<f32>() / 8.0),
         );
         while self.render.len() > 1000 {
@@ -94,7 +96,9 @@ impl EchoEvidence {
     pub fn independent(&mut self, frame: &[f32; 160]) -> bool {
         self.capture.extend(
             frame
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .map(|chunk| chunk.iter().sum::<f32>() / 8.0),
         );
         while self.capture.len() > 160 {
