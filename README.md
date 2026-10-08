@@ -93,6 +93,19 @@ its actual state and sends controls to it; closing the client leaves it running.
 The launchers use this checkout's release binaries. Rebuild after changing the code,
 then reopen the relevant program. Rerun the installer if you move the checkout.
 
+To reclaim disk space after building, run:
+
+```sh
+scripts/clean-builds
+```
+
+Run it when no build is in progress. It removes debug and cross-compilation output,
+release intermediates, voice-generation models/scratch files, and packaging staging
+files. It keeps the release app and service used by desktop launchers, the offline
+speech-recognition model, packaged downloads, and downloaded Rust dependencies and
+toolchains. The next build will recompile removed intermediates. Use
+`scripts/clean-builds --dry-run` to preview the cleanup.
+
 For a sensor-free tour, open **Settings → Simulation mode**. This generates data
 inside the app and leaves the measurement service untouched. Settings also controls
 which panels appear in the sidebar.

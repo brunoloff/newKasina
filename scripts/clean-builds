@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Remove rebuildable output while keeping desktop executables and speech assets."""
+
+import argparse
+from pathlib import Path
+import re
+import shutil
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def candidates(root):
+    target = root / "target"
+    paths = [target / name for name in ("debug", "tmp", "tts-auditions")]
+    # Cargo's optional cross-compilation directories, e.g. x86_64-pc-windows-gnu.
+    if target.is_dir():
+        paths.extend(path for path in target.iterdir()
+                     if re.fullmatch(r"(?:x86_64|i[3-6]86|aarch64|arm\w*|riscv\w*|wasm\w*)-.+", path.name))
+    release = target / "release"
+    paths.extend(release / name for name in
+                 ("build", "deps", "examples", "incremental", ".fingerprint"))
+    if release.is_dir():
+        paths.extend(path for path in release.iterdir()
+                     if path.suffix in (".d", ".rlib", ".rmeta"))
+    paths.append(root / "dist" / ".staging")
+    return sorted(set(path for path in paths if path.exists() or path.is_symlink()))
+
+
+def allocated_bytes(paths):
+    # Count hard links once, as Cargo links release executables into deps/.
+    seen = set()
+    total = 0
+    for path in paths:
+        entries = [path]
+        if path.is_dir() and not path.is_symlink():
+            entries.extend(path.rglob("*"))
+        for entry in entries:
+            stat = entry.lstat()
+            inode = (stat.st_dev, stat.st_ino)
+            if inode not in seen:
+                seen.add(inode)
+                total += getattr(stat, "st_blocks", 0) * 512 if hasattr(stat, "st_blocks") else stat.st_size
+    return total
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="List output without deleting it")
+    args = parser.parse_args()
+    # Do not follow a target/dist symlink to an unrelated directory.
+    for directory in (ROOT / "target", ROOT / "target/release", ROOT / "dist"):
+        if directory.is_symlink():
+            parser.error(f"Refusing cleanup through a directory symlink: {directory}")
+    paths = candidates(ROOT)
+    output_roots = [ROOT / name for name in ("target", "dist") if (ROOT / name).exists()]
+    before = allocated_bytes(output_roots)
+    for path in paths:
+        print(f"{'Would remove' if args.dry_run else 'Removing'} {path.relative_to(ROOT)}", flush=True)
+        if not args.dry_run:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    if args.dry_run:
+        print(f"Selected output: {allocated_bytes(paths) / 1024**3:.2f} GiB (hard-linked executables are kept)")
+    else:
+        after = allocated_bytes(output_roots)
+        print(f"Build output reduced by {(before - after) / 1024**3:.2f} GiB")
+    print("Kept release executables, target/speech-models, packaged downloads, dependencies and toolchains.")
+
+
+if __name__ == "__main__":
+    main()
